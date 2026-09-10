@@ -1,6 +1,8 @@
 # BBVoxi · Windows 语音输入法
 
-<img src="assets/77db7077e32bc30cf6ac4dd5613f422a.png" width="516" height="939" alt="77db7077e32bc30cf6ac4dd5613f422a.png">
+<img src="assets/b82a4664148c4bd078171ff4319626d3.png" width="738" height="1039" alt="b82a4664148c4bd078171ff4319626d3.png">
+
+
 
 > **最新版本**：v1.1（2026-09-11，Stable）
 > 详细发布说明见 [docs/RELEASE_v1.1.md](./docs/RELEASE_v1.1.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
@@ -211,6 +213,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.1.exe
 | 文字打到别处 / 没出现 | 录音开始时本程序会收起自己的设置窗让焦点回到你的程序；注入前也会再次确认前台窗口不是自己 |
 | 提示"无法输入" | 目标窗口以管理员权限运行（Windows UIPI 限制），改用普通权限窗口 |
 | 连接失败 | 日志会写明是超时、`401`（Key 错）还是地址错 |
+| 豆包提示 `code=45xxxxxx` / `55xxxxxx` | 提示里已附中文含义（45000001 请求参数无效、45000002 空音频、45000151 音频格式不正确、55000031 服务器繁忙）；日志里的 `log_id` 是火山侧排查凭证 |
 
 常用检查：`notepad %APPDATA%\BBVoxi\logs\bbvoxi.log`
 
@@ -220,6 +223,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.1.exe
 
 - 目标窗口以**管理员权限**运行时无法输入（Windows UIPI 限制），会给出明确提示
 - 腾讯 `Hy-ASR-3.0-preview` 引擎仅支持 60 秒内语音，超出由服务端结束（千问与豆包无此时限）
+- 豆包「高精度」模式（单流接口）要等说完一句才返回文本，中间结果为空，所以实时输入在该模式下看不到逐字上屏；想边说边出字请用「实时优先」模式
 - 首次运行需在 Windows 隐私设置里允许桌面应用访问麦克风
 - 内存占用约 114 MB（窗口隐藏常驻）/ 170 MB（设置窗可见），主要是 egui + 中文字体的基线开销
 - 实时输入依赖"已经打进目标程序的文本"记账：若目标程序对输入做了自动改写（如代码编辑器自动补全），差分可能与之不同步

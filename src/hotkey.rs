@@ -192,6 +192,12 @@ static CURRENT_MODS: AtomicU32 = AtomicU32::new(1); // bit0 Ctrl / bit1 Alt / bi
 pub fn set_current(hk: Hotkey) {
     CURRENT_VK.store(hk.vk, Ordering::Relaxed);
     CURRENT_MODS.store(mods_bits(&hk), Ordering::Relaxed);
+    // 换键时必须清掉「按住中」状态：否则旧键的 keyup 匹配不上新键，
+    // armed 会一直挂着 —— 会话收不到 Stop，录音停不下来。
+    if let Some(ctx) = CTX.get() {
+        ctx.armed.store(false, Ordering::Relaxed);
+        ctx.held.store(false, Ordering::Relaxed);
+    }
 }
 
 pub fn current() -> Hotkey {
@@ -273,26 +279,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // 注入事件必须完全忽略：我们自己在打字前会注入修饰键 KEYUP（把 Ctrl「清掉」），
     // 如果让它参与状态跟踪，钩子会误判成"用户松开了 Ctrl"，
     // 于是触发键不再被吞 → 前台程序收到 1 的自动重复，出现满屏 111111。
-    if ignore_event(injected || ours, ctx.paused.load(Ordering::Relaxed)) {
+    if injected || ours {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    // 修饰键状态跟着事件走（左右变体由 classify_modifier 统一处理）
-    match classify_modifier(vk) {
-        Some(ModKind::Ctrl) => ctx.ctrl.store(down, Ordering::Relaxed),
-        Some(ModKind::Alt) => ctx.alt.store(down, Ordering::Relaxed),
-        Some(ModKind::Shift) => ctx.shift.store(down, Ordering::Relaxed),
-        Some(ModKind::Win) => ctx.win.store(down, Ordering::Relaxed),
-        None => {}
+    // 修饰键状态跟着事件走（左右变体由 classify_modifier 统一处理）。
+    // 设置界面捕捉快捷键期间也要更新：否则捕捉结束时用户还按着 Ctrl，
+    // 这里的状态却是旧值，接下来按组合键会失灵（得先松手再按一次才恢复）。
+    write_mods(ctx, apply_mods(read_mods(ctx), vk, down));
+
+    // 捕捉快捷键期间只维护状态，不触发也不吞键（按键要原样交给界面）
+    if ctx.paused.load(Ordering::Relaxed) {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
     {
-        let mods = Mods {
-            ctrl: ctx.ctrl.load(Ordering::Relaxed),
-            alt: ctx.alt.load(Ordering::Relaxed),
-            shift: ctx.shift.load(Ordering::Relaxed),
-            win: ctx.win.load(Ordering::Relaxed),
-        };
+        let mods = read_mods(ctx);
         let decision = decide(
             current(),
             mods,
@@ -323,9 +325,32 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// 完全不处理这个事件？（自己注入的事件 / 设置界面正在录制快捷键时）
-pub fn ignore_event(injected: bool, paused: bool) -> bool {
-    injected || paused
+/// 读出当前按住的修饰键
+fn read_mods(ctx: &HookCtx) -> Mods {
+    Mods {
+        ctrl: ctx.ctrl.load(Ordering::Relaxed),
+        alt: ctx.alt.load(Ordering::Relaxed),
+        shift: ctx.shift.load(Ordering::Relaxed),
+        win: ctx.win.load(Ordering::Relaxed),
+    }
+}
+
+fn write_mods(ctx: &HookCtx, mods: Mods) {
+    ctx.ctrl.store(mods.ctrl, Ordering::Relaxed);
+    ctx.alt.store(mods.alt, Ordering::Relaxed);
+    ctx.shift.store(mods.shift, Ordering::Relaxed);
+    ctx.win.store(mods.win, Ordering::Relaxed);
+}
+
+/// 按一次按键事件更新修饰键状态（纯函数，便于单测）
+pub fn apply_mods(mods: Mods, vk: u32, down: bool) -> Mods {
+    match classify_modifier(vk) {
+        Some(ModKind::Ctrl) => Mods { ctrl: down, ..mods },
+        Some(ModKind::Alt) => Mods { alt: down, ..mods },
+        Some(ModKind::Shift) => Mods { shift: down, ..mods },
+        Some(ModKind::Win) => Mods { win: down, ..mods },
+        None => mods,
+    }
 }
 
 /// 修饰键分类 —— 单一事实来源。
@@ -633,11 +658,36 @@ mod tests {
         assert_eq!(stop.trigger, Some(Trigger::Stop));
     }
 
-    /// 注入事件必须完全忽略：自己的「修饰键重置」不能被当成用户松开 Ctrl
+    /// 修饰键状态必须左右键码一视同仁（状态失真会导致组合键失灵）
     #[test]
-    fn injected_events_and_pause_are_ignored() {
-        assert!(ignore_event(true, false), "注入事件必须忽略");
-        assert!(ignore_event(false, true), "录制快捷键时必须忽略");
-        assert!(!ignore_event(false, false));
+    fn apply_mods_tracks_press_and_release() {
+        let down = apply_mods(NONE, 0xA2, true); // 物理左 Ctrl
+        assert!(down.ctrl);
+        let up = apply_mods(down, 0xA2, false);
+        assert_eq!(up, NONE, "松开后必须回到未按下的状态");
+        // 普通键不该动修饰键状态
+        assert_eq!(apply_mods(CTRL, 0x31, true), CTRL);
+    }
+
+    /// 为什么 `set_current` 必须清掉 armed：换键后旧键的 keyup 既不命中新键、
+    /// 也不是修饰键，armed 会永久挂着 —— 会话收不到 Stop，录音停不下来。
+    /// 这里刻意不调用 set_current：它是进程级静态变量，单测里改它会污染并行跑的其他用例。
+    #[test]
+    fn stale_armed_state_is_why_set_current_resets_it() {
+        let old = parse("ctrl+1").unwrap();
+        let start = decide(old, CTRL, 0x31, true, false, false);
+        assert_eq!(start.trigger, Some(Trigger::Start));
+
+        // 录音途中改成 Ctrl+2，然后松开旧键 1
+        let new = parse("ctrl+2").unwrap();
+        let stale = decide(new, CTRL, 0x31, false, start.armed, start.held);
+        assert_eq!(stale.trigger, None, "旧键的 keyup 不会命中新键");
+        assert!(stale.armed, "armed 会一直挂着，这正是 set_current 要清掉它的原因");
+
+        // armed 被清掉之后，新组合能正常工作
+        assert_eq!(
+            decide(new, CTRL, 0x32, true, false, false).trigger,
+            Some(Trigger::Start)
+        );
     }
 }

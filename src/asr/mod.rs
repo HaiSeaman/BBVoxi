@@ -43,6 +43,7 @@ pub enum Kind {
 }
 
 /// 一次 provider 帧的解析结果
+#[derive(Debug)]
 pub enum Parsed {
     Text { kind: Kind, text: String },
     Finished,

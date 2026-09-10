@@ -349,7 +349,7 @@ impl SettingsApp {
                             );
                         });
                     if ghost_button(ui, p, "重新录制").clicked() {
-                        self.begin_capture();
+                        self.begin_capture(ui.ctx());
                     }
                 }
             });
@@ -604,10 +604,18 @@ impl SettingsApp {
         }
     }
 
-    fn begin_capture(&mut self) {
+    fn begin_capture(&mut self, ctx: &egui::Context) {
         self.capturing = true;
         self.hotkey_error = None;
         self.paused.store(true, Ordering::Relaxed);
+        // 捕捉期间钩子是暂停的，按键会原样进到窗口。
+        // 若这之前焦点还停在某个输入框（比如密钥框），按下的字母会被插进去，
+        // 悄悄改坏配置 —— 所以先把键盘焦点收回来。
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
     }
 
     fn end_capture(&mut self) {

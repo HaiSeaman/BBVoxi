@@ -300,7 +300,7 @@ async fn run_session(
         log::log(format!("识别过程中收到服务端错误：{e}"));
     }
     log::log(format!("识别完成（{} 字）", text.chars().count()));
-    ensure_target_focus(shared);
+    ensure_target_focus(shared).await;
     // 收尾：把最终文本同步到光标处。实时输入开着时通常只差最后几个字，
     // 关掉实时输入时则在这里一次性打出全文。
     if let Err(e) = typer.finish(&text) {
@@ -331,24 +331,31 @@ fn same_foreground(start: Option<isize>) -> bool {
 
 /// 注入前确认前台窗口不是我们自己的程序；如果是，就把它藏起来等焦点回去。
 /// 不这样做的话，用户打开着设置窗时打字会落到自己窗口上，看起来"什么都没打出来"。
-fn ensure_target_focus(shared: &Shared) {
+async fn ensure_target_focus(shared: &Shared) {
     #[cfg(windows)]
-    unsafe {
+    {
         use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
         };
 
-        let foreground = GetForegroundWindow();
-        if foreground.is_invalid() {
-            return;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(foreground, Some(&mut pid));
-        if pid == GetCurrentProcessId() {
+        let is_own = unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.is_invalid() {
+                false
+            } else {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(foreground, Some(&mut pid));
+                pid == GetCurrentProcessId()
+            }
+        };
+        if is_own {
             log::log("注入前发现前台是本程序窗口，先收起再输入");
             shared.hide_settings();
-            std::thread::sleep(Duration::from_millis(150));
+            // 用异步 sleep：这里跑在 tokio 工作线程上，阻塞它会拖住整个会话
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
+    #[cfg(not(windows))]
+    let _ = shared;
 }
