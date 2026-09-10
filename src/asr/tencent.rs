@@ -92,12 +92,12 @@ fn tencent_hint(code: i64) -> &'static str {
     }
 }
 
-/// 生成带签名的 WebSocket 地址
-pub fn signed_url(cfg: &TencentConfig) -> Result<String> {
-    signed_url_at(cfg, now_secs())
+/// 生成带签名的 WebSocket 地址（`smooth` 控制 filter_modal，对应「口语顺滑」开关）
+pub fn signed_url(cfg: &TencentConfig, smooth: bool) -> Result<String> {
+    signed_url_at(cfg, now_secs(), smooth)
 }
 
-fn signed_url_at(cfg: &TencentConfig, now: u64) -> Result<String> {
+fn signed_url_at(cfg: &TencentConfig, now: u64, smooth: bool) -> Result<String> {
     let app_id = cfg.app_id.trim();
     let secret_id = cfg.secret_id.trim();
     let secret_key = cfg.secret_key.trim();
@@ -122,7 +122,8 @@ fn signed_url_at(cfg: &TencentConfig, now: u64) -> Result<String> {
     params.insert("needvad".into(), "1".into());
     params.insert("convert_num_mode".into(), "1".into());
     params.insert("filter_dirty".into(), "0".into());
-    params.insert("filter_modal".into(), "0".into());
+    // 语气词过滤（=「口语顺滑」开关）：之前写死 0，开关对腾讯是摆设
+    params.insert("filter_modal".into(), if smooth { "1" } else { "0" }.into());
     params.insert("filter_punc".into(), "0".into());
 
     let query = params
@@ -176,7 +177,7 @@ mod tests {
 
     #[test]
     fn url_contains_required_params_and_signature() {
-        let url = signed_url_at(&cfg(), 1_743_000_000).unwrap();
+        let url = signed_url_at(&cfg(), 1_743_000_000, true).unwrap();
         assert!(url.starts_with("wss://asr.cloud.tencent.com/asr/v2/1259223000?"));
         for key in [
             "engine_model_type=Hy-ASR-3.0-preview",
@@ -206,11 +207,20 @@ mod tests {
         assert_eq!(keys, sorted);
     }
 
+    /// 「口语顺滑」开关必须真的落到 filter_modal 参数里
+    #[test]
+    fn smooth_toggle_reaches_filter_modal() {
+        let on = signed_url_at(&cfg(), 1_743_000_000, true).unwrap();
+        assert!(on.contains("filter_modal=1"));
+        let off = signed_url_at(&cfg(), 1_743_000_000, false).unwrap();
+        assert!(off.contains("filter_modal=0"));
+    }
+
     #[test]
     fn missing_credentials_is_rejected() {
         let mut c = cfg();
         c.secret_key = "  ".into();
-        assert!(signed_url_at(&c, 0).is_err());
+        assert!(signed_url_at(&c, 0, true).is_err());
     }
 
     #[test]

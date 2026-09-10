@@ -95,7 +95,8 @@ impl Shared {
 pub fn spawn(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>) -> UnboundedSender<Cmd> {
     let (tx, rx) = unbounded_channel();
     let sender = tx.clone();
-    std::thread::Builder::new()
+    // 线程起不来必须记日志：之后所有命令都会静默发送失败，没有这条日志无从排查
+    if let Err(e) = std::thread::Builder::new()
         .name("bbvoxi-session".into())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -111,7 +112,9 @@ pub fn spawn(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>) -> UnboundedSender<Cm
             };
             runtime.block_on(worker(cfg, shared, rx));
         })
-        .ok();
+    {
+        log::log(format!("会话线程启动失败：{e}"));
+    }
     sender
 }
 

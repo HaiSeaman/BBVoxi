@@ -281,7 +281,7 @@ fn provider_name(p: Provider) -> &'static str {
 
 fn build_backend(cfg: &Config) -> Backend {
     match cfg.provider {
-        Provider::Qwen => Backend::Qwen(qwen::Qwen::new(&cfg.qwen)),
+        Provider::Qwen => Backend::Qwen(qwen::Qwen::new(&cfg.qwen, cfg.options.auto_punctuation)),
         Provider::Doubao => Backend::Doubao(doubao::Doubao::new(&cfg.doubao, &cfg.options)),
         Provider::Tencent => Backend::Tencent(tencent::Tencent::new()),
     }
@@ -314,7 +314,10 @@ pub fn request_spec(cfg: &Config) -> Result<(String, Vec<(String, String)>)> {
                 ),
             ],
         )),
-        Provider::Tencent => Ok((tencent::signed_url(&cfg.tencent)?, Vec::new())),
+        Provider::Tencent => Ok((
+            tencent::signed_url(&cfg.tencent, cfg.options.smooth)?,
+            Vec::new(),
+        )),
     }
 }
 

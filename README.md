@@ -2,13 +2,13 @@
 
 <img src="assets/77db7077e32bc30cf6ac4dd5613f422a.png" width="516" height="939" alt="77db7077e32bc30cf6ac4dd5613f422a.png">
 
-> **最新版本**：v1.0.0（2026-09-10，Stable）
-> 详细发布说明见 [docs/RELEASE_v1.0.0.md](./docs/RELEASE_v1.0.0.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
+> **最新版本**：v1.1（2026-09-11，Stable）
+> 详细发布说明见 [docs/RELEASE_v1.1.md](./docs/RELEASE_v1.1.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
 
 按住一个全局快捷键说话，松开后识别结果**自动打到光标所在的位置**——就像输入法正常打字一样，没有多余窗口。
 
-- **单文件**：`BBVoxi-1.0.0.exe`，无需安装，双击即用
-- **边说话边打字**：识别结果实时写入光标处，识别被修正时自动回退重打（成熟输入法的做法）
+- **单文件**：`BBVoxi-1.1.exe`，无需安装，双击即用
+- **边说话边打字**：识别结果实时写入光标处，识别被修正时自动回退重打（成熟输入法的做法）；双击 exe 可唤醒后台实例
 - **按多久说多久**：不限制单次录音时长
 - **三家服务商可切换**：阿里云百炼（千问）、火山引擎（豆包）、腾讯云 ASR
 
@@ -18,13 +18,13 @@
 
 ### 直接用（推荐）
 
-从 Releases 下载 `BBVoxi-1.0.0.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗。
+从 Releases 下载 `BBVoxi-1.1.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
 
 ### 从源码构建
 
 ```bash
 cargo build --release     # 产物：target/release/bbvoxi.exe（约 8 MB）
-cargo test                # 单元测试（52 条）
+cargo test                # 单元测试（56 条）
 ```
 
 构建要求：Rust 1.80+（MSVC 工具链，Windows）。
@@ -47,6 +47,7 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 | **托盘 → 开始录音 / 停止录音** | 点一次开始，再点一次结束（适合不想一直按着） | 直接打到光标处 |
 | **设置窗 → 测试识别（5 秒）** | 固定 5 秒自动结束，用来验证凭据与麦克风 | **只显示在窗口里**，不外打 |
 | 双击托盘图标 / 右键「打开设置」 | 打开设置窗 | — |
+| 再次双击 BBVoxi.exe / 桌面快捷方式 | 已在运行时：唤起后台实例弹出设置窗（单实例保护） | — |
 | `bbvoxi.exe --settings` | 直接打开并置前设置窗（排查用） | — |
 
 快捷键可在设置里改成任意组合：`Ctrl / Alt / Shift` + `字母 / 数字 / F1~F12 / 空格`，
@@ -75,7 +76,7 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 
 | 文件 | 职责 |
 |---|---|
-| `main.rs` | 入口：panic 日志钩子、单实例互斥量、中文字体、托盘图标与菜单、图标资源 |
+| `main.rs` | 入口：panic 日志钩子、单实例互斥量 + 跨实例唤醒、中文字体、托盘图标与菜单、图标资源 |
 | `hotkey.rs` | 全局低级键盘钩子：修饰键状态、触发/松开判定、吞键、快捷键解析 |
 | `audio.rs` | cpal 采集；任意格式→单声道 f32；盒式滤波降采样到 16kHz；100ms 分帧 |
 | `asr/mod.rs` | 三家共用的 WebSocket 客户端框架、连接握手、结果累积 |
@@ -146,6 +147,13 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 
 接口地址写死在 `config.rs`，用户不用手填。
 
+识别选项与各家的参数映射（界面上不支持当前服务商的开关会禁用并注明）：
+
+| 设置 | 千问 | 豆包 | 腾讯云 |
+|---|---|---|---|
+| 自动添加标点 | `semantic_punctuation_enabled` | `enable_punc` | 服务端决定（界面禁用） |
+| 口语顺滑 | 暂不支持（界面禁用） | `enable_ddc` | `filter_modal`（语气词过滤） |
+
 ### 5. 容错
 
 - 任何 panic 都会带**文件 + 行号**写进日志；release 用 unwind，单次会话异常不会带走整个程序
@@ -174,7 +182,7 @@ assets/       图标资源（icon.ico + 128/32 RGBA）+ bbvoxi.rc
 scripts/      make_icons.py（源图去背 → 透明图标一键生成）
 docs/         设计与修复报告 + 界面截图
 build.rs      用 Windows SDK rc.exe 把图标编译进 exe
-dist/         打包产物（BBVoxi-1.0.0.exe，不入库）
+dist/         打包产物（BBVoxi-1.1.exe，不入库）
 ```
 
 ---
@@ -183,10 +191,11 @@ dist/         打包产物（BBVoxi-1.0.0.exe，不入库）
 
 ```bash
 cargo build --release
-copy target\release\bbvoxi.exe dist\BBVoxi-1.0.0.exe
+copy target\release\bbvoxi.exe dist\BBVoxi-1.1.exe
 ```
 
-然后在 GitHub 新建 Release：Tag `v1.0.0`，标题 `BBVoxi 1.0.0`，上传 `dist/BBVoxi-1.0.0.exe`。
+然后在 GitHub 新建 Release：Tag `v1.1`，标题 `BBVoxi 1.1`，上传 `dist/BBVoxi-1.1.exe`。
+（对外发布统一用两位版本号 `1.1`；`Cargo.toml` 内为满足 Cargo 的 SemVer 字段限制写 `1.1.0`。）
 
 > `dist/`、`*.exe`、构建产物与 `.workbuddy/` 已在 `.gitignore` 中忽略，不会进仓库。
 
@@ -219,7 +228,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.0.0.exe
 
 ## 十、版本与发布
 
-**当前**：v1.0.0（Stable，2026-09-10）
+**当前**：v1.1（Stable，2026-09-11）
 
 发布说明分两层组织：
 
@@ -228,7 +237,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.0.0.exe
 
 | 文档 | 说明 |
 |---|---|
-| [docs/RELEASE_v1.0.0.md](./docs/RELEASE_v1.0.0.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 架构图 · 14 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
+| [docs/RELEASE_v1.1.md](./docs/RELEASE_v1.1.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 14 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
 | [docs/版本历史.md](./docs/版本历史.md) | 所有版本索引、写作模板、手动发布流程 |
 
 > 后续每个版本都会新增一份 `docs/RELEASE_v<版本号>.md`，并在「版本历史」追加索引行。发布流程见 `docs/版本历史.md` §4。

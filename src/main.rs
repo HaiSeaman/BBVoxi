@@ -25,9 +25,12 @@ use session::{Cmd, Shared};
 fn main() -> Result<()> {
     install_panic_hook();
     if !single_instance_lock() {
-        eprintln!("BBVoxi 已在运行（可在系统托盘中打开设置）。");
+        // 已有实例在运行：windows_subsystem=windows 下没有控制台，打印没人看得见；
+        // 用户双击 exe 想看到的正是设置窗，所以直接通知那个实例弹出来
+        WakeEvent::signal_running_instance();
         return Ok(());
     }
+    let wake = WakeEvent::create();
 
     let (cfg, first_run) = config::load_or_default()?;
     // --settings：即使已配置也直接打开设置窗（方便手动查看/排障）
@@ -49,10 +52,55 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             setup_cjk_font(&cc.egui_ctx);
             ui::setup_style(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc, cfg, force_settings)))
+            Ok(Box::new(App::new(cc, cfg, force_settings, wake)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("启动界面失败：{e}"))
+}
+
+/// 跨实例唤醒：第二个实例通过命名事件通知第一个实例打开设置窗。
+/// 事件创建失败只损失该功能（返回 None），不影响主流程。
+struct WakeEvent(windows::Win32::Foundation::HANDLE);
+
+impl WakeEvent {
+    /// 首个实例：创建命名事件，之后在 UI 帧循环里轮询
+    fn create() -> Option<Self> {
+        use windows::Win32::System::Threading::CreateEventW;
+        unsafe {
+            match CreateEventW(
+                None,
+                false, // 自动复位：一次唤醒只弹一次窗
+                false,
+                windows::core::w!("BBVoxi_ShowSettings"),
+            ) {
+                Ok(h) if !h.is_invalid() => Some(Self(h)),
+                _ => None,
+            }
+        }
+    }
+
+    /// 第二个实例：同名事件已存在（CreateEventW 拿到的是同一个内核对象），
+    /// 置位它即可唤醒首个实例；句柄随本进程退出自动回收
+    fn signal_running_instance() {
+        use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+        unsafe {
+            if let Ok(h) = CreateEventW(
+                None,
+                false,
+                false,
+                windows::core::w!("BBVoxi_ShowSettings"),
+            ) {
+                let _ = SetEvent(h);
+            }
+        }
+    }
+
+    /// 是否收到了唤醒（会自动复位）
+    fn poll(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
 }
 
 /// 任何 panic 都写进日志再交给默认处理器。
@@ -77,6 +125,10 @@ fn install_panic_hook() {
 
 /// 窗口尺寸与位置：高度跟着屏幕走并强制居中，
 /// 否则 Windows 会每次启动把窗口往右下挪 52px，几次之后底部按钮就跑到屏幕外了。
+///
+/// DPI 说明（不要"顺手修"）：这里在 eframe 初始化之前调用，进程仍是 DPI-unaware，
+/// GetSystemMetrics 返回的是按 96 DPI 虚拟化过的逻辑像素——恰好就是 egui 的逻辑坐标，
+/// 因此 125%/150% 缩放屏上算出的居中位置依然正确。
 fn window_geometry() -> (f32, f32, [f32; 2]) {
     #[cfg(windows)]
     {
@@ -154,13 +206,22 @@ struct App {
     tray_tooltip: Option<String>,
     /// 启动时要求把设置窗置前（--settings）
     focus_once: bool,
+    /// 下一帧把设置窗抢到前台（刚显示的窗口立刻 SetForegroundWindow 会失败）
+    pending_focus: bool,
+    /// 重复启动 exe 时的唤醒通道
+    wake: Option<WakeEvent>,
     open_item: MenuItem,
     record_item: MenuItem,
     quit_item: MenuItem,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, cfg: Config, force_settings: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        cfg: Config,
+        force_settings: bool,
+        wake: Option<WakeEvent>,
+    ) -> Self {
         log::log("BBVoxi 启动");
         let shared = Arc::new(Shared::new(cc.egui_ctx.clone()));
         let cfg_shared = Arc::new(Mutex::new(cfg.clone()));
@@ -199,6 +260,8 @@ impl App {
             tray_recording: None,
             tray_tooltip: None,
             focus_once: force_settings,
+            pending_focus: false,
+            wake,
             open_item: MenuItem::new("打开设置", true, None),
             record_item: MenuItem::new("开始录音", true, None),
             quit_item: MenuItem::new("退出", true, None),
@@ -217,9 +280,11 @@ impl App {
             .build()?)
     }
 
-    fn show_settings(&self, ctx: &egui::Context) {
+    /// 弹出设置窗。焦点下一帧再抢：刚显示的窗口立刻 SetForegroundWindow
+    /// 在 Windows 上经常失败，表现为"窗口开了但压在其他窗口下面"。
+    fn show_settings(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.pending_focus = true;
     }
 
     /// 托盘图标与菜单文案跟随录音状态
@@ -286,6 +351,19 @@ impl eframe::App for App {
             self.show_settings(ctx);
         }
 
+        // 重复启动 exe：第二个实例已退出，这里收到唤醒后弹出设置窗
+        let wake_triggered = self.wake.as_ref().is_some_and(WakeEvent::poll);
+        if wake_triggered {
+            log::log("收到重复启动请求，打开设置窗");
+            self.show_settings(ctx);
+        }
+
+        // 上一帧刚显示了窗口，现在抢前台（时机见 show_settings 的注释）
+        if self.pending_focus {
+            self.pending_focus = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
         // 关闭按钮 = 隐藏到托盘，不退出进程
         if ctx.input(|i| i.viewport().close_requested()) {
             self.settings.cancel_capture();
@@ -308,6 +386,7 @@ impl eframe::App for App {
                     .send(if recording { Cmd::Stop } else { Cmd::Start });
             } else if event.id == self.quit_item.id() {
                 log::log("用户退出");
+                self.tray = None; // 先析构托盘图标：process::exit 不跑 Drop，图标会一直残留在托盘
                 std::process::exit(0);
             }
         }
@@ -342,6 +421,24 @@ fn window_icon() -> egui::IconData {
         rgba: ICON_WINDOW.to_vec(),
         width: 128,
         height: 128,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 唤醒机制的内核对象语义（不启 UI、不开窗口）：
+    /// 同名事件是同一个内核对象；置位后 poll 能看到一次，且自动复位
+    /// （一次唤醒只弹一次窗）。注意：跑测试时若 BBVoxi 正在运行，
+    /// 对方也会轮询同一事件，此测试可能出现竞态失败——属环境问题。
+    #[test]
+    fn wake_event_signal_is_seen_once_and_auto_resets() {
+        let first = WakeEvent::create().expect("创建命名事件应成功");
+        assert!(!first.poll(), "刚创建的事件不应处于置位状态");
+        WakeEvent::signal_running_instance();
+        assert!(first.poll(), "第二实例置位后，第一实例应能轮询到唤醒");
+        assert!(!first.poll(), "自动复位：一次唤醒只应弹出一次设置窗");
     }
 }
 

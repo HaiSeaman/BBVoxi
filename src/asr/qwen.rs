@@ -9,15 +9,19 @@ use tokio_tungstenite::tungstenite::Message;
 pub struct Qwen {
     task_id: String,
     model: String,
+    /// 语义标点（跟随「自动添加标点」开关）：true 由 LLM 加标点更准但首字更慢，
+    /// false 用 VAD 断句、出字更快
+    semantic_punctuation: bool,
     pub ready: bool,
     finished: bool,
 }
 
 impl Qwen {
-    pub fn new(cfg: &QwenConfig) -> Self {
+    pub fn new(cfg: &QwenConfig, auto_punctuation: bool) -> Self {
         Self {
             task_id: uuid::Uuid::new_v4().to_string(),
             model: cfg.model.trim().to_string(),
+            semantic_punctuation: auto_punctuation,
             ready: false,
             finished: false,
         }
@@ -34,6 +38,7 @@ impl Qwen {
                 "parameters": {
                     "format": "pcm",
                     "sample_rate": 16_000,
+                    "semantic_punctuation_enabled": self.semantic_punctuation,
                     // 静音时保持连接，否则长时间不说话会被服务端断开
                     "heartbeat": true
                 },
@@ -111,6 +116,22 @@ fn parse_json(text: &str, ready: &mut bool, finished: &mut bool) -> Parsed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「自动添加标点」开关必须真的落到请求参数里（之前不传，开关是摆设）
+    #[test]
+    fn punctuation_toggle_reaches_request() {
+        let cfg = QwenConfig::default();
+        let on = match &Qwen::new(&cfg, true).start_messages()[0] {
+            Message::Text(t) => t.to_string(),
+            _ => panic!("应为文本帧"),
+        };
+        assert!(on.contains(r#""semantic_punctuation_enabled":true"#));
+        let off = match &Qwen::new(&cfg, false).start_messages()[0] {
+            Message::Text(t) => t.to_string(),
+            _ => panic!("应为文本帧"),
+        };
+        assert!(off.contains(r#""semantic_punctuation_enabled":false"#));
+    }
 
     fn feed(raw: &str) -> Parsed {
         let (mut ready, mut finished) = (false, false);

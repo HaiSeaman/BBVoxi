@@ -164,7 +164,7 @@ impl SettingsApp {
                 egui::Frame::new()
                     .fill(p.card)
                     .stroke(Stroke::new(1.0, p.border))
-                    .inner_margin(Margin::symmetric(16, 12)),
+                    .inner_margin(Margin::symmetric(16, 10)),
             )
             .show(ui, |ui| self.actions_bar(ui, &p));
 
@@ -180,15 +180,19 @@ impl SettingsApp {
                     .show(ui, |ui| {
                         ui.add_space(2.0);
                         self.header(ui, &p);
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
                         self.service_card(ui, &p);
                         ui.add_space(8.0);
                         self.hotkey_card(ui, &p);
                         ui.add_space(8.0);
-                        self.options_card(ui, &p);
-                        ui.add_space(8.0);
+                        // 反馈区放在配置区之前：测试录音时不用滚动就能看到实时文字
                         self.result_card(ui, &p);
                         ui.add_space(8.0);
+                        self.options_card(ui, &p);
+                        ui.add_space(8.0);
+                        // 通用沉底：设一次就不动的开关，不挤占首屏
+                        self.general_card(ui, &p);
+                        ui.add_space(6.0);
                     });
             });
     }
@@ -229,7 +233,8 @@ impl SettingsApp {
         } else if snap.error.is_some() {
             (p.danger, "出错了".to_string())
         } else if self.capturing {
-            (p.warn, "录制中".to_string())
+            // 与「录音中」一字之差完全分不清，改成明确指向快捷键
+            (p.warn, "改键中".to_string())
         } else if !self.edit.credentials_ready() {
             (p.warn, "未配置".to_string())
         } else {
@@ -259,14 +264,7 @@ impl SettingsApp {
             ui.add_space(10.0);
 
             ui.label(RichText::new("服务商").size(12.0).color(p.muted));
-            egui::ComboBox::from_id_salt("provider")
-                .selected_text(self.edit.provider.label())
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    for provider in Provider::ALL {
-                        ui.selectable_value(&mut self.edit.provider, provider, provider.label());
-                    }
-                });
+            provider_selector(ui, p, &mut self.edit.provider);
             ui.add_space(8.0);
 
             ui.push_id(self.edit.provider.label(), |ui| match self.edit.provider {
@@ -312,17 +310,11 @@ impl SettingsApp {
                     );
                     ui.label(
                         RichText::new("Hy-ASR-3.0-preview 仅支持 60 秒内语音，上限建议 55 秒")
-                            .size(11.5)
+                            .size(11.0)
                             .color(p.muted),
                     );
                 }
             });
-
-            ui.add_space(6.0);
-            ui.checkbox(
-                &mut self.show_keys,
-                RichText::new("显示密钥明文").size(13.0),
-            );
         });
     }
 
@@ -380,31 +372,80 @@ impl SettingsApp {
         card(p, ui, |ui, p| {
             section_title(ui, p, "识别选项");
             ui.add_space(8.0);
+            // 实时输入是客户端行为，三家服务商都可用
             ui.checkbox(
                 &mut self.edit.options.live_typing,
-                RichText::new("边说话边打字（实时输入）").size(13.5),
+                RichText::new("边说话边打字（实时输入）").size(13.0),
             );
             ui.label(
-                RichText::new("识别修正时自动回退重打；关掉则只在松手后一次性输入")
-                    .size(11.5)
+                RichText::new("识别被修正时自动回退重打；关闭则只在松手后一次性输入")
+                    .size(11.0)
                     .color(p.muted),
             );
             ui.add_space(4.0);
-            ui.checkbox(
-                &mut self.edit.options.auto_punctuation,
-                RichText::new("自动添加标点").size(13.5),
+
+            // 标点 / 顺滑只有部分服务商支持：不支持时禁用并说明，
+            // 不能给用户一个看起来能拨、实际不接线的开关
+            let (punc_ok, smooth_ok) = match self.edit.provider {
+                Provider::Qwen => (true, false),
+                Provider::Doubao => (true, true),
+                Provider::Tencent => (false, true),
+            };
+            ui.add_enabled(
+                punc_ok,
+                egui::Checkbox::new(
+                    &mut self.edit.options.auto_punctuation,
+                    RichText::new("自动添加标点").size(13.0),
+                ),
             );
-            ui.checkbox(
-                &mut self.edit.options.smooth,
-                RichText::new("口语顺滑（去除重复与语气词）").size(13.5),
+            ui.label(
+                RichText::new(if punc_ok {
+                    "识别结果自动补全逗号、句号等标点"
+                } else {
+                    "腾讯云引擎由服务端决定，暂不支持此选项"
+                })
+                .size(11.0)
+                .color(p.muted),
+            );
+            ui.add_space(4.0);
+            ui.add_enabled(
+                smooth_ok,
+                egui::Checkbox::new(
+                    &mut self.edit.options.smooth,
+                    RichText::new("口语顺滑（去除重复与语气词）").size(13.0),
+                ),
+            );
+            ui.label(
+                RichText::new(if smooth_ok {
+                    "过滤「嗯、啊」等语气词与重复表述"
+                } else {
+                    "千问暂不支持此选项"
+                })
+                .size(11.0)
+                .color(p.muted),
+            );
+        });
+    }
+
+    /// 通用：与识别无关的开关（沉底放）。开机自启之前挤在底部操作条里，
+    /// 和瞬态状态消息、动作按钮混在一起，职责不清，挪进卡片。
+    fn general_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(p, ui, |ui, p| {
+            section_title(ui, p, "通用");
+            ui.add_space(8.0);
+            self.autostart_checkbox(ui);
+            ui.label(
+                RichText::new("登录 Windows 后自动在后台待命，不弹窗口")
+                    .size(11.0)
+                    .color(p.muted),
             );
         });
     }
 
     /// 开机自启：勾选立即写注册表（失败会回滚勾选）
-    fn autostart_checkbox(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn autostart_checkbox(&mut self, ui: &mut egui::Ui) {
         let before = self.autostart;
-        ui.checkbox(&mut self.autostart, RichText::new("开机自启").size(12.5));
+        ui.checkbox(&mut self.autostart, RichText::new("开机自启").size(13.0));
         if self.autostart != before && self.autostart != self.applied_autostart {
             match autostart::set(self.autostart) {
                 Ok(()) => {
@@ -424,7 +465,6 @@ impl SettingsApp {
                 }
             }
         }
-        let _ = p;
     }
 
     fn result_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -433,11 +473,18 @@ impl SettingsApp {
             section_title(ui, p, "最近识别");
             ui.add_space(8.0);
             if snap.recording {
+                // 录音中的呼吸点：整窗唯一的动效，一眼看出"正在听"
+                let t = ui.ctx().input(|i| i.time);
+                let pulse = (0.55 + 0.45 * (t * 4.0).sin()) as f32;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").size(12.0).color(p.danger));
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 4.0, p.danger.gamma_multiply(0.35 + 0.65 * pulse));
+                    ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!("录音中 {}", clock(snap.elapsed())))
                             .size(13.0)
+                            .strong()
                             .color(p.danger),
                     );
                 });
@@ -462,7 +509,7 @@ impl SettingsApp {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new("测试结果只显示在这里，不会往其他程序里打字。")
-                        .size(11.5)
+                        .size(11.0)
                         .color(p.muted),
                 );
             }
@@ -472,12 +519,25 @@ impl SettingsApp {
     // —— 底部操作条 ——
 
     fn actions_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // 状态条独占一行：和按钮挤在水平布局里会被长错误消息挤压甚至截断
+        if let Some((ok, msg)) = self.status.clone() {
+            let color = if ok { p.ok } else { p.danger };
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, color);
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(RichText::new(msg).size(12.0).color(color).strong()).truncate(),
+                );
+            });
+            ui.add_space(6.0);
+        }
         let recording = self.shared.snapshot().recording;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !recording,
-                    egui::Button::new(RichText::new("测试识别（5 秒）").size(13.5).color(p.text))
+                    egui::Button::new(RichText::new("测试识别（5 秒）").size(13.0).color(p.text))
                         .fill(p.field)
                         .stroke(Stroke::new(1.0, p.border))
                         .corner_radius(CornerRadius::same(8))
@@ -504,20 +564,12 @@ impl SettingsApp {
             {
                 self.save();
             }
-            // 右侧放开机自启开关，操作条一行解决，不占卡片空间
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let color = self.status.as_ref().map(|(ok, _)| *ok);
-                let msg = self.status.as_ref().map(|(_, m)| m.clone());
-                self.autostart_checkbox(ui, p);
-                ui.add_space(6.0);
-                if let Some(msg) = msg {
-                    let c = if color.unwrap_or(true) {
-                        p.ok
-                    } else {
-                        p.danger
-                    };
-                    ui.label(RichText::new(msg).size(12.0).color(c));
-                }
+                ui.label(
+                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .size(11.0)
+                        .color(p.muted),
+                );
             });
         });
     }
@@ -625,7 +677,17 @@ impl SettingsApp {
     }
 
     fn secret_field(&mut self, ui: &mut egui::Ui, p: &Palette, label: &str, id: &str) {
-        ui.label(RichText::new(label).size(12.0).color(p.muted));
+        // 标签行右侧放"显示/隐藏"小按钮：入口紧贴字段本身，
+        // 替代原先挂在卡片底部的全局「显示密钥明文」复选框
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).size(12.0).color(p.muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let eye = if self.show_keys { "隐藏" } else { "显示" };
+                if small_button(ui, p, eye).clicked() {
+                    self.show_keys = !self.show_keys;
+                }
+            });
+        });
         let value = match id {
             "qwen_key" => &mut self.edit.qwen.api_key,
             "doubao_key" => &mut self.edit.doubao.api_key,
@@ -651,7 +713,7 @@ fn card<R>(p: &Palette, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui, &Pale
         .fill(p.card)
         .stroke(Stroke::new(1.0, p.border))
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::symmetric(16, 12))
+        .inner_margin(Margin::symmetric(16, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui, p)
@@ -697,6 +759,64 @@ fn ghost_button(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
             .corner_radius(CornerRadius::same(8))
             .min_size(egui::vec2(0.0, 32.0)),
     )
+}
+
+/// 贴在字段标签行里的小按钮（如"显示/隐藏"密钥）
+fn small_button(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.0).color(p.muted))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(6))
+            .min_size(egui::vec2(0.0, 22.0)),
+    )
+}
+
+/// 服务商分段选择器：三家一眼看全，比下拉少一次点击
+fn provider_selector(ui: &mut egui::Ui, p: &Palette, current: &mut Provider) {
+    ui.horizontal(|ui| {
+        let count = Provider::ALL.len() as f32;
+        let width = (ui.available_width() - (count - 1.0) * 6.0) / count;
+        for (i, provider) in Provider::ALL.into_iter().enumerate() {
+            if i > 0 {
+                ui.add_space(6.0);
+            }
+            let selected = *current == provider;
+            let (fill, text_color, stroke) = if selected {
+                (
+                    p.accent.gamma_multiply(0.14),
+                    p.accent,
+                    Stroke::new(1.5, p.accent),
+                )
+            } else {
+                (p.field, p.muted, Stroke::new(1.0, p.border))
+            };
+            let label = RichText::new(short_label(provider))
+                .size(13.0)
+                .strong()
+                .color(text_color);
+            if ui
+                .add(
+                    egui::Button::new(label)
+                        .fill(fill)
+                        .stroke(stroke)
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(egui::vec2(width, 32.0)),
+                )
+                .clicked()
+            {
+                *current = provider;
+            }
+        }
+    });
+}
+
+fn short_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Qwen => "千问",
+        Provider::Doubao => "豆包",
+        Provider::Tencent => "腾讯云",
+    }
 }
 
 fn icon_texture(ctx: &egui::Context) -> egui::TextureHandle {

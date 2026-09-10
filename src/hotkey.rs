@@ -179,6 +179,8 @@ struct HookCtx {
     shift: AtomicBool,
     win: AtomicBool,
     armed: AtomicBool,
+    /// 触发键的 keydown 被我们吞过（决定 keyup 是否也吞）
+    held: AtomicBool,
 }
 
 static CTX: OnceLock<HookCtx> = OnceLock::new();
@@ -227,6 +229,7 @@ pub fn spawn(hk: Hotkey, tx: UnboundedSender<Cmd>, paused: Arc<AtomicBool>) -> R
         shift: AtomicBool::new(false),
         win: AtomicBool::new(false),
         armed: AtomicBool::new(false),
+        held: AtomicBool::new(false),
     })
     .ok();
 
@@ -290,8 +293,16 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             shift: ctx.shift.load(Ordering::Relaxed),
             win: ctx.win.load(Ordering::Relaxed),
         };
-        let decision = decide(current(), mods, vk, down, ctx.armed.load(Ordering::Relaxed));
+        let decision = decide(
+            current(),
+            mods,
+            vk,
+            down,
+            ctx.armed.load(Ordering::Relaxed),
+            ctx.held.load(Ordering::Relaxed),
+        );
         ctx.armed.store(decision.armed, Ordering::Relaxed);
+        ctx.held.store(decision.held, Ordering::Relaxed);
 
         match decision.trigger {
             Some(Trigger::Start) => {
@@ -380,11 +391,17 @@ pub struct Decision {
     pub swallow: bool,
     /// 处理之后是否处于「按住中」状态
     pub armed: bool,
+    /// 处理之后触发键是否仍处于「我们吞过它的 keydown」状态
+    pub held: bool,
 }
 
 /// 判定逻辑抽成纯函数：钩子回调本身没法单元测试，
 /// 而「按住说话」的正确性全靠这里（这块之前没人看着，就出过问题）。
-pub fn decide(hk: Hotkey, mods: Mods, vk: u32, down: bool, armed: bool) -> Decision {
+///
+/// `armed` = 正处于按住说话；`held` = 触发键的 keydown 被我们吞过。
+/// keyup 只吞 `held` 的键：裸按触发键（没按修饰键）时 keydown 已放行给
+/// 前台程序，keyup 也必须放行——否则在游戏等跟踪 keyup 的程序里表现为按键卡住。
+pub fn decide(hk: Hotkey, mods: Mods, vk: u32, down: bool, armed: bool, held: bool) -> Decision {
     let mods_ok =
         hk.ctrl == mods.ctrl && hk.alt == mods.alt && hk.shift == mods.shift && hk.win == mods.win;
 
@@ -395,20 +412,25 @@ pub fn decide(hk: Hotkey, mods: Mods, vk: u32, down: bool, armed: bool) -> Decis
                 trigger: if armed { None } else { Some(Trigger::Start) },
                 swallow: true,
                 armed: true,
+                held: true,
             };
         }
         return Decision {
             trigger: None,
             swallow: false,
             armed,
+            held,
         };
     }
 
     if vk == hk.vk {
         return Decision {
             trigger: if armed { Some(Trigger::Stop) } else { None },
-            swallow: true,
+            // 只吞自己吞过 keydown 的键：先松修饰键结束录音后，触发键的
+            // keyup 仍要吞（它的 keydown 从没到过前台程序）
+            swallow: held,
             armed: false,
+            held: false,
         };
     }
     // 先松开修饰键（例如先放 Ctrl 再放 1）也要结束录音
@@ -417,12 +439,14 @@ pub fn decide(hk: Hotkey, mods: Mods, vk: u32, down: bool, armed: bool) -> Decis
             trigger: Some(Trigger::Stop),
             swallow: false,
             armed: false,
+            held,
         };
     }
     Decision {
         trigger: None,
         swallow: false,
         armed,
+        held,
     }
 }
 
@@ -480,27 +504,28 @@ mod tests {
     fn press_and_release_triggers_start_then_stop() {
         let hk = parse("ctrl+1").unwrap();
         // 按下 1
-        let d = decide(hk, CTRL, 0x31, true, false);
+        let d = decide(hk, CTRL, 0x31, true, false, false);
         assert_eq!(d.trigger, Some(Trigger::Start));
         assert!(d.swallow, "命中组合必须吞键，否则浏览器会切标签");
         assert!(d.armed);
         // 长按重复 keydown 不再重复开始
-        let d2 = decide(hk, CTRL, 0x31, true, d.armed);
+        let d2 = decide(hk, CTRL, 0x31, true, d.armed, d.held);
         assert_eq!(d2.trigger, None);
         // 松开 1
-        let d3 = decide(hk, CTRL, 0x31, false, d2.armed);
+        let d3 = decide(hk, CTRL, 0x31, false, d2.armed, d2.held);
         assert_eq!(d3.trigger, Some(Trigger::Stop));
-        assert!(d3.swallow);
+        assert!(d3.swallow, "吞过 keydown 的键，keyup 也要吞");
         assert!(!d3.armed);
     }
 
     #[test]
     fn user_backtick_hotkey_works_with_ctrl_held() {
         let hk = parse("ctrl+`").unwrap();
-        let start = decide(hk, CTRL, 0xC0, true, false);
+        let start = decide(hk, CTRL, 0xC0, true, false, false);
         assert_eq!(start.trigger, Some(Trigger::Start));
-        let stop = decide(hk, CTRL, 0xC0, false, start.armed);
+        let stop = decide(hk, CTRL, 0xC0, false, start.armed, start.held);
         assert_eq!(stop.trigger, Some(Trigger::Stop));
+        assert!(stop.swallow);
     }
 
     #[test]
@@ -510,21 +535,40 @@ mod tests {
             shift: true,
             ..CTRL
         };
-        assert_eq!(decide(hk, with_shift, 0x31, true, false).trigger, None);
-        assert!(!decide(hk, with_shift, 0x31, true, false).swallow);
+        assert_eq!(
+            decide(hk, with_shift, 0x31, true, false, false).trigger,
+            None
+        );
+        assert!(!decide(hk, with_shift, 0x31, true, false, false).swallow);
     }
 
     #[test]
     fn releasing_modifier_first_still_stops() {
         let hk = parse("ctrl+1").unwrap();
-        let start = decide(hk, CTRL, 0x31, true, false);
+        let start = decide(hk, CTRL, 0x31, true, false, false);
         assert_eq!(start.trigger, Some(Trigger::Start));
         // 用户先松开 Ctrl
-        let stop = decide(hk, NONE, 0xA2, false, start.armed);
+        let stop = decide(hk, NONE, 0xA2, false, start.armed, start.held);
         assert_eq!(stop.trigger, Some(Trigger::Stop));
         assert!(!stop.armed);
-        // 之后再松开 1 不应该重复发 Stop
-        assert_eq!(decide(hk, NONE, 0x31, false, false).trigger, None);
+        // 之后再松开 1：不重复发 Stop，但 keyup 仍要吞（keydown 没放行过）
+        let after = decide(hk, NONE, 0x31, false, stop.armed, stop.held);
+        assert_eq!(after.trigger, None);
+        assert!(after.swallow, "先松修饰键时，触发键的 keyup 仍必须吞");
+    }
+
+    /// 回归测试（按键卡住 bug）：没按修饰键直接按触发键（如只按 1）时，
+    /// keydown 已放行给前台程序，keyup 也必须放行——
+    /// 否则在游戏等跟踪 keyup 的程序里表现为按键一直被按住。
+    #[test]
+    fn bare_trigger_keyup_passes_through() {
+        let hk = parse("ctrl+1").unwrap();
+        let down = decide(hk, NONE, 0x31, true, false, false);
+        assert!(!down.swallow, "裸按触发键：keydown 必须放行");
+        assert_eq!(down.trigger, None);
+        let up = decide(hk, NONE, 0x31, false, down.armed, down.held);
+        assert!(!up.swallow, "裸按触发键：keyup 也必须放行，否则按键卡住");
+        assert_eq!(up.trigger, None);
     }
 
     /// 真实键盘上报的是左右分开的虚拟键码（左 Ctrl = 0xA2），一个都不能漏
@@ -557,7 +601,7 @@ mod tests {
     #[test]
     fn unrelated_keys_pass_through_untouched() {
         let hk = parse("ctrl+1").unwrap();
-        let d = decide(hk, CTRL, 0x41, true, false); // Ctrl+A
+        let d = decide(hk, CTRL, 0x41, true, false, false); // Ctrl+A
         assert_eq!(d.trigger, None);
         assert!(!d.swallow, "非组合键必须放行");
     }
@@ -568,23 +612,24 @@ mod tests {
     #[test]
     fn repeated_keydowns_while_holding_are_all_swallowed() {
         let hk = parse("ctrl+1").unwrap();
-        let first = decide(hk, CTRL, 0x31, true, false);
+        let first = decide(hk, CTRL, 0x31, true, false, false);
         assert_eq!(first.trigger, Some(Trigger::Start));
         assert!(first.swallow);
 
         // 模拟长按产生的 20 次自动重复
-        let mut armed = first.armed;
+        let (mut armed, mut held) = (first.armed, first.held);
         for _ in 0..20 {
-            let repeat = decide(hk, CTRL, 0x31, true, armed);
+            let repeat = decide(hk, CTRL, 0x31, true, armed, held);
             assert!(
                 repeat.swallow,
                 "自动重复的 keydown 必须继续吞掉，否则会出现 1111"
             );
             assert_eq!(repeat.trigger, None, "不能重复触发开始录音");
             armed = repeat.armed;
+            held = repeat.held;
         }
 
-        let stop = decide(hk, CTRL, 0x31, false, armed);
+        let stop = decide(hk, CTRL, 0x31, false, armed, held);
         assert_eq!(stop.trigger, Some(Trigger::Stop));
     }
 

@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+#[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -29,12 +30,30 @@ pub fn log(msg: impl AsRef<str>) {
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_BYTES {
         let _ = fs::rename(&path, path.with_extension("log.1"));
     }
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "[{ts}] {}", msg.as_ref());
+        let _ = writeln!(f, "[{}] {}", local_timestamp(), msg.as_ref());
     }
     eprintln!("{}", msg.as_ref()); // 开发期同时在控制台可见
+}
+
+/// 本地可读时间戳。之前写的是 unix 秒（如 1757491200），排障时完全对不上发生时间。
+fn local_timestamp() -> String {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let st = unsafe { GetLocalTime() };
+        return format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        );
+    }
+    // 非 Windows 兜底：unix 秒
+    #[cfg(not(windows))]
+    {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{ts}")
+    }
 }
