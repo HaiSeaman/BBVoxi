@@ -1,0 +1,53 @@
+[package]
+name = "bbvoxi"
+version = "1.0.0"
+edition = "2021"
+description = "BBVoxi - Windows 语音输入法：按住快捷键说话，松开即自动输入到光标处"
+rust-version = "1.80"
+
+[dependencies]
+eframe = { version = "0.35.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+tray-icon = "0.24.2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# rustls 必须显式启用一个加密后端，否则首次 WSS 连接会 panic（release 下 panic=abort = 闪退）
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+cpal = "0.17"
+flate2 = "1"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+percent-encoding = "2"
+uuid = { version = "1", features = ["v4"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+# 不用 panic=abort：常驻程序里一次 panic 就静默消失是最糟的失败方式，
+# 改成 unwind 后后台线程的 panic 不会带走整个程序，配合 panic hook 还会记进日志。
+panic = "unwind"
+strip = true

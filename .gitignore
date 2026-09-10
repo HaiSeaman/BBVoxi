@@ -1,0 +1,48 @@
+# Rust 构建产物
+/target/
+**/target/
+
+# 打包产物（发布时手动上传，不入库）
+/dist/
+*.exe
+*.msi
+
+# 图标资源编译中间产物
+*.res
+
+# 本机 / 会话数据（不入库）
+.workbuddy
+
+# 本机辅助脚本（含本机绝对路径，只在本地用，不入库）
+scripts/git_init_v1.ps1
+
+# 编辑器与系统文件
+.vs/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志
+*.log
+*.log.*
+
+# 凭据与本机配置（救命闸门：万一有人把配置拷进仓库，也不会被提交）
+.env
+.env.*
+!.env.example
+
+# 配置文件：只忽略仓库根的，不误伤项目里可能需要的同名文件
+/config.json
+# 兜底：任何目录下的 BBVoxi 配置文件（我们的配置目录就叫 BBVoxi）
+**/BBVoxi/config.json
+
+# 密钥与证书类
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+*credential*
+*secret*
