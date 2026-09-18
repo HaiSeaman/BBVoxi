@@ -183,7 +183,15 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+        let json = serde_json::to_string_pretty(self)?;
+        // 原子写：先写同目录下的临时文件，成功后再改名覆盖目标。
+        // 直接覆盖写的话，写到一半崩溃/断电会留下半截坏文件，下次启动只能
+        // 静默回退默认配置（凭据全丢）。同卷内的改名是原子的：要么旧文件，
+        // 要么完整的新文件，不会出现"半截"状态。
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// 当前服务商是否已填好可用凭据（M3 连通性测试与 M2 录音前校验用）
@@ -259,5 +267,39 @@ mod tests {
         let cfg: Config = serde_json::from_str(raw).expect("旧配置必须还能读");
         assert_eq!(cfg.provider, Provider::Qwen);
         assert!(!cfg.options.auto_punctuation);
+    }
+
+    /// 保存必须是"要么整体成功、要么旧文件原封不动"。
+    ///
+    /// 直接覆盖写的话，写到一半崩溃/断电会留下半截坏文件，下次启动只能静默
+    /// 回退默认配置 —— 主人的 API Key 就这么没了。所以改成"先写临时文件、
+    /// 再改名覆盖"，写临时文件失败时旧配置必须一个字都没动。
+    #[test]
+    fn failed_save_keeps_the_previous_config_intact() {
+        let dir = std::env::temp_dir().join(format!("bbvoxi_atomic_{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let original = Config {
+            provider: Provider::Qwen,
+            ..Default::default()
+        };
+        original.save_to(&path).unwrap();
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "保存成功后不该留下临时文件"
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // 制造写入失败：在临时文件该在的位置放一个同名目录，写它必然失败
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        let broken = Config {
+            provider: Provider::Tencent,
+            ..Default::default()
+        };
+        assert!(broken.save_to(&path).is_err(), "写临时文件失败时必须如实报错");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before, "保存失败时旧配置必须原封不动");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

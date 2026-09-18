@@ -158,15 +158,19 @@ impl Doubao {
         if frame.flags & FLAG_LAST_PACKET != 0 {
             self.finished = true;
         }
+        // `finished` 必须跟着文本一起上报：最后一包可能同时带着新定稿的句子，
+        // 只回文本的话会话就等不到结束（主人松手后白等 8 秒超时）。
         if !newly_final.is_empty() {
             Parsed::Text {
                 kind: Kind::Final,
                 text: newly_final,
+                finished: self.finished,
             }
         } else if !partial.is_empty() {
             Parsed::Text {
                 kind: Kind::Partial,
                 text: partial,
+                finished: self.finished,
             }
         } else if self.finished {
             Parsed::Finished
@@ -371,6 +375,24 @@ mod tests {
         assert_eq!(&bytes[8..], &[4, 0, 5, 0, 6, 0]);
     }
 
+    /// 回归（结束标记与文本同包 → `done` 不置位，松手后白等 8 秒）：
+    /// 服务端实测最后一包 flags=0b0011，它可能**同时**带着新定稿的文本。
+    /// 解析必须把"这一包是最后一包"这个信息一起交给上层，不能被文本吞掉。
+    #[test]
+    fn last_packet_with_text_also_finishes() {
+        let mut d = Doubao::new(&cfg(), &Options::default());
+        let body = json!({
+            "result": { "utterances": [ { "text": "最后一句", "definite": true } ] }
+        });
+        match d.parse(real_frame(0b0011, Some(1), &body.to_string(), false)) {
+            Parsed::Text { text, finished, .. } => {
+                assert_eq!(text, "最后一句");
+                assert!(finished, "带着文本的最后一包也要结束会话");
+            }
+            other => panic!("应返回文本，实际：{other:?}"),
+        }
+    }
+
     #[test]
     fn parses_streaming_and_definite_utterances() {
         let mut d = Doubao::new(&cfg(), &Options::default());
@@ -387,7 +409,7 @@ mod tests {
         });
         let parsed = d.parse(server_frame(&body.to_string()));
         match parsed {
-            Parsed::Text { kind, text } => {
+            Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Final);
                 assert_eq!(text, "你好");
             }
@@ -402,7 +424,7 @@ mod tests {
             ] }
         });
         match d.parse(real_frame(0b0011, Some(1), &body2.to_string(), false)) {
-            Parsed::Text { kind, text } => {
+            Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Final);
                 assert_eq!(text, "世界"); // 只发新增的，不重复
             }

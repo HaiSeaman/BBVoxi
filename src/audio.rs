@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,8 +83,15 @@ fn build_stream(tx: Sender<Vec<i16>>, stopped: Arc<AtomicBool>) -> Result<cpal::
         other => bail!("不支持的麦克风采样格式：{other:?}"),
     };
     stream.play().context("启动麦克风采集失败")?;
+    // 日志里写清走的是哪条路：低于 16kHz 的输入（蓝牙免提）值得主人知道
+    // 自己在用免提设备，识别质量本来就比立体声麦克风差一截。
+    let how = match in_rate.cmp(&TARGET_RATE) {
+        std::cmp::Ordering::Less => "线性插值升采样",
+        std::cmp::Ordering::Equal => "原样通过",
+        std::cmp::Ordering::Greater => "盒式滤波降采样",
+    };
     crate::log::log(format!(
-        "麦克风已启动：{in_rate}Hz / {channels}ch / {format:?} → 重采样到 {TARGET_RATE}Hz"
+        "麦克风已启动：{in_rate}Hz / {channels}ch / {format:?} → {how}到 {TARGET_RATE}Hz"
     ));
     Ok(stream)
 }
@@ -101,7 +109,7 @@ where
     T: cpal::SizedSample + ToF32 + Send + 'static,
 {
     let mut feed = Feed {
-        decimator: Decimator::new(in_rate, TARGET_RATE),
+        resampler: Resampler::new(in_rate, TARGET_RATE),
         frame: Vec::with_capacity(FRAME_SAMPLES),
         tx,
         stopped,
@@ -116,7 +124,7 @@ where
 }
 
 struct Feed {
-    decimator: Decimator,
+    resampler: Resampler,
     frame: Vec<i16>,
     tx: Sender<Vec<i16>>,
     stopped: Arc<AtomicBool>,
@@ -138,8 +146,8 @@ impl Feed {
             let mono = self.sum / self.channels as f32;
             self.sum = 0.0;
             self.counted = 0;
-            self.decimator.push(mono);
-            while let Some(sample) = self.decimator.pop() {
+            self.resampler.push(mono);
+            while let Some(sample) = self.resampler.pop() {
                 self.frame.push(sample);
                 if self.frame.len() >= FRAME_SAMPLES {
                     let full =
@@ -161,6 +169,101 @@ impl Feed {
             }
         }
     }
+}
+
+/// 采样率转换：把麦克风的原生采样率统一到 16kHz。
+///
+/// 为什么要分两条路走：`Decimator` 那套"分箱取均值"只能把**多个**输入样本
+/// 合成一个输出样本。当输入比输出还少（蓝牙耳机免提模式常见 8kHz）时，
+/// 它会退化成"一进一出"——输出速率还是 8kHz，却被当成 16kHz 送去识别，
+/// 声音被慢放一倍，识别结果基本是乱码。升采样必须在样本之间插值。
+pub enum Resampler {
+    Down(Decimator),
+    Up(Interpolator),
+}
+
+impl Resampler {
+    pub fn new(in_rate: u32, out_rate: u32) -> Self {
+        if in_rate >= out_rate {
+            Resampler::Down(Decimator::new(in_rate, out_rate))
+        } else {
+            Resampler::Up(Interpolator::new(in_rate, out_rate))
+        }
+    }
+
+    pub fn push(&mut self, sample: f32) {
+        match self {
+            Resampler::Down(d) => d.push(sample),
+            Resampler::Up(u) => u.push(sample),
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<i16> {
+        match self {
+            Resampler::Down(d) => d.pop(),
+            Resampler::Up(u) => u.pop(),
+        }
+    }
+}
+
+/// 线性插值升采样：输入的采样率低于目标时，在两个样本之间补出中间值。
+///
+/// 第 m 个输出样本落在输入时间轴的 `m * 输入率/输出率` 处，取它左右两个
+/// 输入样本的线性插值。8k→16k 时正好是每两个样本之间补一个中点。
+pub struct Interpolator {
+    /// 每个输出样本在输入时间轴上推进的距离 = 输入率/输出率（< 1）
+    step: f64,
+    /// 下一个待计算的输出样本在输入时间轴上的位置
+    pos: f64,
+    /// 已经读入的输入样本个数
+    idx: u64,
+    /// 上一个输入样本（插值区间的左端点）
+    prev: f64,
+    /// 一次 push 可能产出多个输出样本（8k→16k 是两个），先攒着慢慢取
+    ready: VecDeque<i16>,
+}
+
+impl Interpolator {
+    pub fn new(in_rate: u32, out_rate: u32) -> Self {
+        Self {
+            step: in_rate as f64 / out_rate as f64,
+            pos: 0.0,
+            idx: 0,
+            prev: 0.0,
+            ready: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, sample: f32) {
+        let x = sample as f64;
+        if self.idx == 0 {
+            // 第一个样本既是时间轴 0 处的输出，也是后面插值的左端点
+            self.prev = x;
+            self.idx = 1;
+            self.ready.push_back(to_i16(x));
+            self.pos = self.step;
+            return;
+        }
+        // 现在已知 [idx-1, idx] 这一段的两个端点，把落在这段里的输出点全算出来
+        while self.pos <= self.idx as f64 {
+            let left = (self.idx - 1) as f64;
+            let frac = self.pos - left;
+            self.ready
+                .push_back(to_i16(self.prev + (x - self.prev) * frac));
+            self.pos += self.step;
+        }
+        self.prev = x;
+        self.idx += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<i16> {
+        self.ready.pop_front()
+    }
+}
+
+/// 归一化浮点样本 → i16：先夹到 [-1, 1]（插值可能越界），再按 i16::MAX 缩放。
+fn to_i16(sample: f64) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f64) as i16
 }
 
 /// 盒式滤波降采样：把输入样本按 (in_rate/out_rate) 分箱取均值。
@@ -206,8 +309,7 @@ impl Decimator {
         if self.count == 0 {
             return;
         }
-        let avg = (self.sum / self.count as f64).clamp(-1.0, 1.0);
-        self.ready = Some((avg * i16::MAX as f64) as i16);
+        self.ready = Some(to_i16(self.sum / self.count as f64));
         self.sum = 0.0;
         self.count = 0;
     }
@@ -256,6 +358,18 @@ mod tests {
         out
     }
 
+    /// 喂完输入、收干输出（升采样时一次 push 可能吐出多个样本，所以要收干净）
+    fn run(r: &mut Resampler, input: &[f32]) -> Vec<i16> {
+        let mut out = Vec::new();
+        for s in input {
+            r.push(*s);
+            while let Some(v) = r.pop() {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// 最后一个箱要等下一个样本进来才闭合，所以末尾多喂 1 个样本再断言
     #[test]
     fn downsample_48k_to_16k_keeps_rate_and_level() {
@@ -287,5 +401,41 @@ mod tests {
     #[test]
     fn frame_size_is_100ms() {
         assert_eq!(FRAME_SAMPLES, 1600);
+    }
+
+    /// 回归（低于 16kHz 的麦克风不会被升采样）：
+    /// 蓝牙耳机免提模式常见 8kHz 输入，服务端只认 16kHz —— 不补采样就等于
+    /// 把声音慢放一倍送过去，识别结果基本是乱码。输出速率必须是输入的 2 倍。
+    #[test]
+    fn upsamples_low_rate_input_to_target_rate() {
+        let mut r = Resampler::new(8_000, TARGET_RATE);
+        let input = vec![0.5f32; 80_000];
+        let out = run(&mut r, &input);
+        let ratio = out.len() as f64 / input.len() as f64;
+        assert!(
+            (ratio - 2.0).abs() < 0.001,
+            "8kHz 输入必须按 2 倍升采样到 16kHz，实际速率比只有 {ratio:.4}"
+        );
+    }
+
+    /// 升采样必须在两个样本之间**插值**，不能是"每个样本原样重复两遍"
+    /// （重复=零阶保持，会在频谱里产生镜像，听感发毛，识别也更差）。
+    /// 期望值按线性插值手算：位置 0/0.5/1/1.5/2/2.5/3 处的 [-1,-0.75,-0.5,-0.25,0,0.25,0.5]。
+    #[test]
+    fn upsampling_interpolates_between_neighbours() {
+        let mut r = Resampler::new(8_000, 16_000);
+        let out = run(&mut r, &[-1.0f32, -0.5, 0.0, 0.5]);
+        assert_eq!(out, vec![-32767, -24575, -16383, -8191, 0, 8191, 16383]);
+    }
+
+    /// 16kHz 及以上的输入不能被这次改动影响（走原来的降采样路径）
+    #[test]
+    fn decimation_path_is_unchanged() {
+        let mut r = Resampler::new(48_000, 16_000);
+        let mut input = vec![0.5f32; 48_000];
+        input.push(0.0);
+        let out = run(&mut r, &input);
+        assert_eq!(out.len(), 16_000);
+        assert!(out.iter().all(|v| (*v - 16383).abs() <= 1), "电平被改变");
     }
 }

@@ -45,7 +45,17 @@ pub enum Kind {
 /// 一次 provider 帧的解析结果
 #[derive(Debug)]
 pub enum Parsed {
-    Text { kind: Kind, text: String },
+    /// 带文本的结果。
+    ///
+    /// `finished` = 这一包同时是会话的**最后一包**：腾讯（`final=1`）和豆包
+    /// （最后一包 flags）都会把结束标记和最后一句的文本塞进同一个包，
+    /// 所以"结束"必须能跟正文一起上报，否则就会被正文吞掉 —— 会话只能靠
+    /// 8 秒超时收场。
+    Text {
+        kind: Kind,
+        text: String,
+        finished: bool,
+    },
     Finished,
     Error(String),
     Ignored,
@@ -103,11 +113,71 @@ pub struct AsrClient {
     msgs: UnboundedReceiver<Message>,
     reader: tokio::task::JoinHandle<()>,
     backend: Backend,
+    /// 识别结果的累积状态（定稿文本 / 中间结果 / 是否结束 / 服务端错误）
+    pub state: Transcript,
+}
+
+/// 识别结果的累积状态。
+///
+/// 单独抽出来是为了能**脱离 WebSocket 单测**：「最后一包要不要结束会话」这类
+/// 逻辑以前长在 `AsrClient::handle` 里，没有真连接就测不到 —— 而它恰好是
+/// 「松手后白等 8 秒」那个 bug 的所在地。
+#[derive(Default)]
+pub struct Transcript {
+    /// 已定稿的文本
     pub final_text: String,
+    /// 当前这句还没定稿的中间结果
     pub partial_text: String,
+    /// 服务端已明确结束（或出错）
     pub done: bool,
     /// 服务端返回的错误（需要在界面上提示，不能只写日志）
     pub last_error: Option<String>,
+}
+
+impl Transcript {
+    /// 吸收一条解析结果；返回界面要显示的完整文本（有文本可显示时）
+    pub fn absorb(&mut self, parsed: Parsed) -> Option<(Kind, String)> {
+        match parsed {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+            } => {
+                match kind {
+                    Kind::Partial => self.partial_text = text,
+                    Kind::Final => {
+                        self.final_text.push_str(&text);
+                        self.partial_text.clear();
+                    }
+                }
+                // 先收正文再结束：顺序反了最后一句就丢了
+                if finished {
+                    self.done = true;
+                }
+                Some((kind, self.display_text()))
+            }
+            Parsed::Finished => {
+                self.done = true;
+                None
+            }
+            Parsed::Error(e) => {
+                self.done = true;
+                crate::log::log(format!("ASR 返回错误：{e}"));
+                self.last_error = Some(e);
+                None
+            }
+            Parsed::Ignored => None,
+        }
+    }
+
+    /// 实时显示的完整文本（已定稿部分 + 当前中间结果）
+    pub fn display_text(&self) -> String {
+        if self.partial_text.is_empty() {
+            self.final_text.clone()
+        } else {
+            format!("{}{}", self.final_text, self.partial_text)
+        }
+    }
 }
 
 impl AsrClient {
@@ -141,10 +211,7 @@ impl AsrClient {
             msgs,
             reader,
             backend: build_backend(cfg),
-            final_text: String::new(),
-            partial_text: String::new(),
-            done: false,
-            last_error: None,
+            state: Transcript::default(),
         };
 
         for msg in client.backend.start_messages() {
@@ -192,38 +259,8 @@ impl AsrClient {
     }
 
     pub fn handle(&mut self, msg: Message) -> Option<(Kind, String)> {
-        match self.backend.parse(msg) {
-            Parsed::Text { kind, text } => {
-                match kind {
-                    Kind::Partial => self.partial_text = text,
-                    Kind::Final => {
-                        self.final_text.push_str(&text);
-                        self.partial_text.clear();
-                    }
-                }
-                Some((kind, self.display_text()))
-            }
-            Parsed::Finished => {
-                self.done = true;
-                None
-            }
-            Parsed::Error(e) => {
-                self.done = true;
-                crate::log::log(format!("ASR 返回错误：{e}"));
-                self.last_error = Some(e);
-                None
-            }
-            Parsed::Ignored => None,
-        }
-    }
-
-    /// 实时显示的完整文本（已定稿部分 + 当前中间结果）
-    pub fn display_text(&self) -> String {
-        if self.partial_text.is_empty() {
-            self.final_text.clone()
-        } else {
-            format!("{}{}", self.final_text, self.partial_text)
-        }
+        let parsed = self.backend.parse(msg);
+        self.state.absorb(parsed)
     }
 
     /// 最终交付文本：已定稿部分 + 还没定稿的尾部。
@@ -231,7 +268,7 @@ impl AsrClient {
     /// 必须把未定稿的尾部也算进去：实时输入已经把这段字打进了目标程序，
     /// 若这里只返回已定稿部分，收尾对账时反而会把用户看到的字删掉。
     pub fn take_result(&self) -> String {
-        merge_result(&self.final_text, &self.partial_text)
+        merge_result(&self.state.final_text, &self.state.partial_text)
     }
 }
 
@@ -356,5 +393,42 @@ mod tests {
         assert_eq!(merge_result("", "还在这句"), "还在这句");
         assert_eq!(merge_result("第一句。", "还在这句"), "第一句。还在这句");
         assert_eq!(merge_result("  有空白  ", ""), "有空白");
+    }
+
+    /// 回归（结束标记与文本同包时 `done` 不置位 → 松手后白等 8 秒超时）：
+    /// 腾讯和豆包都会把「最后一包」和「最后一句的文本」放进同一个包里。
+    /// 解析层已经把这件事说清楚了，累积这一层不能把它吞掉。
+    #[test]
+    fn transcript_marks_done_when_a_text_packet_also_finishes() {
+        let mut t = Transcript::default();
+        let shown = t.absorb(Parsed::Text {
+            kind: Kind::Final,
+            text: "你好".into(),
+            finished: true,
+        });
+        assert_eq!(shown.unwrap().1, "你好", "文本不能被结束标记吞掉");
+        assert!(t.done, "带结束标记的文本包必须结束会话，否则只能白等到超时");
+    }
+
+    /// 普通文本包不能提前结束会话（否则后面的句子全丢）
+    #[test]
+    fn transcript_keeps_going_without_the_finish_flag() {
+        let mut t = Transcript::default();
+        t.absorb(Parsed::Text {
+            kind: Kind::Final,
+            text: "你好".into(),
+            finished: false,
+        });
+        assert!(!t.done);
+        assert_eq!(t.display_text(), "你好");
+    }
+
+    /// 服务端报错也必须结束会话，并把原因留给界面
+    #[test]
+    fn transcript_records_server_errors() {
+        let mut t = Transcript::default();
+        assert!(t.absorb(Parsed::Error("鉴权失败".into())).is_none());
+        assert!(t.done);
+        assert_eq!(t.last_error.as_deref(), Some("鉴权失败"));
     }
 }

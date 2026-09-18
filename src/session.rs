@@ -161,17 +161,14 @@ async fn run_session(
         shared.hide_settings();
     }
 
-    // 只有「测试识别」自动结束（5 秒）；正常录音完全跟着按键走，
-    // 按多久录多久，不做时长限制。
-    let test_limit = test.then(|| tokio::time::Instant::now() + Duration::from_secs(5));
-
     shared.update(|s| {
         s.recording = true;
         s.text.clear();
         s.hint = "正在连接…".into();
         s.error = None;
         s.error_at = None;
-        s.started = Some(Instant::now());
+        // 计时器先不启动：见下面"请说话…"处把 started 与 test_limit 对齐的说明
+        s.started = None;
     });
 
     let mut capture = match audio::start() {
@@ -192,11 +189,30 @@ async fn run_session(
 
     shared.update(|s| s.hint = "请说话…".into());
 
-    // 实时输入：中间结果一到就写进目标程序（被修正时自动回退重打）。
-    // 测试模式永远不往别的程序里打字，只记录。
-    let mut typer = typer::LiveTyper::new(cfg.options.live_typing && !test);
-    // 记住开始时的前台窗口：录音中途用户切走就停止实时输入，避免把字/退格打错地方
+    // 记住开始时的前台窗口：录音中途主人切走了，就一个字都别再往新窗口写。
+    // 把它交给 typer 自己持有（而不是散在各个调用点），这样 sync/finish 每次
+    // 都必须重新上报当前窗口 —— 漏掉校验这件事从"靠自觉"变成"编译不过"。
     let watch = foreground_window();
+    // 实时输入：中间结果一到就写进目标程序（被修正时自动回退重打）。
+    // 测试模式用 muted：不只是"关掉实时打字"，而是连收尾都绝不允许注入 ——
+    // 「结果只显示在窗口里」是软件对主人的承诺。
+    let mut typer = if test {
+        typer::LiveTyper::muted()
+    } else {
+        typer::LiveTyper::new(cfg.options.live_typing, watch)
+    };
+
+    // 只有「测试识别」自动结束（5 秒）；正常录音完全跟着按键走，按多久录多久，
+    // 不做时长限制。
+    //
+    // 计时必须从**这一刻**起算（麦克风已开、服务已连上、紧接着提示"请说话"）。
+    // 之前是在函数开头就算的，连接耗时会被吃进这 5 秒里 —— 网络慢的时候
+    // 主人还没开口就到期了，测试窗里一个字都不会有。
+    let test_limit = test.then(|| tokio::time::Instant::now() + Duration::from_secs(5));
+
+    // 界面上的计时也从这个时刻起算，和上面那 5 秒同一个起跑线：
+    // 否则测试窗口会显示"录音中 00:07"却只录了 5 秒，看着像坏了。
+    shared.update(|s| s.started = Some(Instant::now()));
 
     loop {
         tokio::select! {
@@ -219,14 +235,12 @@ async fn run_session(
                 Some(m) => {
                     if let Some((_, text)) = client.handle(m) {
                         shared.update(|s| s.text = text.clone());
-                        if typer.enabled && !same_foreground(watch) {
-                            typer.disable("录音过程中切换了窗口");
-                        }
-                        if let Err(e) = typer.sync(&text) {
+                        // 当前窗口是必填参数：typer 自己会核对"主人有没有切走"
+                        if let Err(e) = typer.sync(&text, foreground_window()) {
                             shared.report(format!("{e}"));
                         }
                     }
-                    if client.done {
+                    if client.state.done {
                         break;
                     }
                 }
@@ -259,12 +273,14 @@ async fn run_session(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while !client.done {
+    while !client.state.done {
         match tokio::time::timeout_at(deadline, client.recv()).await {
             Ok(Some(m)) => {
                 if let Some((_, text)) = client.handle(m) {
                     shared.update(|s| s.text = text.clone());
-                    if let Err(e) = typer.sync(&text) {
+                    // 松手后等最终结果的这段时间，主人同样可能切走窗口，
+                    // 所以这里也要过一遍：漏掉它，迟到的结果就会打进别的程序。
+                    if let Err(e) = typer.sync(&text, foreground_window()) {
                         shared.report(format!("{e}"));
                     }
                 }
@@ -278,7 +294,7 @@ async fn run_session(
     }
 
     let text = client.take_result();
-    let asr_error = client.last_error.clone();
+    let asr_error = client.state.last_error.clone();
     drop(client);
 
     shared.update(|s| {
@@ -300,10 +316,35 @@ async fn run_session(
         log::log(format!("识别过程中收到服务端错误：{e}"));
     }
     log::log(format!("识别完成（{} 字）", text.chars().count()));
+
+    if test {
+        // 测试模式：结果只回显在设置窗里。既不能注入（会打进设置窗背后的程序），
+        // 也不能收起设置窗 —— 主人正盯着它看结果。
+        log::log("测试模式：结果只回显在窗口里，不输入任何字符");
+        return;
+    }
+
+    // 收尾前的最后一道校验：主人可能在上一条结果之后、这段收尾之前又切走了窗口
+    // （等最终结果时尤其容易）。先判一次是为了把顺序理顺 —— 已经确定不输入了，
+    // 就不必再多此一举去收起设置窗。
+    typer.guard(foreground_window());
+    if typer.is_abandoned() {
+        // `sent` 里记的是打在**旧窗口**里的字：再做收尾对账，退格会删掉新窗口里的
+        // 内容；把整段重打到新窗口同样是打错地方。所以一个字都不输入。
+        // 文本本身已经存进 last_result（下次会话开始、错误提示清掉后可见），
+        // 日志里也有完整记录。
+        log::log("录音途中切换了窗口，已放弃自动输入");
+        shared.report("录音途中切换了窗口，为避免打错地方，本次结果没有自动输入");
+        return;
+    }
+
     ensure_target_focus(shared).await;
     // 收尾：把最终文本同步到光标处。实时输入开着时通常只差最后几个字，
     // 关掉实时输入时则在这里一次性打出全文。
-    if let Err(e) = typer.finish(&text) {
+    //
+    // 当前窗口是必填参数：`finish` 会拿它再核对一次。即使上面那次校验将来被谁
+    // 删掉，这里也兜得住 —— 不会把补打和退格送进别的程序。
+    if let Err(e) = typer.finish(&text, foreground_window()) {
         shared.fail(format!("{e}"));
     }
 }
@@ -319,14 +360,6 @@ fn foreground_window() -> Option<isize> {
 #[cfg(not(windows))]
 fn foreground_window() -> Option<isize> {
     None
-}
-
-/// 前台窗口是否还是开始录音时那个（中途切走就别再实时打了）
-fn same_foreground(start: Option<isize>) -> bool {
-    match (start, foreground_window()) {
-        (Some(a), Some(b)) => a == b,
-        _ => true, // 拿不到窗口句柄时不拦
-    }
 }
 
 /// 注入前确认前台窗口不是我们自己的程序；如果是，就把它藏起来等焦点回去。

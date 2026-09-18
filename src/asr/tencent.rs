@@ -63,14 +63,19 @@ fn parse_json(text: &str) -> Parsed {
         .to_string();
     let is_final = v["final"].as_i64().unwrap_or(0) == 1;
 
+    // 注意 `finished` 要跟着文本一起上报：腾讯会把 `final=1` 和最后一句的文本
+    // 放进同一个包。若这里只判 slice_type，这一包就被当成普通文本，
+    // 会话永远等不到结束 —— 主人松手后要白等满 8 秒超时。
     match slice_type {
         2 if !text.is_empty() => Parsed::Text {
             kind: Kind::Final,
             text,
+            finished: is_final,
         },
         1 if !text.is_empty() => Parsed::Text {
             kind: Kind::Partial,
             text,
+            finished: is_final,
         },
         _ if is_final => Parsed::Finished,
         _ => Parsed::Ignored,
@@ -148,9 +153,12 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 随机正整数（nonce，最长 10 位）
+/// 随机正整数（nonce，腾讯要求最长 10 位）。
+///
+/// 别写成 `% 9_999_999_999` 再 `as u32`：u32 最大只有 4_294_967_295，
+/// 100 亿取模的结果会被截断，得到的根本不是注释里说的那个区间。
 fn nonce() -> u32 {
-    (uuid::Uuid::new_v4().as_u128() % 9_999_999_999) as u32
+    1 + (uuid::Uuid::new_v4().as_u128() % 999_999_999) as u32
 }
 
 #[cfg(test)]
@@ -223,12 +231,28 @@ mod tests {
         assert!(signed_url_at(&c, 0, true).is_err());
     }
 
+    /// 回归（腾讯最后一包永不结束会话 → 主人松手后白等 8 秒超时）：
+    /// 腾讯把结束标记 `final=1` 和最后一句的文本放在**同一个包**里，而解析是
+    /// 先判 slice_type 的 —— 于是这一包被当成普通文本，`done` 永远不置位。
+    #[test]
+    fn final_packet_with_text_also_ends_the_session() {
+        match parse_json(
+            r#"{"code":0,"result":{"slice_type":2,"voice_text_str":"你好，世界。"},"final":1}"#,
+        ) {
+            Parsed::Text { text, finished, .. } => {
+                assert_eq!(text, "你好，世界。");
+                assert!(finished, "带文本的最后一包也要结束会话，否则只能白等到超时");
+            }
+            other => panic!("应解析出稳态结果，实际：{other:?}"),
+        }
+    }
+
     #[test]
     fn parses_slice_types() {
         match parse_json(
             r#"{"code":0,"result":{"slice_type":1,"voice_text_str":"你好"},"final":0}"#,
         ) {
-            Parsed::Text { kind, text } => {
+            Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Partial);
                 assert_eq!(text, "你好");
             }
@@ -237,7 +261,7 @@ mod tests {
         match parse_json(
             r#"{"code":0,"result":{"slice_type":2,"voice_text_str":"你好，世界。"},"final":1}"#,
         ) {
-            Parsed::Text { kind, text } => {
+            Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Final);
                 assert_eq!(text, "你好，世界。");
             }

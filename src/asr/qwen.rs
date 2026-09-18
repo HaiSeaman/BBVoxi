@@ -107,7 +107,12 @@ fn parse_json(text: &str, ready: &mut bool, finished: &mut bool) -> Parsed {
             } else {
                 Kind::Partial
             };
-            Parsed::Text { kind, text }
+            // 千问的结束是单独一条 task-finished，不会跟文本同包
+            Parsed::Text {
+                kind,
+                text,
+                finished: false,
+            }
         }
         _ => Parsed::Ignored,
     }
@@ -161,9 +166,15 @@ mod tests {
             r#"{"header":{"event":"result-generated"},"payload":{"output":{"sentence":{"text":"今天天气","sentence_end":false,"sentence_id":1}},"usage":null}}"#,
         );
         match partial {
-            Parsed::Text { kind, text } => {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+                ..
+            } => {
                 assert_eq!(kind, Kind::Partial);
                 assert_eq!(text, "今天天气");
+                assert!(!finished, "千问普通中间结果不该结束会话");
             }
             _ => panic!("应解析出中间结果"),
         }
@@ -172,7 +183,7 @@ mod tests {
             r#"{"header":{"event":"result-generated"},"payload":{"output":{"sentence":{"text":"今天天气不错。","sentence_end":true,"sentence_id":1}},"usage":{"duration":3}}}"#,
         );
         match fin {
-            Parsed::Text { kind, text } => {
+            Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Final);
                 assert_eq!(text, "今天天气不错。");
             }
