@@ -3,6 +3,7 @@
 mod asr;
 mod audio;
 mod autostart;
+mod clipboard;
 mod config;
 mod hotkey;
 mod injector;
@@ -344,6 +345,13 @@ impl eframe::App for App {
             }
         }
         self.sync_tray();
+
+        // 改键捕捉必须跟着设置界面一起结束：界面收起后 `ui()` 不再运行，
+        // 若 `paused` 留在 true，全局快捷键会**彻底失效**且毫无提示。
+        // 这里兜住所有收起路径（含托盘触发录音时的隐藏），见该方法上的说明。
+        if self.settings.reap_capture_if_ui_gone() {
+            log::log("设置窗已不在，自动结束改键捕捉（否则全局快捷键会一直失效）");
+        }
 
         // --settings 启动时把窗口拉到最前面（否则会被其他窗口挡住）
         if self.focus_once {

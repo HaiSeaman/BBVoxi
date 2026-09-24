@@ -8,9 +8,9 @@
 //! 把 `sent` 多出来的尾巴用退格删掉，再补打新的尾巴。
 //! 这样：文本变长时只补打增量，识别结果被修正时也只回退/重打被改动的部分。
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
-use crate::injector;
+use crate::{clipboard, injector};
 
 /// sent → desired 需要做的编辑动作
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,18 +60,46 @@ fn plan(blocked: bool, sent: &str, desired: &str) -> Option<Diff> {
     (!planned.is_noop()).then_some(planned)
 }
 
+/// 逐字注入被拒之后的兜底配置（来自设置里的两个开关）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fallback {
+    /// 改用剪贴板粘贴再试一次。
+    ///
+    /// 默认**关**：单测与 `muted` 都不该在无声无息中动主人的剪贴板，
+    /// 由 `session` 按设置显式打开。
+    pub paste: bool,
+    /// 「识别结果总留一份到剪贴板」：开着就永不还原主人原来的内容
+    pub keep_on_clipboard: bool,
+}
+
+/// 主人原来的剪贴板内容。三态是必要的 —— `Option<String>` 分不清
+/// "还没看过"和"看过了但里面没有文本（是图片/文件）"，而这两种情况的
+/// 处理完全不同（前者要去看，后者不必再看也不必还原）。
+enum OriginalClipboard {
+    /// 还没快照过
+    Pending,
+    /// 看过了，但主人的剪贴板里没有文本（图片、文件，或正被别的程序占用）
+    NotText,
+    Text(String),
+}
+
 pub struct LiveTyper {
     sent: String,
-    /// 是否边说话边打字。被放弃（切走窗口）或测试模式下会被置为 false
+    /// 是否边说话边打字（来自设置）
     pub enabled: bool,
     /// 注入失败的原因，失败后不再重试，避免反复报错
     pub failure: Option<String>,
-    /// 运行中被放弃（录音途中切走了窗口）→ 收尾必须彻底放弃输入，见 `plan`
-    abandoned: bool,
+    /// 此刻是否不在"按住快捷键时的那个窗口"里 —— 在别处时既不做实时输入，
+    /// 收尾也一个字不打（见 `guard`）
+    away: bool,
     /// 测试模式：结果只回显到设置窗，任何情况下都不注入（见 `muted`）
     muted: bool,
-    /// 开始录音时的前台窗口。之后每次输入前都要拿当前窗口跟它核对，切走了就整体放弃
+    /// 开始录音时的前台窗口。之后每次输入前都要拿当前窗口跟它核对
     watch: Option<isize>,
+    /// 逐字注入被拒时的兜底方式
+    fallback: Fallback,
+    /// 主人原来的剪贴板内容（只在第一次兜底粘贴之前看一眼，见 `paste`）
+    original: OriginalClipboard,
 }
 
 impl LiveTyper {
@@ -81,10 +109,20 @@ impl LiveTyper {
             sent: String::new(),
             enabled,
             failure: None,
-            abandoned: false,
+            away: false,
             muted: false,
             watch,
+            fallback: Fallback::default(),
+            original: OriginalClipboard::Pending,
         }
+    }
+
+    /// 挂上兜底配置。做成链式方法而不是 `new` 的第三个参数：
+    /// `Fallback::default()` 是"什么都不做"，既有调用点（含单测）
+    /// 因此一个字都不用改，也就不会有人不小心让单测去动真剪贴板。
+    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
+        self.fallback = fallback;
+        self
     }
 
     /// 测试模式专用：结果只回显到设置窗，**任何情况下都不注入一个字符**。
@@ -102,40 +140,44 @@ impl LiveTyper {
 
     /// 本次会话是否完全禁止注入
     fn blocked(&self) -> bool {
-        self.muted || self.abandoned || self.failure.is_some()
+        self.muted || self.away || self.failure.is_some()
     }
 
-    /// 每次准备输入之前核对前台窗口：主人切走了就放弃本次会话的自动输入。
+    /// 每次准备输入之前核对前台窗口：不在"按住快捷键时的那个窗口"里就整体停掉。
     ///
     /// 为什么把它做成「每次输入前必须上报当前窗口」的**必填参数**（而不是一个
     /// 可选的外部检查）：漏掉一次校验，补打和退格就会落到别的程序里。这个坑
     /// 已经踩过两次 —— 第一次是收尾没校验，第二次是「实时阶段校验了、收尾忘了」。
     /// 现在 `sync` / `finish` 的签名逼着调用方每次都报一次，漏不掉。
-    pub fn guard(&mut self, now: Option<isize>) {
-        let switched = matches!((self.watch, now), (Some(a), Some(b)) if a != b);
-        if switched {
-            self.abandon("录音过程中切换了窗口");
-        }
-    }
-
-    /// 放弃本次会话的自动输入：实时打字停掉，收尾也一个字都不输入。
     ///
-    /// **不管「边说话边打字」是开是关，都要放弃**。关着实时输入时虽然还没往
-    /// 目标程序写过字，但把整段结果打进"主人中途切过去的新窗口"同样是打错地方 ——
-    /// 同一个动作不该有两种结果。（原来的实现只在 `enabled` 为真时才生效，
-    /// 于是关着实时输入时切走窗口，反而会把全文打进新窗口。）
-    pub fn abandon(&mut self, reason: &str) {
-        if self.abandoned {
+    /// 切走是**可恢复的**：主人切出去看一眼再切回来，`sent` 里记的仍然正是
+    /// 那个窗口里的字，继续对它做差分完全安全。以前这里是一次性置位、永不复位，
+    /// 于是"切出去又切回来"这一下就把整段识别结果丢掉了。
+    /// （真正不能做的只有一件事：往**别的**窗口写字或退格。）
+    pub fn guard(&mut self, now: Option<isize>) {
+        // 句柄读不到时不判定：不能因为读不到句柄就把主人的输入停掉。
+        // 这不是"不设防"——`watch` 只在确认过焦点已离开本程序时才记下来
+        // （见 `session::wait_for_foreign_foreground`），"把自己的窗口误记成目标"
+        // 这件事从源头堵住了。
+        let (Some(watch), Some(now)) = (self.watch, now) else {
+            return;
+        };
+        let away = watch != now;
+        if away == self.away {
             return;
         }
-        self.abandoned = true;
-        self.enabled = false;
-        crate::log::log(format!("已放弃本次自动输入：{reason}"));
+        self.away = away;
+        if away {
+            crate::log::log("主人切到了别的窗口，暂停本次自动输入");
+        } else {
+            crate::log::log("主人回到原窗口，恢复本次自动输入");
+        }
     }
 
-    /// 是否因"录音途中切走了窗口"而被放弃（收尾不会输入任何字符）
-    pub fn is_abandoned(&self) -> bool {
-        self.abandoned
+    /// 此刻是否不在目标窗口里。收尾遇到这种情况会一个字都不输入，
+    /// 改由 `session` 把结果放到剪贴板（见 `session::run_session` 的收尾段）。
+    pub fn is_away(&self) -> bool {
+        self.away
     }
 
     /// 实时阶段调用：把目标程序里的文本调整成 `desired`。
@@ -155,7 +197,7 @@ impl LiveTyper {
 
     /// 会话收尾调用：把目标程序里的文本对账成最终识别结果。
     ///
-    /// 但被放弃的会话（录音途中切走了窗口）和测试模式例外：一个字符都不输入。
+    /// 但不在目标窗口里、以及测试模式例外：一个字符都不输入。
     /// 前者 `sent` 记的是打在旧窗口里的字，对新窗口做退格会删掉主人的内容；
     /// 后者连设置窗都不该被写进去。
     ///
@@ -163,6 +205,14 @@ impl LiveTyper {
     /// 可能又切走了窗口（等最终结果时尤其容易），此刻补打和退格都会落到别人家。
     pub fn finish(&mut self, desired: &str, now: Option<isize>) -> Result<()> {
         self.guard(now);
+        // 之前某一步注入已经失败 → 之后一个字都不再输入（避免反复报错），
+        // 但**必须把原因抛出去**：调用方正是靠这个 Err 把整段结果放进剪贴板的。
+        // 这里要是返回 Ok，主人刚说的话两条路都走不通 —— 既不进目标程序、
+        // 也不进剪贴板，直接丢掉（`blocked()` 把失败也算作禁止注入，
+        // 所以走 `plan()` 只会得到一个"什么都不做"的 Ok）。
+        if let Some(reason) = &self.failure {
+            return Err(anyhow!("{reason}"));
+        }
         match plan(self.blocked(), &self.sent, desired) {
             Some(planned) => self.execute(planned, desired),
             None => Ok(()),
@@ -172,6 +222,9 @@ impl LiveTyper {
     fn execute(&mut self, planned: Diff, desired: &str) -> Result<()> {
         let started = std::time::Instant::now();
         if planned.backspaces > 0 {
+            // 退格失败**不做**粘贴兜底：删不掉的旧尾巴还留在目标程序里，
+            // 再粘一段上去只会得到一段错的文本。留给会话收尾处理 ——
+            // 那里会把完整结果放进剪贴板。
             if let Err(e) = injector::backspace(planned.backspaces) {
                 self.failure = Some(e.to_string());
                 return Err(e);
@@ -179,8 +232,7 @@ impl LiveTyper {
         }
         if !planned.append.is_empty() {
             if let Err(e) = injector::type_text(&planned.append) {
-                self.failure = Some(e.to_string());
-                return Err(e);
+                return self.paste_fallback(&planned.append, desired, e);
             }
         }
         self.sent = desired.to_string();
@@ -197,11 +249,75 @@ impl LiveTyper {
         }
         Ok(())
     }
+
+    /// 逐字注入被拒时的兜底：把该补的这段写到剪贴板，再用 `Ctrl+V` 粘贴。
+    ///
+    /// 为什么值得多这一步：`KEYEVENTF_UNICODE` 和 `Ctrl+V` 是两条不同的通道，
+    /// 忽略前者的程序（远程桌面、部分 Electron/Java/老 MFC）认后者。
+    ///
+    /// 但 UIPI 拦下的是**整个** `SendInput`，那时候粘贴同样会失败 ——
+    /// 所以先看错误类型，别白试一次、也别多报一次错。
+    fn paste_fallback(&mut self, append: &str, desired: &str, e: anyhow::Error) -> Result<()> {
+        let denied = e.downcast_ref::<injector::AccessDenied>().is_some();
+        if !self.fallback.paste || denied {
+            self.failure = Some(e.to_string());
+            return Err(e);
+        }
+        match self.paste(append) {
+            Ok(()) => {
+                self.sent = desired.to_string();
+                crate::log::log(format!(
+                    "逐字注入被拒，已改用剪贴板粘贴兜底（{} 字）",
+                    append.chars().count()
+                ));
+                Ok(())
+            }
+            Err(pe) => {
+                // 粘贴也没成：照旧记下失败、不再重试，避免反复报错。
+                // 结果本身不会丢 —— 会话收尾会把它放进剪贴板。
+                self.failure = Some(pe.to_string());
+                Err(pe)
+            }
+        }
+    }
+
+    /// 走一次剪贴板粘贴。
+    ///
+    /// 主人原来的内容**只在第一次粘贴之前快照一次**。每次粘贴都重新快照的话，
+    /// 第二次快照到的就是**我们自己上一次写进去的那个片段** —— 最后"还原"
+    /// 会把这个碎片留在主人的剪贴板里，比干脆不还原还糟。
+    fn paste(&mut self, append: &str) -> Result<()> {
+        if should_snapshot(self.fallback.keep_on_clipboard, &self.original) {
+            self.original = match clipboard::read_text() {
+                Some(text) => OriginalClipboard::Text(text),
+                None => OriginalClipboard::NotText,
+            };
+        }
+        clipboard::write_text(append)?;
+        let seq = clipboard::sequence();
+        injector::paste()?;
+        if let OriginalClipboard::Text(previous) = &self.original {
+            clipboard::schedule_restore(previous.clone(), seq);
+        }
+        Ok(())
+    }
+}
+
+/// 此刻该不该去看主人的剪贴板（纯函数：这个判断错一次，
+/// 主人原来复制的内容就会被我们自己的碎片顶掉）
+fn should_snapshot(keep_on_clipboard: bool, state: &OriginalClipboard) -> bool {
+    // 开着"总留一份"就是明确表示不还原，那连看都不必看
+    !keep_on_clipboard && matches!(state, OriginalClipboard::Pending)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 约定：这里的用例**不允许**真的走到 `injector` 去。注入会打到当前前台窗口
+    // （跑 `cargo test` 时就是你的终端），所以每个用例都必须先让 `blocked()`
+    // 为真，或者只走 `plan()`/`diff()` 这类纯函数。要构造"注入失败过"的状态，
+    // 直接赋 `failure` 字段即可 —— 不要为了造这个态去真注入一次。
 
     #[test]
     fn appends_only_the_new_tail() {
@@ -262,19 +378,53 @@ mod tests {
     }
 
     /// 回归（会把字打进别的程序那个 bug）：
-    /// 录音途中切走窗口后，`sent` 里记的是打在**旧窗口**里的字。
+    /// 人在别的窗口里时，`sent` 里记的是打在**原窗口**里的字。
     /// 收尾若照常做差分，就会先对新窗口退格（删掉主人的内容）再补打 ——
-    /// 所以被放弃的会话在收尾时必须一个字符都不输入。
+    /// 所以不在目标窗口里时收尾必须一个字符都不输入。
     #[test]
-    fn abandoned_session_plans_no_final_edit() {
+    fn away_session_plans_no_final_edit() {
         assert_eq!(
             plan(true, "今天天气", "今天天汽不错。"),
             None,
-            "被放弃的会话收尾绝不能输入（否则退格会砸到新窗口）"
+            "不在目标窗口时收尾绝不能输入（否则退格会砸到别的窗口）"
         );
     }
 
-    /// 没被放弃时，收尾照常给出差分（正常路径不能被这次修复误伤）
+    /// 兜底必须默认**关**着。单测里到处都在 `LiveTyper::new`，
+    /// 只要有一个用例默认开着粘贴，它就会往**真实剪贴板**里写东西，
+    /// 把开发机上主人正复制的内容洗掉。
+    #[test]
+    fn fallback_is_off_by_default() {
+        let f = Fallback::default();
+        assert!(!f.paste, "默认不能开粘贴兜底");
+        assert!(!f.keep_on_clipboard, "默认不能常驻剪贴板");
+    }
+
+    /// 回归（会把主人原来的剪贴板内容弄丢）：一次会话里可能兜底粘贴好几次
+    /// （每来一条中间结果就是一次）。若每次都重新快照，第二次快照到的就是
+    /// **我们自己上一次写进去的片段**，最后"还原"会把这个碎片留在主人的
+    /// 剪贴板里 —— 比不还原还糟。
+    #[test]
+    fn original_clipboard_is_snapshotted_only_once() {
+        assert!(
+            should_snapshot(false, &OriginalClipboard::Pending),
+            "还没看过时应该去看一次"
+        );
+        assert!(
+            !should_snapshot(false, &OriginalClipboard::Text("主人复制的东西".into())),
+            "已经看过就必须复用那次快照，不能再去看（看到的是我们自己的碎片）"
+        );
+        assert!(
+            !should_snapshot(false, &OriginalClipboard::NotText),
+            "已经确认没有文本可还原，也不必再看"
+        );
+        assert!(
+            !should_snapshot(true, &OriginalClipboard::Pending),
+            "「总留一份」明确表示不还原，连看都不必看"
+        );
+    }
+
+    /// 没在别的窗口里时，收尾照常给出差分（正常路径不能被这次修复误伤）
     #[test]
     fn normal_session_still_plans_the_final_edit() {
         assert_eq!(
@@ -290,26 +440,43 @@ mod tests {
     /// 回归（同一个动作却有两种结果）：关着「边说话边打字」时切走窗口，
     /// 整段文字照样会被打进新窗口 —— 而开着实时输入时是"一个字都不打"。
     ///
-    /// 规则应该只有一条：按快捷键时盯着哪个窗口，字就只往那个窗口写；中途切走就不写。
+    /// 规则应该只有一条：按快捷键时盯着哪个窗口，字就只往那个窗口写。
     /// （关着实时输入时虽然还没往目标程序写过字，但把结果打进主人切过去的新窗口，
     /// 同样是"文字打到别处"。）
     #[test]
-    fn switching_windows_abandons_even_when_live_typing_was_off() {
+    fn switching_windows_stops_input_even_when_live_typing_was_off() {
         let mut t = LiveTyper::new(false, Some(100));
         t.guard(Some(200));
-        assert!(t.is_abandoned(), "关着实时输入时切走窗口也应放弃自动输入");
+        assert!(t.is_away(), "关着实时输入时切走窗口也应停止自动输入");
         t.finish("x", Some(200)).unwrap();
-        assert!(
-            t.sent.is_empty(),
-            "整段文字被打进了主人中途切过去的那个窗口"
-        );
+        assert!(t.sent.is_empty(), "整段文字被打进了主人切过去的那个窗口");
     }
 
-    /// 「一开始就没开实时输入」和「运行中被停用」是两回事：
-    /// 前者收尾仍要一次性把全文打出去，后者必须彻底放弃。
+    /// 切走只是**暂停**，不是报废：主人切出去看一眼再切回来，
+    /// `sent` 里记的仍然正是原窗口里的那些字，继续对它做差分完全安全
+    /// （`guard` 只改 `away`，从不碰 `sent` —— 恢复之所以安全就靠这一点）。
+    ///
+    /// 回归：以前这里是一次性置位、永不复位，于是"切出去又切回来"这一下
+    /// 就把整段识别结果丢掉了 —— 屏幕上什么都没出现，正是主人报的那个现象。
+    #[test]
+    fn returning_to_the_original_window_resumes_typing() {
+        let mut t = LiveTyper::new(true, Some(100));
+        t.guard(Some(200));
+        assert!(t.is_away(), "切到别的窗口后应暂停");
+        assert!(t.blocked(), "在别的窗口里时必须禁止注入");
+
+        t.guard(Some(100));
+        assert!(!t.is_away(), "回到原窗口应恢复");
+        assert!(!t.blocked(), "恢复后不应再禁止注入");
+        assert!(t.enabled, "恢复不该动到主人的「边说话边打字」设置");
+        assert!(t.sent.is_empty(), "单测里没注入过，sent 不该凭空出现内容");
+    }
+
+    /// 「一开始就没开实时输入」和「此刻不在目标窗口里」是两回事：
+    /// 前者收尾仍要一次性把全文打出去，后者必须一个字都不输入。
     #[test]
     fn disabled_by_default_still_plans_its_final_edit() {
-        // 没被放弃：收尾照常给出"补打全文"的计划（这里只看计划，不真的注入）
+        // 在目标窗口里、只是没开实时输入：收尾照常给出"补打全文"的计划（这里只看计划，不真的注入）
         let t = LiveTyper::new(false, Some(100));
         assert!(!t.blocked(), "只是没开实时输入，不该被判定成禁止注入");
         assert_eq!(
@@ -322,16 +489,12 @@ mod tests {
     }
 
     /// 回归（实时输入会把字/退格打到别的程序里）：
-    /// 前台窗口一旦变了，就必须停止实时输入，并标记为"收尾也不许输入"。
+    /// 前台窗口一旦变了，就必须停止实时输入，并按"收尾也不许输入"处理。
     #[test]
     fn guard_stops_typing_after_the_window_changes() {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(200));
-        assert!(!t.enabled, "切到别的窗口后必须停止实时输入");
-        assert!(
-            t.is_abandoned(),
-            "切窗口后收尾也不能再输入（退格会砸到新窗口）"
-        );
+        assert!(t.is_away(), "切到别的窗口后必须停止实时输入");
     }
 
     /// 同一个窗口时不能误伤：实时输入要照常工作
@@ -340,7 +503,7 @@ mod tests {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(100));
         assert!(t.enabled, "同一个窗口不该被停用");
-        assert!(!t.is_abandoned());
+        assert!(!t.is_away());
     }
 
     /// 拿不到窗口句柄时不拦：不能因为读不到句柄就把主人的输入停掉
@@ -398,20 +561,42 @@ mod tests {
         );
     }
 
+    /// 回归（会把整段识别结果丢掉）：注入失败过之后，`finish` 必须**报错**，
+    /// 而不是返回一个"什么都不做"的 Ok。
+    ///
+    /// 调用方 `session` 是靠 `Err` 才把整段结果放进剪贴板的（`hand_off_to_clipboard`）。
+    /// 之前 `finish` 走 `plan(blocked())`，而 `blocked()` 把已失败也算作禁止注入，
+    /// 于是它安静地返回 Ok —— 结果既不进目标程序也不进剪贴板，主人的话直接消失。
+    ///
+    /// 这里直接构造失败态（不改真注入路径），断言 Err 确实被抛出来。
+    #[test]
+    fn finish_reports_a_latched_failure_so_the_caller_can_use_the_clipboard() {
+        let mut t = LiveTyper::new(true, Some(100));
+        t.failure = Some("目标程序以管理员权限运行".into());
+        let err = t
+            .finish("你好", Some(100))
+            .expect_err("失败过之后 finish 必须报错，否则结果会被静默丢弃");
+        assert!(
+            err.to_string().contains("管理员权限"),
+            "错误里要带上失败原因，界面上那句提示才有用：{err}"
+        );
+        assert!(t.sent.is_empty(), "报错路径不该注入任何字符");
+    }
+
     /// 守住 `finish` 这条调用链本身（上一条只测了 `plan` 函数，
-    /// 万一 `finish` 忘了把 abandoned 传进去，它是发现不了的）。
+    /// 万一 `finish` 忘了把 `away` 传进去，它是发现不了的）。
     ///
     /// 断言 `sent` 没被记账：`execute` 只有在真的注入之后才会更新它。
     /// 探针用单个 ASCII 字符，即使将来有人改坏了这里、真的注入出去，
     /// 也只是一个 "x"，不会造成破坏。
     #[test]
-    fn finish_types_nothing_after_being_abandoned() {
+    fn finish_types_nothing_while_in_another_window() {
         let mut t = LiveTyper::new(true, Some(100));
-        t.abandon("录音过程中切换了窗口");
-        t.finish("x", Some(100)).unwrap();
+        t.guard(Some(200)); // 主人切走了
+        t.finish("x", Some(200)).unwrap();
         assert!(
             t.sent.is_empty(),
-            "被放弃的会话在 finish 里仍然输入了字符（会打到别的程序里）"
+            "不在目标窗口里时 finish 仍然输入了字符（会打到别的程序里）"
         );
     }
 }

@@ -55,7 +55,9 @@ fn parse_json(text: &str) -> Parsed {
         ));
     }
 
-    let slice_type = v["result"]["slice_type"].as_i64().unwrap_or(-1);
+    // 缺字段按 0（"不是稳态/终态"）处理，**不能**拿 -1 这种值域外的哨兵当默认：
+    // 那样"字段没来"和"来了个怪值"就混成同一个东西了（豆包那边踩过同样的坑）。
+    let slice_type = v["result"]["slice_type"].as_i64().unwrap_or(0);
     let text = v["result"]["voice_text_str"]
         .as_str()
         .unwrap_or("")
@@ -270,6 +272,26 @@ mod tests {
         // final=1 但没有文本 → 结束
         assert!(matches!(
             parse_json(r#"{"code":0,"result":{"slice_type":0,"voice_text_str":""},"final":1}"#),
+            Parsed::Finished
+        ));
+    }
+
+    /// `slice_type` 的合法值只有 0/1/2；字段缺失必须按 0（"不是稳态/终态"）
+    /// 处理，落到与 0 相同的分支，绝不能因为"字段没来"就当成别的东西。
+    ///
+    /// 注意这条用例**不是**用来区分 `unwrap_or(0)` 和 `unwrap_or(-1)` 的 ——
+    /// 在当前这组分支里两者结果一样。它守的是分支本身：将来有人给 0 或负值
+    /// 加上文本分支时，这里会立刻红。
+    #[test]
+    fn missing_slice_type_stays_in_the_value_domain() {
+        // 缺 slice_type、有文本、非终包 → 按 0 → 不进任何文本分支
+        assert!(matches!(
+            parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":0}"#),
+            Parsed::Ignored
+        ));
+        // 缺 slice_type、有文本、是终包 → 结束（文本分支要求 slice_type 为 1 或 2）
+        assert!(matches!(
+            parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":1}"#),
             Parsed::Finished
         ));
     }

@@ -13,7 +13,6 @@ pub struct Qwen {
     /// false 用 VAD 断句、出字更快
     semantic_punctuation: bool,
     pub ready: bool,
-    finished: bool,
 }
 
 impl Qwen {
@@ -23,7 +22,6 @@ impl Qwen {
             model: cfg.model.trim().to_string(),
             semantic_punctuation: auto_punctuation,
             ready: false,
-            finished: false,
         }
     }
 
@@ -64,17 +62,14 @@ impl Qwen {
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Close(_) => {
-                self.finished = true;
-                return Parsed::Finished;
-            }
+            Message::Close(_) => return Parsed::Finished,
             _ => return Parsed::Ignored,
         };
-        parse_json(&text, &mut self.ready, &mut self.finished)
+        parse_json(&text, &mut self.ready)
     }
 }
 
-fn parse_json(text: &str, ready: &mut bool, finished: &mut bool) -> Parsed {
+fn parse_json(text: &str, ready: &mut bool) -> Parsed {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return Parsed::Ignored;
     };
@@ -83,12 +78,8 @@ fn parse_json(text: &str, ready: &mut bool, finished: &mut bool) -> Parsed {
             *ready = true;
             Parsed::Ignored
         }
-        "task-finished" => {
-            *finished = true;
-            Parsed::Finished
-        }
+        "task-finished" => Parsed::Finished,
         "task-failed" => {
-            *finished = true;
             let code = v["header"]["error_code"].as_str().unwrap_or("TASK_FAILED");
             let msg = v["header"]["error_message"].as_str().unwrap_or("");
             Parsed::Error(format!("{code}: {msg}"))
@@ -139,25 +130,30 @@ mod tests {
     }
 
     fn feed(raw: &str) -> Parsed {
-        let (mut ready, mut finished) = (false, false);
-        parse_json(raw, &mut ready, &mut finished)
+        let mut ready = false;
+        parse_json(raw, &mut ready)
     }
 
     #[test]
     fn parses_task_started_and_finished() {
-        let (mut ready, mut finished) = (false, false);
-        parse_json(
-            r#"{"header":{"event":"task-started"},"payload":{}}"#,
-            &mut ready,
-            &mut finished,
-        );
-        assert!(ready && !finished);
-        parse_json(
+        let mut ready = false;
+        assert!(matches!(
+            parse_json(
+                r#"{"header":{"event":"task-started"},"payload":{}}"#,
+                &mut ready
+            ),
+            Parsed::Ignored
+        ));
+        assert!(ready, "task-started 必须把 ready 置起来（否则不会开始送音频）");
+
+        let finished = parse_json(
             r#"{"header":{"event":"task-finished"},"payload":{}}"#,
             &mut ready,
-            &mut finished,
         );
-        assert!(finished);
+        assert!(
+            matches!(finished, Parsed::Finished),
+            "task-finished 必须以 Finished 结束会话，实际 {finished:?}"
+        );
     }
 
     #[test]

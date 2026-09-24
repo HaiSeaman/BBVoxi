@@ -201,18 +201,26 @@ pub fn set_current(hk: Hotkey) {
 }
 
 pub fn current() -> Hotkey {
-    let m = CURRENT_MODS.load(Ordering::Relaxed);
+    let (ctrl, alt, shift, win) = unpack_mods(CURRENT_MODS.load(Ordering::Relaxed));
     Hotkey {
-        ctrl: m & 1 != 0,
-        alt: m & 2 != 0,
-        shift: m & 4 != 0,
-        win: m & 8 != 0,
+        ctrl,
+        alt,
+        shift,
+        win,
         vk: CURRENT_VK.load(Ordering::Relaxed),
     }
 }
 
+/// 修饰键位打包（`CURRENT_MODS` 的编码）。与 [`unpack_mods`] 成对 ——
+/// 单独抽出来是为了让"打包→解包必须还原"这件事**可以在不碰静态变量的前提下**
+/// 被单测覆盖（见 mod tests 顶部关于进程级静态变量的说明）。
 fn mods_bits(hk: &Hotkey) -> u32 {
     (hk.ctrl as u32) | ((hk.alt as u32) << 1) | ((hk.shift as u32) << 2) | ((hk.win as u32) << 3)
+}
+
+/// 位解包，返回 (ctrl, alt, shift, win)
+fn unpack_mods(m: u32) -> (bool, bool, bool, bool) {
+    (m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0)
 }
 
 /// 解析配置里的快捷键并立即让正在运行的钩子生效（不必重启）
@@ -503,13 +511,36 @@ mod tests {
     }
 
     /// 用户实际用的组合：Ctrl + 反引号（曾经因为"保存后没同步给钩子"而失效）
+    ///
+    /// 这里**刻意不调 `apply_from_config` / 不断言 `current()`**：
+    /// 那两个都读写进程级静态变量 `CURRENT_VK`/`CURRENT_MODS`，单测并行跑时
+    /// 会污染其他用例（这个坑踩过一次）。要验证"应用后钩子拿到的就是刚设置的
+    /// 组合"，覆盖点拆成两半 —— 解析这半在下面用纯函数测，位打包那半由
+    /// `mods_bits_round_trips_through_unpack` 覆盖；`apply_from_config` 本身
+    /// 只剩 parse + set_current 两行接线。
     #[test]
-    fn applies_user_hotkey_immediately() {
-        let hk = apply_from_config("ctrl+`").unwrap();
+    fn parses_user_hotkey_and_serializes_it_back() {
+        let hk = parse("ctrl+`").unwrap();
         assert_eq!(hk.vk, 0xC0);
         assert!(hk.ctrl);
-        assert_eq!(current(), hk, "钩子里生效的必须就是刚设置的组合");
         assert_eq!(hk.to_config(), "ctrl+`");
+    }
+
+    /// `CURRENT_MODS` 的位打包必须能被解包还原成同一个组合
+    /// （打包/解包写偏一个位，就会出现"保存后快捷键设置看着对、实际不生效"）
+    #[test]
+    fn mods_bits_round_trips_through_unpack() {
+        for bits in 0u32..16 {
+            let (ctrl, alt, shift, win) = unpack_mods(bits);
+            let hk = Hotkey {
+                ctrl,
+                alt,
+                shift,
+                win,
+                vk: 0x31,
+            };
+            assert_eq!(mods_bits(&hk), bits, "位 {bits:04b} 打包回去不一致");
+        }
     }
 
     const CTRL: Mods = Mods {

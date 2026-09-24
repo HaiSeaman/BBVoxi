@@ -1,13 +1,17 @@
 //! 文字注入：SendInput + KEYEVENTF_UNICODE 逐字符模拟打字。
-//! 不碰剪贴板，因此不会破坏用户正在复制的内容。
+//!
+//! 首选路径不碰剪贴板，因此不会破坏用户正在复制的内容。
+//! 逐字注入被目标程序拒掉时，由 `typer` 改用 [`paste`] 走剪贴板兜底 ——
+//! 两条通道在 Windows 里是**不同**的路径，认后者的程序并不少。
+//! 本模块只负责按键合成，剪贴板的读写都在 `clipboard` 里。
 
 use anyhow::{anyhow, Result};
 use std::mem::size_of;
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_RETURN,
-    VK_TAB,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+    VK_BACK, VK_LCONTROL, VK_RETURN, VK_TAB, VK_V,
 };
 
 /// 一次 SendInput 提交的字符数（每个字符 2 个事件）
@@ -17,6 +21,25 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 /// 我们注入的事件都带这个标记（dwExtraInfo）。
 /// 键盘钩子据此识别"这是自己发的"，避免把自己的修饰键重置误当成用户按键。
 pub const INJECT_TAG: usize = 0x4242_564F_5849; // "BBVOXI"
+
+/// 目标窗口以管理员权限运行 —— Windows 的 UIPI 会拦下我们**整个** `SendInput`。
+///
+/// 单独立一个类型、而不是只留一句错误消息，是为了让上层能分辨出它：
+/// 这种情况下 `Ctrl+V` 走的同样是 `SendInput`，一样会被拦，再试一次粘贴
+/// 只会白等 80ms 并多报一次错。
+#[derive(Debug)]
+pub struct AccessDenied;
+
+impl std::fmt::Display for AccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "目标程序以管理员权限运行，BBVoxi 无法向它输入文字（请改用普通权限的窗口）"
+        )
+    }
+}
+
+impl std::error::Error for AccessDenied {}
 
 /// 把修饰键重置事件追加到批次开头
 fn push_modifier_reset(buf: &mut Vec<INPUT>) {
@@ -38,13 +61,13 @@ pub fn type_text(text: &str) -> Result<()> {
     for unit in text.encode_utf16() {
         match unit {
             0x0A => {
-                push_key(&mut buf, VK_RETURN, false);
-                push_key(&mut buf, VK_RETURN, true);
+                push_key(&mut buf, VK_RETURN, 0, false);
+                push_key(&mut buf, VK_RETURN, 0, true);
             }
             0x0D => continue, // \r\n 里只处理 \n
             0x09 => {
-                push_key(&mut buf, VK_TAB, false);
-                push_key(&mut buf, VK_TAB, true);
+                push_key(&mut buf, VK_TAB, 0, false);
+                push_key(&mut buf, VK_TAB, 0, true);
             }
             _ => {
                 // UTF-16 编码单元直接送，代理对天然被拆成两次，生僻字/emoji 也能输入
@@ -59,6 +82,44 @@ pub fn type_text(text: &str) -> Result<()> {
     flush(&mut buf)
 }
 
+/// 剪贴板粘贴：注入一次 `Ctrl+V`。
+///
+/// 为什么值得单独做一条通道：`KEYEVENTF_UNICODE` 和 `Ctrl+V` 在 Windows 里走的是
+/// 两条不同的路径 —— 忽略前者的程序（远程桌面、部分 Electron/Java/老 MFC）
+/// 认后者，所以它是逐字注入被拒之后唯一有意义的备选。
+///
+/// 三处与 `type_text` 不同，都不是随手写的：
+/// - 这里要**按下** Ctrl。逐字注入反而是先把修饰键清掉（按住快捷键说话时
+///   Ctrl 一直按着，不清就会变成 Ctrl+字符）；
+/// - 必须带**扫描码**。有些程序只读硬件的扫描码，`wScan` 为 0 的按键它们
+///   根本看不见 —— 而那正是需要走粘贴兜底的那类目标；
+/// - 末尾再清一次修饰键。目标程序若在粘贴过程中吞掉了某个 KEYUP，Ctrl 会卡住，
+///   之后主人敲的每个键都会变成 `Ctrl+键`。`push_modifier_reset` 覆盖了全部左右变体，
+///   重复一次是幂等的。
+pub fn paste() -> Result<()> {
+    let mut buf: Vec<INPUT> = Vec::with_capacity(crate::hotkey::MODIFIERS.len() * 2 + 5);
+    paste_events(&mut buf);
+    flush(&mut buf)
+}
+
+/// 组装一次粘贴的按键序列（与 `paste` 分开，便于单测校验顺序与扫描码）
+fn paste_events(buf: &mut Vec<INPUT>) {
+    let (ctrl, ctrl_scan) = (VK_LCONTROL, scan_code(VK_LCONTROL));
+    let v_scan = scan_code(VK_V);
+    push_modifier_reset(buf);
+    push_key(buf, ctrl, ctrl_scan, false);
+    push_key(buf, VK_V, v_scan, false);
+    push_key(buf, VK_V, v_scan, true);
+    push_key(buf, ctrl, ctrl_scan, true);
+    push_modifier_reset(buf);
+}
+
+/// 虚拟键码 → 扫描码。查不到时返回 0，此时事件依然合法
+/// （与逐字注入的做法一致），只是读扫描码的程序看不到它。
+fn scan_code(vk: VIRTUAL_KEY) -> u16 {
+    unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 }
+}
+
 /// 退格删除：实时输入时用来回退被识别修正的文字
 pub fn backspace(count: usize) -> Result<()> {
     if count == 0 {
@@ -67,8 +128,8 @@ pub fn backspace(count: usize) -> Result<()> {
     let mut buf: Vec<INPUT> = Vec::with_capacity(BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len());
     push_modifier_reset(&mut buf);
     for _ in 0..count {
-        push_key(&mut buf, VK_BACK, false);
-        push_key(&mut buf, VK_BACK, true);
+        push_key(&mut buf, VK_BACK, 0, false);
+        push_key(&mut buf, VK_BACK, 0, true);
         if buf.len() >= BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len() {
             flush(&mut buf)?;
         }
@@ -84,13 +145,15 @@ fn push_unicode(buf: &mut Vec<INPUT>, scan: u16, keyup: bool) {
     buf.push(keyboard_input(VIRTUAL_KEY(0), scan, flags));
 }
 
-fn push_key(buf: &mut Vec<INPUT>, vk: VIRTUAL_KEY, keyup: bool) {
+/// `scan` = 硬件扫描码，读扫描码的程序（游戏、部分远程桌面）只认它；
+/// 不需要时传 0 即可。
+fn push_key(buf: &mut Vec<INPUT>, vk: VIRTUAL_KEY, scan: u16, keyup: bool) {
     let flags = if keyup {
         KEYEVENTF_KEYUP
     } else {
         KEYBD_EVENT_FLAGS(0)
     };
-    buf.push(keyboard_input(vk, 0, flags));
+    buf.push(keyboard_input(vk, scan, flags));
 }
 
 fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -118,9 +181,7 @@ fn flush(buf: &mut Vec<INPUT>) -> Result<()> {
     if sent != expected {
         let err = unsafe { GetLastError() };
         if err.0 == ERROR_ACCESS_DENIED {
-            return Err(anyhow!(
-                "目标程序以管理员权限运行，BBVoxi 无法向它输入文字（请改用普通权限的窗口）"
-            ));
+            return Err(anyhow::Error::new(AccessDenied));
         }
         return Err(anyhow!("模拟键盘输入失败（错误码 {}）", err.0));
     }
@@ -196,12 +257,95 @@ mod tests {
     fn injected_events_carry_our_tag() {
         let mut buf = Vec::new();
         push_modifier_reset(&mut buf);
-        push_key(&mut buf, VK_BACK, false);
+        push_key(&mut buf, VK_BACK, 0, false);
         push_unicode(&mut buf, 0x4F60, false);
         assert!(
             buf.iter()
                 .all(|i| unsafe { i.Anonymous.ki.dwExtraInfo } == INJECT_TAG),
             "注入事件缺少标记，钩子将无法识别"
+        );
+    }
+
+    /// 粘贴是一条独立的注入批次，同样必须带标记 —— 否则钩子会把它
+    /// 当成主人的按键，我们注入的 Ctrl+V 就会去触发主人自己的快捷键
+    #[test]
+    fn paste_events_carry_our_tag() {
+        let mut buf = Vec::new();
+        paste_events(&mut buf);
+        assert!(
+            buf.iter()
+                .all(|i| unsafe { i.Anonymous.ki.dwExtraInfo } == INJECT_TAG),
+            "粘贴事件缺少标记"
+        );
+    }
+
+    /// 读扫描码的程序（游戏、部分远程桌面）看不到 `wScan` 为 0 的按键 ——
+    /// 而那正是需要靠粘贴兜底救回来的那类目标，所以这里的扫描码不能是 0
+    #[test]
+    fn paste_carries_real_scan_codes() {
+        assert_ne!(scan_code(VK_V), 0, "V 的扫描码不该是 0");
+        assert_ne!(scan_code(VK_LCONTROL), 0, "左 Ctrl 的扫描码不该是 0");
+
+        let mut buf = Vec::new();
+        paste_events(&mut buf);
+        let v_down = buf
+            .iter()
+            .find(|i| {
+                let ki = unsafe { i.Anonymous.ki };
+                ki.wVk == VK_V && ki.dwFlags.0 & KEYEVENTF_KEYUP.0 == 0
+            })
+            .expect("应有 V 的按下事件");
+        assert_eq!(unsafe { v_down.Anonymous.ki.wScan }, scan_code(VK_V));
+    }
+
+    /// 顺序错了就不是粘贴：Ctrl 少按一次会打出字面的 v，
+    /// Ctrl 少松一次会让主人之后敲的每个键都变成 Ctrl+键
+    #[test]
+    fn paste_is_ctrl_down_v_down_v_up_ctrl_up() {
+        let mut buf = Vec::new();
+        paste_events(&mut buf);
+        let seq: Vec<(u16, bool)> = buf
+            .iter()
+            .map(|i| {
+                let ki = unsafe { i.Anonymous.ki };
+                (ki.wVk.0, ki.dwFlags.0 & KEYEVENTF_KEYUP.0 != 0)
+            })
+            .collect();
+
+        let ctrl_down = seq
+            .iter()
+            .position(|(vk, up)| *vk == VK_LCONTROL.0 && !up)
+            .expect("缺 Ctrl 按下");
+        let v_down = seq
+            .iter()
+            .position(|(vk, up)| *vk == VK_V.0 && !up)
+            .expect("缺 V 按下");
+        let v_up = seq
+            .iter()
+            .position(|(vk, up)| *vk == VK_V.0 && *up)
+            .expect("缺 V 松开");
+        let ctrl_up = seq
+            .iter()
+            .rposition(|(vk, up)| *vk == VK_LCONTROL.0 && *up)
+            .expect("缺 Ctrl 松开");
+
+        assert!(
+            ctrl_down < v_down && v_down < v_up && v_up < ctrl_up,
+            "顺序必须是 Ctrl↓ V↓ V↑ Ctrl↑，实际 {seq:?}"
+        );
+    }
+
+    /// 批次末尾必须再清一次修饰键：目标程序吞掉某个 KEYUP 时 Ctrl 会卡住
+    #[test]
+    fn paste_ends_with_modifier_reset() {
+        let mut buf = Vec::new();
+        paste_events(&mut buf);
+        let muts = crate::hotkey::MODIFIERS.len();
+        let tail = &buf[buf.len() - muts..];
+        assert!(
+            tail.iter()
+                .all(|i| unsafe { i.Anonymous.ki.dwFlags.0 } & KEYEVENTF_KEYUP.0 != 0),
+            "批次末尾必须是全部修饰键的 KEYUP"
         );
     }
 
@@ -224,7 +368,7 @@ mod tests {
     #[test]
     fn newline_maps_to_enter_keycode() {
         let mut buf = Vec::new();
-        push_key(&mut buf, VK_RETURN, false);
+        push_key(&mut buf, VK_RETURN, 0, false);
         assert_eq!(unsafe { buf[0].Anonymous.ki.wVk }, VK_RETURN);
         assert_eq!(unsafe { buf[0].Anonymous.ki.wScan }, 0);
     }

@@ -12,10 +12,16 @@ use eframe::egui;
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// 应用图标（128×128 RGBA），用作窗口内的品牌标识
 static ICON_WINDOW: &[u8] = include_bytes!("../assets/rgba128_window.bin");
+
+/// 改键捕捉与界面心跳的容忍度：`logic()` 100ms 一帧，界面可见时 `ui()` 至多
+/// 100ms 就被绘制一次，这里留 4 倍余量。超时即认定界面已不在（见
+/// `SettingsApp::reap_capture_if_ui_gone`）。
+const CAPTURE_IDLE_LIMIT: Duration = Duration::from_millis(400);
 
 // —— 设计令牌 ——
 struct Palette {
@@ -120,6 +126,9 @@ pub struct SettingsApp {
     applied_autostart: bool,
     capturing: bool,
     hotkey_error: Option<String>,
+    /// 上一次 `ui()` 被绘制的时刻。改键捕捉的生命周期靠它兜底，见
+    /// `reap_capture_if_ui_gone`。
+    painted_at: Instant,
 }
 
 impl SettingsApp {
@@ -143,6 +152,7 @@ impl SettingsApp {
             applied_autostart: autostart,
             capturing: false,
             hotkey_error: None,
+            painted_at: Instant::now(),
         }
     }
 
@@ -153,7 +163,27 @@ impl SettingsApp {
         }
     }
 
+    /// 界面已经不在（`ui()` 迟迟没被绘制）就结束改键捕捉，返回是否结束了。
+    ///
+    /// 为什么需要这条兜底：捕捉期间钩子是**暂停**的（`paused=true`），按键原样
+    /// 交给窗口。而主窗口一旦收起，eframe 就不再调用 `ui()`（`logic()` 照常
+    /// 10Hz 跑），于是捕捉既结束不了、`paused` 也永远留在 true —— 全局快捷键
+    /// **彻底失效**（按什么键都没反应），而且没有任何提示。
+    ///
+    /// 不逐个去补"隐藏窗口"的调用点：已知的隐藏路径就有两条（关闭按钮、
+    /// 托盘触发录音时的 `hide_settings`），将来还会有第三条。这里判的是
+    /// 真正的不变量 —— *捕捉只能在设置界面正在被绘制时存在*。
+    pub fn reap_capture_if_ui_gone(&mut self) -> bool {
+        if !capture_is_stale(self.capturing, self.painted_at.elapsed()) {
+            return false;
+        }
+        self.end_capture();
+        true
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        // 心跳：`logic()` 靠它判断"界面还在不在"，见 `reap_capture_if_ui_gone`
+        self.painted_at = Instant::now();
         self.handle_capture(ui.ctx());
         let p = Palette::of(ui.visuals().dark_mode);
         apply_widget_style(ui, &p);
@@ -384,6 +414,32 @@ impl SettingsApp {
             );
             ui.add_space(4.0);
 
+            // 剪贴板相关的两个开关都在客户端起作用，与选哪家服务商无关
+            ui.checkbox(
+                &mut self.edit.options.clipboard_fallback,
+                RichText::new("输入被拒时用剪贴板粘贴兜底").size(13.0),
+            );
+            ui.label(
+                RichText::new(
+                    "目标程序不认模拟按键时改走 Ctrl+V；粘贴成功后会还原你原来的剪贴板内容",
+                )
+                .size(11.0)
+                .color(p.muted),
+            );
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.edit.options.keep_on_clipboard,
+                RichText::new("识别结果总留一份到剪贴板").size(13.0),
+            );
+            ui.label(
+                RichText::new(
+                    "输入成功也留一份，随时可以 Ctrl+V；开启后不再还原你原来的剪贴板内容",
+                )
+                .size(11.0)
+                .color(p.muted),
+            );
+            ui.add_space(4.0);
+
             // 标点 / 顺滑只有部分服务商支持：不支持时禁用并说明，
             // 不能给用户一个看起来能拨、实际不接线的开关
             let (punc_ok, smooth_ok) = match self.edit.provider {
@@ -563,6 +619,20 @@ impl SettingsApp {
                 .clicked()
             {
                 self.save();
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("项目地址").size(13.0).color(p.text))
+                        .fill(p.field)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(egui::vec2(96.0, 34.0)),
+                )
+                .clicked()
+            {
+                if let Err(e) = open_project_page() {
+                    self.status = Some((false, format!("打开项目地址失败：{e}")));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -780,6 +850,60 @@ fn small_button(ui: &mut egui::Ui, p: &Palette, text: &str) -> egui::Response {
     )
 }
 
+/// 改键捕捉是否已经失效（界面久久没被绘制）。
+///
+/// 抽成纯函数只是为了能把 `CAPTURE_IDLE_LIMIT` 这条边界钉死在单测里 ——
+/// 这里判错的代价很不对称：判漏了，`paused` 会永远留着、**全局快捷键彻底失效**；
+/// 判早了只是让主人重新点一次「重新录制」。所以边界取 ">"，宁可晚一步收。
+fn capture_is_stale(capturing: bool, idle: Duration) -> bool {
+    capturing && idle > CAPTURE_IDLE_LIMIT
+}
+
+/// 项目地址（「项目地址」按钮打开的那个链接）
+const PROJECT_URL: &str = "https://github.com/HaiSeaman/BBVoxi";
+
+/// 用系统默认浏览器打开项目地址。
+///
+/// **不能用 `egui::Context::open_url` 或 `egui::Hyperlink`**：那两个只是把
+/// `OutputCommand::OpenUrl` 投出去，而 eframe 0.35 只在 web runner 里消费它，
+/// 原生窗口上没有任何人处理 —— 按下去会毫无反应（不报错，也不打开）。
+///
+/// 用 `ShellExecuteW` 是 Windows 上打开 URL 的标准做法：不需要经过 shell 解析，
+/// 不会闪黑窗，也不需要额外的依赖。
+#[cfg(windows)]
+fn open_project_page() -> Result<(), String> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let url: Vec<u16> = PROJECT_URL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    // 返回值声明成 HINSTANCE，但语义是错误码：> 32 才算成功（微软文档的经典坑）
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("系统拒绝了打开浏览器的请求（错误码 {code}）"))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_project_page() -> Result<(), String> {
+    Err("仅支持 Windows".into())
+}
+
 /// 服务商分段选择器：三家一眼看全，比下拉少一次点击
 fn provider_selector(ui: &mut egui::Ui, p: &Palette, current: &mut Provider) {
     ui.horizontal(|ui| {
@@ -917,6 +1041,47 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真的去开一次浏览器，验证 `ShellExecuteW` 这条链路能通。
+    ///
+    /// 标了 `#[ignore]`：它会**真的用你的默认浏览器打开项目页**，所以不进
+    /// `cargo test` 的默认集合。需要烟测时手动跑：
+    /// `cargo test open_project_page -- --ignored`
+    ///
+    /// 为什么值得有这么一条：这个功能**没有任何可在单测里断言的东西** ——
+    /// 按钮画对了、函数编过了，都不代表浏览器真的会起来（egui 那套
+    /// `open_url` 就是典型反例：编译通过、运行不报错，只是什么都不发生）。
+    #[test]
+    #[ignore = "会真的打开浏览器；需要时手动跑：cargo test open_project_page -- --ignored"]
+    fn open_project_page_reports_success() {
+        assert_eq!(PROJECT_URL, "https://github.com/HaiSeaman/BBVoxi");
+        open_project_page().expect("ShellExecuteW 应该能打开项目地址");
+    }
+
+    /// 改键捕捉必须跟着界面一起过期。
+    ///
+    /// 判错的代价不对称：漏判 → `paused` 永远是 true，**全局快捷键彻底失效**
+    /// 且没有任何提示；误判 → 主人重新点一次「重新录制」。所以这里要求
+    /// "超过容忍度"才算失效（正好等于不算），并且没在捕捉时一律不动作。
+    #[test]
+    fn capture_expires_only_when_capturing_and_past_the_limit() {
+        assert!(
+            !capture_is_stale(false, CAPTURE_IDLE_LIMIT * 10),
+            "没在捕捉时谈不上失效，不能去动 paused"
+        );
+        assert!(
+            !capture_is_stale(true, Duration::from_millis(100)),
+            "界面刚画过（logic 100ms 一帧），绝不能误杀"
+        );
+        assert!(
+            !capture_is_stale(true, CAPTURE_IDLE_LIMIT),
+            "刚好到容忍度不算失效（边界取 >）"
+        );
+        assert!(
+            capture_is_stale(true, CAPTURE_IDLE_LIMIT + Duration::from_millis(1)),
+            "超过容忍度必须收掉，否则全局快捷键会永久失效"
+        );
+    }
 
     #[test]
     fn key_mapping_covers_letters_digits_and_function_keys() {

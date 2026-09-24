@@ -114,6 +114,10 @@ pub struct Options {
     pub smooth: bool,
     /// 边说话边打字（识别中间结果实时写入目标程序，被修正时自动回退重打）
     pub live_typing: bool,
+    /// 逐字注入被目标程序拒掉时，改用剪贴板粘贴兜底
+    pub clipboard_fallback: bool,
+    /// 识别结果总留一份到剪贴板（成功输入也留）
+    pub keep_on_clipboard: bool,
 }
 
 impl Default for Options {
@@ -122,6 +126,12 @@ impl Default for Options {
             auto_punctuation: true,
             smooth: true,
             live_typing: true,
+            // 兜底默认开：它只在"逐字注入已经失败"时才动剪贴板，
+            // 而且是先存后还，对主人的影响只是失败那一下的几百毫秒。
+            clipboard_fallback: true,
+            // 常驻默认关：它会让主人复制的东西一去不回（我们靠剪贴板序号
+            // 判断"期间有没有人写过"，没法替他决定该留哪一份），所以要显式开。
+            keep_on_clipboard: false,
         }
     }
 }
@@ -168,7 +178,9 @@ pub fn load_or_default() -> Result<(Config, bool)> {
     match serde_json::from_str::<Config>(&text) {
         Ok(cfg) => Ok((cfg, false)),
         Err(e) => {
-            eprintln!("配置文件解析失败，已回退默认配置: {e}");
+            // 不能用 eprintln!：release 下 windows_subsystem="windows"，没有控制台，
+            // 这一行会直接消失。这里不是"恢复默认"就完了 —— 主人需要知道凭据为什么没了。
+            crate::log::log(format!("配置文件解析失败，已回退默认配置: {e}"));
             Ok((Config::default(), false))
         }
     }
@@ -267,6 +279,18 @@ mod tests {
         let cfg: Config = serde_json::from_str(raw).expect("旧配置必须还能读");
         assert_eq!(cfg.provider, Provider::Qwen);
         assert!(!cfg.options.auto_punctuation);
+    }
+
+    /// 老配置文件里没有这两个新开关，必须能读、且拿到我们定的默认值。
+    /// 两者默认相反，各自有理由：
+    /// - 兜底默认**开**：只在逐字注入已经失败时才动剪贴板，且先存后还；
+    /// - 常驻默认**关**：它会让主人原来复制的内容一去不回。
+    #[test]
+    fn clipboard_options_default_for_old_configs() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"options":{"live_typing":true}}"#).expect("旧配置必须还能读");
+        assert!(cfg.options.clipboard_fallback, "兜底应默认开");
+        assert!(!cfg.options.keep_on_clipboard, "常驻剪贴板应默认关");
     }
 
     /// 保存必须是"要么整体成功、要么旧文件原封不动"。

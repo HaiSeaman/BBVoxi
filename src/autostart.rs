@@ -30,17 +30,26 @@ fn has_value(name: &str) -> bool {
 }
 
 fn set_named(name: &str, enabled: bool) -> Result<()> {
-    let key = open(KEY_WRITE)?;
-    let name = HSTRING::from(name);
-    let err = if enabled {
+    // 先把要写进去的值备好，再打开注册表键：`current_exe()` 失败（进程映像被
+    // 删掉或改名后运行）时 `?` 会直接返回 —— 若那时键已经打开，这个句柄就漏了。
+    let value = if enabled {
         let exe = std::env::current_exe().context("无法获取程序自身路径")?;
         let mut wide: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().collect();
         wide.push(0); // 注册表字符串需要以 0 结尾
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
-        unsafe { RegSetValueExW(key, &name, None, REG_SZ, Some(bytes)) }
+        Some(wide)
     } else {
-        unsafe { RegDeleteValueW(key, &name) }
+        None
+    };
+
+    let key = open(KEY_WRITE)?;
+    let name = HSTRING::from(name);
+    let err = match &value {
+        Some(wide) => {
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2) };
+            unsafe { RegSetValueExW(key, &name, None, REG_SZ, Some(bytes)) }
+        }
+        None => unsafe { RegDeleteValueW(key, &name) },
     };
     let _ = unsafe { RegCloseKey(key) };
     if err.0 != 0 {

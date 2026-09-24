@@ -235,7 +235,7 @@ impl AsrClient {
                 Err(_) => bail!("服务端握手超时"),
             }
         }
-        crate::log::log(format!("ASR 已连接：{}", provider_name(cfg.provider)));
+        crate::log::log(format!("ASR 已连接：{}", cfg.provider.label()));
         Ok(client)
     }
 
@@ -309,14 +309,6 @@ async fn forward_frames(
     }
 }
 
-fn provider_name(p: Provider) -> &'static str {
-    match p {
-        Provider::Qwen => "千问（阿里云百炼）",
-        Provider::Doubao => "豆包（火山引擎）",
-        Provider::Tencent => "腾讯云",
-    }
-}
-
 fn build_backend(cfg: &Config) -> Backend {
     match cfg.provider {
         Provider::Qwen => Backend::Qwen(qwen::Qwen::new(&cfg.qwen, cfg.options.auto_punctuation)),
@@ -374,7 +366,8 @@ mod tests {
 
     /// 回归测试：走一遍真实的 TLS 连接路径（故意用无效 Key）。
     /// 期望得到「明确的错误」，而不是 panic —— 之前 rustls 缺少加密后端时
-    /// 会在这里 panic，release 版（panic=abort）表现为点测试按钮直接闪退。
+    /// 会在这里 panic，那时的 release 配置是 `panic = "abort"`，表现为点测试
+    /// 按钮直接闪退（现在已改为 `unwind` + panic hook，见 `Cargo.toml`）。
     #[tokio::test]
     async fn connect_with_invalid_key_returns_error_instead_of_crashing() {
         let mut cfg = Config::default();
