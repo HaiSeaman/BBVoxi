@@ -368,9 +368,8 @@ impl AsrClient {
     ///
     /// 为什么要有它：以前全程不发关闭帧，`Drop` 又直接 `reader.abort()`，服务端
     /// 只能把连接当成异常中断，关闭原因/错误码的语义全部丢失，排障时看不到线索。
-    /// 这是给调用方可选的优雅收尾入口 —— `Drop` 里不能 await，所以不做在里面；
-    /// 调用方若想优雅收尾可显式调用它（不调也不影响原有行为）。
-    #[allow(dead_code)] // 供调用方按需使用；当前会话流程未强制调用它
+    /// `Drop` 里不能 await，所以只能由会话在收尾时显式调一次
+    /// （见 `session::run_session` —— 以前它是个没人调用的死函数，等于白写）。
     pub async fn close(&mut self) -> Result<()> {
         self.send_timed(Message::Close(None), "发送关闭帧").await?;
         // `send` 已隐含一次 flush，这里再显式刷一次，确保关闭帧真的落到线上

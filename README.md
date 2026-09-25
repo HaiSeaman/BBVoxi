@@ -4,15 +4,16 @@
 
 
 
-> **最新版本**：v1.3.1（2026-09-25，Stable）
-> 详细发布说明见 [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
+> **最新版本**：v1.3.2（2026-09-25，Stable）
+> 详细发布说明见 [docs/RELEASE_v1.3.2.md](./docs/RELEASE_v1.3.2.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
 
 按住一个全局快捷键说话，松开后识别结果**自动打到光标所在的位置**——就像输入法正常打字一样，没有多余窗口。
 
-- **单文件**：`BBVoxi-1.3.1.exe`，无需安装，双击即用
+- **单文件**：`BBVoxi-1.3.2.exe`，无需安装，双击即用
 - **边说话边打字**：识别结果实时写入光标处，识别被修正时自动回退重打（成熟输入法的做法）；双击 exe 可唤醒后台实例
 - **按多久说多久**：不限制单次录音时长
-- **打不进去也不丢字**：有些程序不认逐字注入（远程桌面、部分 Electron/Java），会自动改用剪贴板粘贴；连粘贴也不行时就把结果放进剪贴板，按 `Ctrl+V` 取回
+- **打不进去也不丢字**：识别结果**每次都留一份到剪贴板**（默认开）——有些程序不认逐字注入（远程桌面、部分 Electron/Java），而"字到底有没有打进目标程序"客户端**无法核实**，所以留一份最稳；随时 `Ctrl+V` 取回
+- **不打扰**：结果改走剪贴板时**不弹窗**，只在托盘悬浮文字与设置窗里说明
 - **三家服务商可切换**：阿里云百炼（千问）、火山引擎（豆包）、腾讯云 ASR
 
 ---
@@ -21,7 +22,7 @@
 
 ### 直接用（推荐）
 
-从 Releases 下载 `BBVoxi-1.3.1.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
+从 Releases 下载 `BBVoxi-1.3.2.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
 
 ### 从源码构建
 
@@ -232,7 +233,7 @@ assets/       图标资源（icon.ico + 128/32 RGBA）+ bbvoxi.rc
 scripts/      make_icons.py（源图去背 → 透明图标一键生成）
 docs/         设计与修复报告 + 界面截图
 build.rs      用 Windows SDK rc.exe 把图标编译进 exe
-dist/         打包产物（BBVoxi-1.3.1.exe，不入库）
+dist/         打包产物（BBVoxi-1.3.2.exe，不入库）
 ```
 
 ---
@@ -241,12 +242,12 @@ dist/         打包产物（BBVoxi-1.3.1.exe，不入库）
 
 ```bash
 cargo build --release
-copy target\release\bbvoxi.exe dist\BBVoxi-1.3.1.exe
+copy target\release\bbvoxi.exe dist\BBVoxi-1.3.2.exe
 ```
 
-然后在 GitHub 新建 Release：Tag `v1.3.1`，标题 `BBVoxi 1.3.1`，上传 `dist\BBVoxi-1.3.1.exe`。
-（版本号三处一致：exe 文件名 / 界面显示 / GitHub Tag 都是 `1.3.1`，`Cargo.toml` 里同样写 `1.3.1`。）
-可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.3.1.md](./docs/GITHUB发布文案-v1.3.1.md)。
+然后在 GitHub 新建 Release：Tag `v1.3.2`，标题 `BBVoxi 1.3.2`，上传 `dist\BBVoxi-1.3.2.exe`。
+（版本号三处一致：exe 文件名 / 界面显示 / GitHub Tag 都是 `1.3.2`，`Cargo.toml` 里同样写 `1.3.2`。）
+可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.3.2.md](./docs/GITHUB发布文案-v1.3.2.md)。
 
 > `dist/`、`*.exe`、构建产物与 `.workbuddy/` 已在 `.gitignore` 中忽略，不会进仓库。
 
@@ -288,7 +289,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.1.exe
 
 ## 十、版本与发布
 
-**当前**：v1.3.1（Stable，2026-09-25）
+**当前**：v1.3.2（Stable，2026-09-25）
 
 发布说明分两层组织：
 
@@ -297,9 +298,10 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.1.exe
 
 | 文档 | 说明 |
 |---|---|
-| [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
-| [docs/全量审查与修复报告-v1.3.1.md](./docs/全量审查与修复报告-v1.3.1.md) | 本轮的逐项根因分析（32 项问题 / 修复 31 项）、验证方式与过程中的偏差记录 |
-| [docs/GITHUB发布文案-v1.3.1.md](./docs/GITHUB发布文案-v1.3.1.md) | GitHub Release 标题与正文（复制粘贴用）+ 发布前 30 秒自检清单 |
-| [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) ｜ [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 上一版发布说明 ｜ 上上版 ｜ 所有版本索引、写作模板、手动发布流程 |
+| [docs/RELEASE_v1.3.2.md](./docs/RELEASE_v1.3.2.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
+| [docs/全量审查与修复报告.md](./docs/全量审查与修复报告.md) | 本版的逐项根因分析（四路并行审查：规格 / 约定 / 逻辑缺陷 / 死代码与依赖）、修了什么与"刻意不改"的取舍 |
+| [docs/GITHUB发布文案-v1.3.2.md](./docs/GITHUB发布文案-v1.3.2.md) | GitHub Release 标题与正文（复制粘贴用）+ 发布前 30 秒自检清单 |
+| [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md) ｜ [docs/全量审查与修复报告-v1.3.1.md](./docs/全量审查与修复报告-v1.3.1.md) ｜ [docs/GITHUB发布文案-v1.3.1.md](./docs/GITHUB发布文案-v1.3.1.md) | 上一版（1.3.1）：发布说明 ｜ 审查报告 ｜ 发布文案 |
+| [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) ｜ [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 更早版本 ｜ 所有版本索引、写作模板、手动发布流程 |
 
 > 后续每个版本都会新增一份 `docs/RELEASE_v<版本号>.md`，并在「版本历史」追加索引行。发布流程见 `docs/版本历史.md` §4。

@@ -20,6 +20,8 @@ pub struct Capture {
     error: Arc<Mutex<Option<String>>>,
     /// 请求采集线程收工（会话收尾时置位）
     stopped: Arc<AtomicBool>,
+    /// 停止后"残留尾帧已经补发完了"（由采集回调置位，见 `Feed::push`）
+    tail_flushed: Arc<AtomicBool>,
 }
 
 impl Capture {
@@ -36,24 +38,46 @@ impl Capture {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
     }
+
+    /// 残留尾帧补发完了吗（见 `Feed::push` 开头）。
+    ///
+    /// 会话收尾时**等这个标志**，而不是睡一个固定时长：蓝牙免提、部分 USB 声卡的
+    /// 回调周期能到 100ms 以上，固定睡 60ms 会在回调到来之前就把流 drop 掉 ——
+    /// 尾帧再也没机会补发，主人松手前那几个字就这么丢了。
+    pub fn tail_flushed(&self) -> bool {
+        self.tail_flushed.load(Ordering::Relaxed)
+    }
 }
+
+/// 等麦克风就绪的上限。设备被独占、驱动卡死时 `build_input_stream` 可能一直不返回，
+/// 而这里是**同步调用**（会话线程）—— 不设上限的话整个会话线程会一直卡着，
+/// 之后所有热键（包括松开结束）都失效，只能重启程序。
+const DEVICE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn start() -> Result<Capture> {
     // 100 帧 = 10 秒，够覆盖连接建立的耗时
     let (tx, rx) = channel::<Vec<i16>>(100);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-    // stopped / error 在这里创建、由采集线程和 Capture 共享：
-    // 会话要能主动叫停采集（stop），出错时也要能读到原因（error）。
+    // stopped / error / tail_flushed 在这里创建、由采集线程和 Capture 共享：
+    // 会话要能主动叫停采集（stop）、出错时读到原因（error）、收尾时知道尾巴补完没有。
     let stopped = Arc::new(AtomicBool::new(false));
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tail_flushed = Arc::new(AtomicBool::new(false));
     let thread_stopped = stopped.clone();
     let thread_error = error.clone();
+    let thread_tail = tail_flushed.clone();
 
     std::thread::Builder::new()
         .name("bbvoxi-audio".into())
         .spawn(move || {
-            let stream = match build_stream(tx, thread_stopped.clone(), thread_error) {
+            let handles = CaptureHandles {
+                tx,
+                stopped: thread_stopped.clone(),
+                error: thread_error,
+                tail_flushed: thread_tail.clone(),
+            };
+            let stream = match build_stream(handles) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -66,22 +90,53 @@ pub fn start() -> Result<Capture> {
             while !thread_stopped.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // 会话可能还在等"尾帧补发完"：这里再给回调一点时间（它每 50ms 轮询一次），
+            // 但**有上限**，绝不为了尾巴把收尾卡死。
+            let deadline = std::time::Instant::now() + TAIL_WAIT_BEFORE_DROP;
+            while !thread_tail.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             drop(stream);
         })
         .context("启动音频线程失败")?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Capture { rx, error, stopped }),
+    match ready_rx.recv_timeout(DEVICE_READY_TIMEOUT) {
+        Ok(Ok(())) => Ok(Capture {
+            rx,
+            error,
+            stopped,
+            tail_flushed,
+        }),
         Ok(Err(e)) => Err(anyhow!(e)),
-        Err(_) => Err(anyhow!("音频线程异常退出")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // 让采集线程别在后台继续挂着（它一旦就绪会立刻看到 stopped 并退出）
+            stopped.store(true, Ordering::Relaxed);
+            Err(anyhow!(
+                "麦克风启动超时（{DEVICE_READY_TIMEOUT:?} 没就绪，通常是被别的程序独占或驱动卡住）"
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("音频线程异常退出")),
     }
 }
 
-fn build_stream(
+/// 采集线程 drop 流之前，最多再等多久"尾帧补发完"。
+/// 与 `Capture::tail_flushed` 是同一件事的两端（会话等的是同一个标志）。
+const TAIL_WAIT_BEFORE_DROP: Duration = Duration::from_millis(300);
+
+/// 采集回调需要的那几样共享句柄。
+///
+/// 收成一个结构体是为了别让它们各自成串地穿四层调用（`start` → `build_stream` →
+/// `build` → `Feed`）：以前这四个参数每次都按同一个顺序传，插一个新参数就得改四处、
+/// 还容易传错位置。打包之后只管往里加字段。
+#[derive(Clone)]
+struct CaptureHandles {
     tx: Sender<Vec<i16>>,
     stopped: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
-) -> Result<cpal::Stream> {
+    tail_flushed: Arc<AtomicBool>,
+}
+
+fn build_stream(handles: CaptureHandles) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host.default_input_device().context("未检测到麦克风设备")?;
     let supported = device
@@ -102,8 +157,8 @@ fn build_stream(
     // 所以这里除了记日志，还要（1）把错误文本存到共享位置供会话读取，
     // （2）置位 stopped 让采集线程退出、rx 关闭 —— 会话随即正常收尾并如实报错。
     let on_err = {
-        let stopped = stopped.clone();
-        let error = error.clone();
+        let stopped = handles.stopped.clone();
+        let error = handles.error.clone();
         move |e: cpal::StreamError| {
             let msg = format!("{e}");
             crate::log::log(format!("麦克风采集错误：{msg}"));
@@ -112,18 +167,10 @@ fn build_stream(
         }
     };
     let stream = match format {
-        SampleFormat::F32 => {
-            build::<f32>(&device, &config, in_rate, channels, tx, stopped, on_err)?
-        }
-        SampleFormat::I16 => {
-            build::<i16>(&device, &config, in_rate, channels, tx, stopped, on_err)?
-        }
-        SampleFormat::U16 => {
-            build::<u16>(&device, &config, in_rate, channels, tx, stopped, on_err)?
-        }
-        SampleFormat::I32 => {
-            build::<i32>(&device, &config, in_rate, channels, tx, stopped, on_err)?
-        }
+        SampleFormat::F32 => build::<f32>(&device, &config, in_rate, channels, handles, on_err)?,
+        SampleFormat::I16 => build::<i16>(&device, &config, in_rate, channels, handles, on_err)?,
+        SampleFormat::U16 => build::<u16>(&device, &config, in_rate, channels, handles, on_err)?,
+        SampleFormat::I32 => build::<i32>(&device, &config, in_rate, channels, handles, on_err)?,
         other => bail!("不支持的麦克风采样格式：{other:?}"),
     };
     stream.play().context("启动麦克风采集失败")?;
@@ -145,8 +192,7 @@ fn build<T>(
     config: &StreamConfig,
     in_rate: u32,
     channels: usize,
-    tx: Sender<Vec<i16>>,
-    stopped: Arc<AtomicBool>,
+    handles: CaptureHandles,
     on_err: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream>
 where
@@ -155,8 +201,9 @@ where
     let mut feed = Feed {
         resampler: Resampler::new(in_rate, TARGET_RATE),
         frame: Vec::with_capacity(FRAME_SAMPLES),
-        tx,
-        stopped,
+        tx: handles.tx,
+        stopped: handles.stopped,
+        tail_flushed: handles.tail_flushed,
         channels,
         sum: 0.0,
         counted: 0,
@@ -173,6 +220,8 @@ struct Feed {
     frame: Vec<i16>,
     tx: Sender<Vec<i16>>,
     stopped: Arc<AtomicBool>,
+    /// 残留尾帧补发完的标志（会话收尾时等它，见 `Capture::tail_flushed`）
+    tail_flushed: Arc<AtomicBool>,
     channels: usize,
     sum: f32,
     counted: usize,
@@ -199,6 +248,10 @@ impl Feed {
                     let tail = std::mem::take(&mut self.frame);
                     let _ = self.tx.try_send(tail);
                 }
+                // 告诉会话"尾巴已经补完了"：它在收尾时等这个标志，而不是睡一个
+                // 固定时长（固定时长在回调周期长的设备上会等不到，尾巴照样丢）。
+                // 即使这次没有残留可补，也必须置位 —— "补完了"就是"以后没有了"。
+                self.tail_flushed.store(true, Ordering::Relaxed);
             }
             return;
         }
@@ -534,17 +587,23 @@ mod tests {
     fn stopping_flushes_the_partial_tail_instead_of_dropping_it() {
         let (tx, mut rx) = channel::<Vec<i16>>(10);
         let stopped = Arc::new(AtomicBool::new(false));
+        let tail_flushed = Arc::new(AtomicBool::new(false));
         let mut feed = Feed {
             resampler: Resampler::new(TARGET_RATE, TARGET_RATE),
             frame: Vec::new(),
             tx,
             stopped: stopped.clone(),
+            tail_flushed: tail_flushed.clone(),
             channels: 1,
             sum: 0.0,
             counted: 0,
             dropped: false,
             flushed: false,
         };
+        assert!(
+            !tail_flushed.load(Ordering::Relaxed),
+            "还没停止就不该声称尾巴补完了"
+        );
 
         // 正常采一小段，还凑不满一整帧
         feed.push(&[0.1f32; 100]);
@@ -562,10 +621,44 @@ mod tests {
             "补发的尾帧要包含停止前攒下的样本，实际只有 {} 个",
             tail.len()
         );
+        // 会话收尾就是等这个标志（而不是睡固定时长）：
+        // 不置位的话它会一直等到超时上限，尾巴就有被丢的风险
+        assert!(
+            tail_flushed.load(Ordering::Relaxed),
+            "补发完必须置位 tail_flushed，会话才知道可以收尾了"
+        );
 
         // 只补发一次：再来回调也不该重复发
         feed.push(&[0.1f32; 10]);
         assert!(rx.try_recv().is_err(), "残留尾帧只能补发一次，不能重复");
+    }
+
+    /// 停止时哪怕**没有**残留可补（正好整齐）也要置位 `tail_flushed` ——
+    /// 会话等的是"补完了"，不是"补过东西了"；不置位它会一直等到超时上限。
+    #[test]
+    fn stopping_without_leftovers_still_marks_the_tail_as_done() {
+        let (tx, _rx) = channel::<Vec<i16>>(10);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let tail_flushed = Arc::new(AtomicBool::new(false));
+        let mut feed = Feed {
+            resampler: Resampler::new(TARGET_RATE, TARGET_RATE),
+            frame: Vec::new(),
+            tx,
+            stopped: stopped.clone(),
+            tail_flushed: tail_flushed.clone(),
+            channels: 1,
+            sum: 0.0,
+            counted: 0,
+            dropped: false,
+            flushed: false,
+        };
+
+        stopped.store(true, Ordering::Relaxed);
+        feed.push(&[] as &[f32]);
+        assert!(
+            tail_flushed.load(Ordering::Relaxed),
+            "没有残留也要置位，否则会话会白等到超时"
+        );
     }
 
     /// `Decimator::finish` 要把当前正在积累的箱也收掉，

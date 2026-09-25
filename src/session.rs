@@ -2,7 +2,6 @@
 //! 独立线程跑 tokio 运行时，UI 线程通过 Shared 快照读取状态。
 
 use eframe::egui;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -27,6 +26,16 @@ pub struct Snapshot {
     pub text: String,
     pub hint: String,
     pub error: Option<String>,
+    /// 一次**不算错误**的提示（例如"结果已放进剪贴板"）。
+    /// 与 `error` 分开是为了界面上的颜色与托盘提示分开：这类情况不是故障，
+    /// 只是这次没能自动输入而已。
+    pub notice: Option<String>,
+    /// 上一次结果**确实**留在剪贴板里了吗（写完回读核对过）。
+    ///
+    /// 界面靠它决定要不要说"这份结果也留在了剪贴板"—— 说错了比不说更糟：
+    /// 主人照着去 Ctrl+V 却什么也粘不出来，正是他报的那个"提示说复制好了、
+    /// 却找不到"。所以这个标记只由**核对通过**的那一次写入置位。
+    pub kept_on_clipboard: bool,
     pub last_result: String,
     pub started: Option<Instant>,
 }
@@ -40,8 +49,6 @@ impl Snapshot {
 pub struct Shared {
     inner: Mutex<Snapshot>,
     ctx: egui::Context,
-    /// 会话线程请求「把设置窗显示出来」的标志（见 `show_settings` / `take_show_request`）
-    show_request: AtomicBool,
 }
 
 impl Shared {
@@ -49,7 +56,6 @@ impl Shared {
         Self {
             inner: Mutex::new(Snapshot::default()),
             ctx,
-            show_request: AtomicBool::new(false),
         }
     }
 
@@ -76,23 +82,39 @@ impl Shared {
             .send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
-    /// 请求把设置窗重新显示出来。
-    /// 放弃自动输入、改走剪贴板交付时用：主人得看得见"结果已放到剪贴板、
-    /// 按 Ctrl+V 粘贴"这句提示，否则他会以为这次识别什么都没出。
+    /// 结果改走剪贴板时**只提示、不弹窗**。
     ///
-    /// 为什么不能在这里直接发 `Visible(true)`：`App::logic` 在"本程序认为窗口
-    /// 是收起的"（`shown == false`：静默启动、收起到托盘）状态下每帧都会补发一次
-    /// `Visible(false)`，会把这里的请求当场盖掉 —— 结果就是"想让主人看提示"
-    /// 却什么也看不见。所以这里只置一个请求位并唤醒界面，由 UI 线程走正规的
-    /// 显示流程（`App::show_settings`：更新 `shown`、搬回屏幕内、延后一帧抢焦点）。
-    pub fn show_settings(&self) {
-        self.show_request.store(true, Ordering::Relaxed);
-        self.ctx.request_repaint();
+    /// 之前这里是把设置窗顶到最前面（`ViewportCommand::Visible(true)`），理由是
+    /// "主人得看得见这句话"。可主人此刻正在别的程序里干活：窗口自己跳出来既打断他，
+    /// 又会被当成"软件乱弹"（他报的就是这个）。所以提示换到不打扰的地方：
+    /// 托盘图标与悬浮文字（见 `main.rs::sync_tray`）、窗口里的那行字（他愿意看时
+    /// 再看）、以及日志。文字放在 `notice` 而不是 `error`：这不是故障。
+    pub fn notice(&self, message: impl Into<String>) {
+        let message = message.into();
+        log::log(format!("提示（不弹窗）：{message}"));
+        self.update(|s| {
+            s.notice = Some(message);
+        });
     }
 
-    /// UI 线程取走「显示设置窗」请求（取走即清零）
-    pub fn take_show_request(&self) -> bool {
-        self.show_request.swap(false, Ordering::Relaxed)
+    /// 一次会话开始时的状态复位。抽成方法而不是就地写一段 `update`：
+    /// 这样"上一次的提示要退场"这条契约可以在单测里直接钉住。
+    ///
+    /// `started` 特意留空：计时要从**麦克风已开、服务已连上**那一刻起算
+    /// （见 `run_session` 里把 started 与 test_limit 对齐的说明），在会话开头
+    /// 就算时间会把连接耗时吃进那 5 秒测试时限里。
+    pub fn begin_session(&self) {
+        self.update(|s| {
+            s.recording = true;
+            s.text.clear();
+            s.hint = "正在连接…".into();
+            s.error = None;
+            // 上一次留下的"结果已放进剪贴板"提示这时就该退场了：
+            // 它挂着的意义是"主人还没去粘贴"，而不是长期状态
+            s.notice = None;
+            s.kept_on_clipboard = false;
+            s.started = None;
+        });
     }
 
     fn fail(&self, message: impl Into<String>) {
@@ -113,6 +135,20 @@ impl Shared {
         self.update(|s| {
             s.error = Some(message);
         });
+    }
+}
+
+/// 把钩子攒下的「Win 键补发失败」落成日志。
+///
+/// 钩子回调里**禁止 I/O**（会被 Windows 静默摘钩子，见 `hotkey::take_replay_failures`），
+/// 所以那边只记次数与错误码，真正的日志在这里补上 —— 会话线程做 I/O 是安全的。
+fn log_replay_failures() {
+    let (count, code) = crate::hotkey::take_replay_failures();
+    if count > 0 {
+        log::log(format!(
+            "上次有 {count} 次 Win 键补发失败（最近错误码 {code}）——前台若是管理员权限\
+             窗口，注入会被系统拦下，那种情况下按 Win 不会弹开始菜单"
+        ));
     }
 }
 
@@ -150,9 +186,23 @@ async fn worker(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>, mut rx: UnboundedR
         // 常驻程序继续活着并把错误显示给用户（不要整个进程消失）
         let outcome = std::panic::AssertUnwindSafe(async {
             match cmd {
-                Cmd::Start => run_session(&cfg, &shared, &mut rx, false).await,
-                Cmd::Test => run_session(&cfg, &shared, &mut rx, true).await,
-                Cmd::Stop => {} // 空闲时收到 Stop 忽略即可
+                Cmd::Start => {
+                    // 「谁按了快捷键」这类日志记在这里、而不是键盘钩子里：
+                    // 低级键盘钩子必须毫秒级返回，里面做文件 I/O 一旦卡住（杀软、
+                    // 磁盘忙），Windows 会**悄悄**把钩子摘掉 —— 表现就是"快捷键突然
+                    // 全都没反应、Win 键开始乱弹开始菜单"，而且日志里什么都没有。
+                    // 钩子那边只攒原子计数，由这里落成日志。
+                    log_replay_failures();
+                    log::log("开始录音（收到启动指令）");
+                    run_session(&cfg, &shared, &mut rx, false).await
+                }
+                Cmd::Test => {
+                    log::log("测试识别（设置窗）");
+                    run_session(&cfg, &shared, &mut rx, true).await
+                }
+                // 空闲时收到 Stop 忽略即可（录音中的 Stop 由 run_session 自己的
+                // 循环收走，不会落到这里）
+                Cmd::Stop => log::log("结束录音指令（当前没在录音，已忽略）"),
             }
         })
         .catch_unwind()
@@ -191,14 +241,7 @@ async fn run_session(
         shared.hide_settings();
     }
 
-    shared.update(|s| {
-        s.recording = true;
-        s.text.clear();
-        s.hint = "正在连接…".into();
-        s.error = None;
-        // 计时器先不启动：见下面"请说话…"处把 started 与 test_limit 对齐的说明
-        s.started = None;
-    });
+    shared.begin_session();
 
     let mut capture = match audio::start() {
         Ok(c) => c,
@@ -239,10 +282,8 @@ async fn run_session(
     let mut typer = if test {
         typer::LiveTyper::muted()
     } else {
-        typer::LiveTyper::new(cfg.options.live_typing, watch).with_fallback(typer::Fallback {
-            paste: cfg.options.clipboard_fallback,
-            keep_on_clipboard: cfg.options.keep_on_clipboard,
-        })
+        typer::LiveTyper::new(cfg.options.live_typing, watch)
+            .with_paste_fallback(cfg.options.clipboard_fallback)
     };
 
     // 只有「测试识别」自动结束（5 秒）；正常录音完全跟着按键走，按多久录多久，
@@ -266,7 +307,11 @@ async fn run_session(
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 // 松开快捷键 = 结束录音
-                Some(Cmd::Stop) | None => break,
+                Some(Cmd::Stop) => {
+                    log::log("结束录音（松开了快捷键，或从托盘点了停止）");
+                    break;
+                }
+                None => break,
                 // 已经在录音，重复的启动指令忽略
                 Some(Cmd::Start) | Some(Cmd::Test) => {}
             },
@@ -278,10 +323,13 @@ async fn run_session(
                     match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&f)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
+                            // 会话半路失败也要把已经识别到的部分留给主人（见该函数说明）
+                            keep_partial_on_failure(shared, &cfg, &mut client);
                             shared.fail(format!("{e:#}"));
                             return;
                         }
                         Err(_) => {
+                            keep_partial_on_failure(shared, &cfg, &mut client);
                             shared.fail("发送音频超时（网络不通），已结束本次录音");
                             return;
                         }
@@ -327,11 +375,17 @@ async fn run_session(
     // 释放麦克风；接收端仍在我们手里，缓冲里已录下的帧还能读完，尾巴不丢。
     capture.stop();
 
-    // 给采集线程一点时间收工再收干：它每 50ms 轮询一次停止标志，退出前会把
+    // 等采集线程把尾巴补发完再收干：它每 50ms 轮询一次停止标志，退出前会把
     // 重采样器里压着的样本、以及不足一帧的残料补发进通道（见 `audio::Feed::push`）。
-    // 不留这个间隔，下面的收干循环就很可能抢在补发之前读到"通道已空" ——
-    // 尾巴照样丢，等于白补（主人听到的现象就是"最后一个字少一点"）。
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    //
+    // 为什么是"等标志"而不是睡一个固定时长：蓝牙免提、部分 USB 声卡的回调周期能到
+    // 100ms 以上，固定睡 60ms 会在回调到来之前就把流 drop 掉 —— 尾帧再也没机会补发，
+    // 主人松手前那几个字就这么丢了（现象就是"最后一个字少一点"）。
+    // 上限 300ms，绝不为了尾巴把收尾卡死。
+    let tail_deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while !capture.tail_flushed() && tokio::time::Instant::now() < tail_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // 采集是自己结束的（rx 关闭）且带着错误：如实报「麦克风异常」。
     // 不能含糊地说「没有识别到内容」—— 那会让主人以为是自己没说话，
@@ -339,6 +393,8 @@ async fn run_session(
     if mic_ended {
         if let Some(msg) = capture.error() {
             drop(capture);
+            // 麦克风挂了，但主人刚说的话可能已经识别出一部分 —— 别丢
+            keep_partial_on_failure(shared, &cfg, &mut client);
             shared.fail(format!("麦克风异常：{msg}"));
             return;
         }
@@ -411,6 +467,12 @@ async fn run_session(
 
     let text = client.take_result();
     let asr_error = client.state.last_error.clone();
+    // 主动发一条关闭帧再放手：让服务端看到的是「正常关闭」而不是异常断开
+    // （`close()` 以前是个没人调用的死函数，收尾时补上这次调用它才有意义）。
+    // 失败只记日志：结果已经拿到了，收尾礼仪不该影响主人这次的字。
+    if let Err(e) = client.close().await {
+        log::log(format!("发送关闭帧失败（不影响本次识别结果）：{e:#}"));
+    }
     drop(client);
 
     shared.update(|s| {
@@ -461,44 +523,101 @@ async fn run_session(
             // 但结果不能就这么算了 —— 把它放到剪贴板，主人至少还能 Ctrl+V 粘回去。
             // 这正是"切走窗口"这个场景下唯一安全的交付方式：不动别人的窗口，
             // 又把文字交到主人手上（他此刻的焦点就是他要粘的地方）。
+            //
+            // 另外**绝不弹窗**：主人此刻就在别的程序里干活，把设置窗顶到最前面既打断
+            // 他、又会被当成"软件自己乱跳"（他报的就是这个）。提示走托盘与日志，
+            // 窗口里那句话也留着 —— 他愿意看的时候再看。
             log::log("主人此刻不在原窗口，已放弃自动输入（结果放进剪贴板）");
-            shared.show_settings();
-            shared.report(hand_off_to_clipboard(
-                &text,
-                "录音途中切换了窗口，为避免打错地方，本次结果没有自动输入。已复制到剪贴板，按 Ctrl+V 粘贴",
-            ));
+            shared.notice(hand_off_message(shared, &text));
             return;
         }
         Err(e) => {
             // 注入失败：错误照报，但结果同时放进剪贴板 —— 否则主人只能去设置窗里
-            // 手动选中复制。顺手把设置窗显示出来，主人才能看见这句提示。
-            shared.show_settings();
-            shared.fail(hand_off_to_clipboard(&text, &format!("{e}")));
+            // 手动选中复制。这里同样**不弹窗**（理由同上），靠托盘图标与悬浮文字提示；
+            // 主人打开设置窗时会看到这句话。
+            shared.fail(format!("{e}{}", hand_off_suffix(shared, &text)));
             return;
         }
     }
 
-    // 「识别结果总留一份到剪贴板」：成功输入也留一份。
-    // 这是唯一能覆盖"注入报了成功、字却被目标程序悄悄丢掉"那一档的手段 ——
-    // 那种情况我们在客户端根本观测不到，只能保证主人手里始终有一份。
+    // 「识别结果留一份到剪贴板」（默认开，见 `config::Options`）。
+    //
+    // 这是唯一能覆盖"注入报了成功、字却被目标程序悄悄丢掉"那一档的手段：那种
+    // 情况我们在客户端**根本观测不到** —— `SendInput` 只报告事件已入队，目标
+    // 收下再丢掉我们看不见；而且实测（Chrome/Electron 这类目标）连插入符都不给，
+    // 没有任何可核实的痕迹。所以只能保证主人手里始终有一份：随时 Ctrl+V 都还在。
     if cfg.options.keep_on_clipboard {
-        match clipboard::write_text(&text) {
-            Ok(()) => log::log("已按设置把识别结果留在剪贴板"),
-            Err(e) => log::log(format!("把识别结果留到剪贴板失败：{e}")),
+        match put_on_clipboard(shared, &text) {
+            None => log::log("识别结果已留在剪贴板（随时可 Ctrl+V）"),
+            Some(reason) => shared.notice(format!(
+                "本次结果没能留在剪贴板（{reason}）：文字在设置窗的「最近识别」里，可手动复制"
+            )),
         }
     }
 }
 
-/// 把结果放到剪贴板，并把提示语补全成主人看得懂的一句话。
+/// 放弃自动输入时给主人看的那句话（含"到底复制成功了没有"）。
 ///
-/// 失败不改提示（写不进去不是主人的问题，日志里有），只如实说明"没复制上"。
-fn hand_off_to_clipboard(text: &str, message: &str) -> String {
-    match clipboard::write_text(text) {
-        Ok(()) => message.to_string(),
+/// 成功与失败必须是**两句不同的话**：以前不管成没成都写"已复制到剪贴板"，
+/// 主人照着去 Ctrl+V 却什么也粘不出来 —— 这正是他报的那个 bug。
+fn hand_off_message(shared: &Shared, text: &str) -> String {
+    const HEAD: &str = "录音途中切换了窗口，为避免打错地方，本次结果没有自动输入。";
+    match put_on_clipboard(shared, text) {
+        None => format!("{HEAD}已复制到剪贴板，按 Ctrl+V 粘贴"),
+        Some(reason) => format!("{HEAD}但没能复制到剪贴板（{reason}），可在设置窗里手动复制"),
+    }
+}
+
+/// 注入失败时的后缀：只补"复制结果如何"，错误本身由调用方照原样报出来。
+fn hand_off_suffix(shared: &Shared, text: &str) -> String {
+    match put_on_clipboard(shared, text) {
+        None => "（结果已放进剪贴板，可 Ctrl+V 粘贴）".to_string(),
+        Some(reason) => format!("（结果也未能放进剪贴板：{reason}）"),
+    }
+}
+
+/// 剪贴板交付的**唯一入口**：写进去、回读核对、把"到底留住了没有"如实写进快照。
+///
+/// 返回 `None` = 整段都写进去了且回读对得上；`Some(原因)` = 没能可靠地留在剪贴板。
+/// 为什么收成一处：留一份（收尾）与改走剪贴板（切走窗口/注入被拒）以前各写了一份
+/// 同样的三分支，结论还容易走偏；而界面现在还要靠 `kept_on_clipboard` 决定要不要
+/// 说"这份结果也留在了剪贴板"，更不该让三处各自判断。
+fn put_on_clipboard(shared: &Shared, text: &str) -> Option<String> {
+    let outcome = clipboard::write_text_verified(text);
+    let kept = matches!(outcome, Ok(true));
+    shared.update(|s| s.kept_on_clipboard = kept);
+    match outcome {
+        Ok(true) => None,
+        Ok(false) => {
+            log::log("剪贴板回读与写入不一致：结果可能被别的程序改写了");
+            Some("剪贴板可能已被其他程序改写".into())
+        }
         Err(e) => {
             log::log(format!("把结果放进剪贴板失败：{e}"));
-            format!("{message}（但剪贴板被占用，没能复制进去）")
+            Some(format!("剪贴板被占用（{e}）"))
         }
+    }
+}
+
+/// 会话中途失败（网络超时、麦克风异常）时，把**已经识别到的部分**也留一份到剪贴板。
+///
+/// 为什么：主人真正在意的是"字没打进去时手里得有一份"。会话半路结束时，实时输入
+/// 可能已经把半句打出去了、也可能一个字都没出去 —— 这时候什么都不留，等于把主人
+/// 刚说的话直接丢掉。只有在设置里关掉"留一份"时才什么都不做。
+fn keep_partial_on_failure(shared: &Shared, cfg: &Config, client: &mut AsrClient) {
+    if !cfg.options.keep_on_clipboard {
+        return;
+    }
+    let partial = client.take_result();
+    if partial.trim().is_empty() {
+        return;
+    }
+    match put_on_clipboard(shared, &partial) {
+        None => log::log(format!(
+            "会话中途结束，已把已识别到的 {} 字留在剪贴板",
+            partial.chars().count()
+        )),
+        Some(reason) => log::log(format!("会话中途结束，留下的内容没能进剪贴板：{reason}")),
     }
 }
 
@@ -567,39 +686,87 @@ async fn wait_for_foreign_foreground() -> Option<isize> {
     None
 }
 
+/// 此刻的前台窗口是不是我们自己（没有前台窗口时算"不是"）。
+///
+/// 抽出来是因为"要不要把字交给它"这件事在两个地方要判断（等焦点离开本程序、
+/// 注入前再确认一次），以前各自写了一遍 `GetForegroundWindow` + 判归属 + 判无效句柄。
+fn foreground_is_own() -> bool {
+    foreground_window().is_some_and(is_own_window)
+}
+
 /// 注入前确认前台窗口不是我们自己的程序；如果是，就把它藏起来等焦点回去。
 /// 不这样做的话，用户打开着设置窗时打字会落到自己窗口上，看起来"什么都没打出来"。
 async fn ensure_target_focus(shared: &Shared) {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
-        let foreground = unsafe { GetForegroundWindow() };
-        let is_own = !foreground.is_invalid() && is_own_window(foreground.0 as isize);
-        if is_own {
-            log::log("注入前发现前台是本程序窗口，先收起再输入");
-            shared.hide_settings();
-            // 用异步 sleep：这里跑在 tokio 工作线程上，阻塞它会拖住整个会话
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
+    if foreground_is_own() {
+        log::log("注入前发现前台是本程序窗口，先收起再输入");
+        shared.hide_settings();
+        // 用异步 sleep：这里跑在 tokio 工作线程上，阻塞它会拖住整个会话
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    #[cfg(not(windows))]
-    let _ = shared;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 「显示设置窗」必须是**一次性**的请求位：UI 线程取走后要清零。
-    /// 少了这个语义，会话线程每请求一次、界面就会被反复强制显示出来
-    /// （主人会看到窗口在他没点的时候自己跳出来）。
+    /// 结果改走剪贴板时必须**只提示、不弹窗**，而且提示要落在 `notice` 而不是 `error`。
+    ///
+    /// 这条守的是主人报的"这个提示会弹出软件窗口"：
+    /// - 不能走 `error` —— 那不是故障（界面会红着脸报错、托盘也会变成出错态）；
+    /// - 提示本身要留在快照里：主人打开设置窗时得能看到这句话。
+    ///
+    /// 更要紧的是：`Shared` 里**不该再有任何"请求显示窗口"的通道**（以前正是它把
+    /// 设置窗顶到最前面）。`show_settings` / `take_show_request` 连同那个原子标志
+    /// 已经删掉了 —— 这条用例把"只提示"这个契约钉在明面上。
     #[test]
-    fn show_request_is_taken_exactly_once() {
+    fn clipboard_handoff_only_notices_it_never_asks_for_the_window() {
         let shared = Shared::new(egui::Context::default());
-        assert!(!shared.take_show_request(), "初始不该有待处理的请求");
-        shared.show_settings();
-        assert!(shared.take_show_request(), "置位后应该能取到");
-        assert!(!shared.take_show_request(), "取走之后必须清零");
+        shared.notice("已复制到剪贴板，按 Ctrl+V 粘贴");
+        let snap = shared.snapshot();
+        assert_eq!(
+            snap.notice.as_deref(),
+            Some("已复制到剪贴板，按 Ctrl+V 粘贴"),
+            "提示要留得下来，主人打开窗口时看得到"
+        );
+        assert!(snap.error.is_none(), "这不是故障，不该走 error 通道");
+        assert!(!snap.recording, "提示不该把状态改回录音中");
+    }
+
+    /// 「这份结果真的留在剪贴板里了」这个标记只由**核对通过**的写入置位：
+    /// 界面靠它决定要不要说那句话，说错了主人就会对着空的剪贴板干瞪眼。
+    ///
+    /// 这里只测标记的语义（置位/复位）—— 真去写剪贴板的那条路在 `clipboard`
+    /// 模块里由 `#[ignore]` 的手测覆盖（单测不许动主人真实的剪贴板）。
+    #[test]
+    fn kept_on_clipboard_flag_is_explicit_and_cleared_per_session() {
+        let shared = Shared::new(egui::Context::default());
+        assert!(
+            !shared.snapshot().kept_on_clipboard,
+            "初始状态不许声称'已经留了一份'"
+        );
+        shared.update(|s| s.kept_on_clipboard = true);
+        assert!(shared.snapshot().kept_on_clipboard);
+        shared.begin_session();
+        assert!(
+            !shared.snapshot().kept_on_clipboard,
+            "开新会话时上一次的'留住了'必须退场，否则界面会拿旧结论说事"
+        );
+    }
+
+    /// 上一次的剪贴板提示必须在下次录音开始时退场，
+    /// 否则托盘会一直挂着"已复制到剪贴板"，主人以为这次也没输入
+    #[test]
+    fn begin_session_clears_the_previous_notice() {
+        let shared = Shared::new(egui::Context::default());
+        shared.notice("已复制到剪贴板，按 Ctrl+V 粘贴");
+        shared.begin_session();
+        let snap = shared.snapshot();
+        assert!(snap.recording, "新会话要立刻进入录音状态");
+        assert!(
+            snap.notice.is_none(),
+            "上一次的提示没清掉，托盘会一直挂着旧话"
+        );
+        assert!(snap.error.is_none());
+        assert!(snap.started.is_none(), "计时要从麦克风与服务都就绪后才开始");
     }
 }

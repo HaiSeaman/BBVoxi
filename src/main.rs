@@ -365,9 +365,12 @@ impl App {
     /// 托盘图标与菜单文案跟随录音状态
     fn sync_tray(&mut self) {
         let snap = self.shared.snapshot();
+        // 图标只有三档（就绪 / 录音中 / 出错）。「结果已放进剪贴板」借用"出错"那一档：
+        // 它同样意味着"该看一眼提示"，而悬浮文字会把话说清楚 —— 不弹窗是主人的要求，
+        // 托盘就成了唯一不打扰的提示通道。
         let state = if snap.recording {
             TrayState::Recording
-        } else if snap.error.is_some() {
+        } else if snap.error.is_some() || snap.notice.is_some() {
             TrayState::Error
         } else {
             TrayState::Idle
@@ -389,19 +392,22 @@ impl App {
             });
             self.tray_recording = Some(snap.recording);
         }
-        // 没有悬浮条了，托盘提示文字就是唯一的状态反馈
+        // 没有悬浮条了，托盘提示文字就是唯一的状态反馈。
+        // 提示语优先于错误：它说的正是"刚这次结果在哪、该干什么"。
         let tooltip = if snap.recording {
-            "BBVoxi · 正在录音，结束请再点一次或用快捷键"
+            "BBVoxi · 正在录音，结束请再点一次或用快捷键".to_string()
+        } else if let Some(notice) = &snap.notice {
+            format!("BBVoxi · {notice}")
         } else if snap.error.is_some() {
-            "BBVoxi · 上次识别出错（打开设置查看）"
+            "BBVoxi · 上次识别出错（打开设置查看）".to_string()
         } else {
-            "BBVoxi 语音输入法"
+            "BBVoxi 语音输入法".to_string()
         };
-        if self.tray_tooltip.as_deref() != Some(tooltip) {
+        if self.tray_tooltip.as_deref() != Some(tooltip.as_str()) {
             if let Some(tray) = &self.tray {
-                let _ = tray.set_tooltip(Some(tooltip));
+                let _ = tray.set_tooltip(Some(&tooltip));
             }
-            self.tray_tooltip = Some(tooltip.to_string());
+            self.tray_tooltip = Some(tooltip);
         }
     }
 }
@@ -409,17 +415,14 @@ impl App {
 impl eframe::App for App {
     /// eframe 0.35：窗口隐藏时仍会调用 logic，托盘状态都在这里维护
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 会话线程请求显示设置窗（例如录音失败、结果改放剪贴板，得让主人看见提示）。
-        // 必须放在下面那句 `Visible(false)` **之前**：`show_settings` 会把 `shown`
-        // 置回 true，同一帧就不会再被"收起"的补发盖掉（这正是这个请求位的意义）。
-        if self.shared.take_show_request() {
-            self.show_settings(ctx);
-        }
-
         // 「启动后直接缩在后台」这件事必须在这里补发，不能只靠 NativeOptions 的
         // `with_visible(false)`：eframe 在首帧渲染完之后会**无条件**把窗口设成可见
         // （epi_integration::post_rendering），那一下会盖掉我们的隐藏请求。
         // 窗口隐藏时 eframe 照常每帧调用 logic，所以这里补发一定生效。
+        //
+        // 会话线程**不会**再请求显示窗口（结果改走剪贴板时也不弹，见
+        // `Shared::notice_clipboard_handoff`）：主人正在别的程序里干活，窗口自己
+        // 跳出来既打断他、又会被当成"软件乱跳"。提示只在托盘与窗口内给。
         if !self.shown {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

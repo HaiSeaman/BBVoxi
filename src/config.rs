@@ -126,12 +126,18 @@ impl Default for Options {
             auto_punctuation: true,
             smooth: true,
             live_typing: true,
-            // 兜底默认开：它只在"逐字注入已经失败"时才动剪贴板，
-            // 而且是先存后还，对主人的影响只是失败那一下的几百毫秒。
+            // 兜底默认开。
             clipboard_fallback: true,
-            // 常驻默认关：它会让主人复制的东西一去不回（我们靠剪贴板序号
-            // 判断"期间有没有人写过"，没法替他决定该留哪一份），所以要显式开。
-            keep_on_clipboard: false,
+            // 默认**开**（1.3.2 起改的，老配置会被迁移过来）。
+            //
+            // 改它的原因：这个开关叫"识别结果总留一份到剪贴板"，而主人真正需要它
+            // 兜的就是"字到底有没有打进目标程序"——**这件事我们无法核实**：
+            // `SendInput` 只报告"事件已入队"，目标程序完全可以收下然后丢掉；
+            // 实测（Chrome/Electron 这类目标）连插入符都不给，看不出任何痕迹。
+            // 所以唯一可靠的兜底就是"永远留一份"：主人随时 Ctrl+V 都还在。
+            // 代价是主人原来复制的内容会被顶掉（这正是它的说明里写的），
+            // 不想要这个代价的可以显式关掉。
+            keep_on_clipboard: true,
         }
     }
 }
@@ -151,7 +157,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: CURRENT_VERSION,
             provider: Provider::default(),
             // 默认「Ctrl + Win」：这个组合在 Windows 上几乎没有程序占用，
             // 又是纯修饰键组合（不需要再记一个主键），按住说话最顺手。
@@ -193,6 +199,47 @@ fn migrate_legacy_default_hotkey(cfg: &mut Config) -> bool {
         return false;
     }
     cfg.hotkey = Config::default().hotkey;
+    crate::log::log("旧默认快捷键 Ctrl+` 已升级为 Ctrl+Win（可在设置窗口里改）");
+    true
+}
+
+/// 当前配置版本。引入"必须改老配置"的行为变更时就 +1，并在 [`migrate`] 里补一步。
+const CURRENT_VERSION: u32 = 2;
+
+/// 把读到的配置升级到当前版本，返回是否改动了配置（改了就要写回）。
+///
+/// 为什么必须有这一步：只改 `Default` 救不了**已经存在的配置文件** ——
+/// 启动逻辑是"文件在就用文件里的值"，于是主人升级后一看，行为还是老样子。
+/// （`migrate_legacy_default_hotkey` 当初就是为这个加的。）
+///
+/// 1 → 2：`keep_on_clipboard` 老默认是关的，而它兜的恰恰是"字没打进目标程序"
+/// 这一档 —— 那一档**无法核实**（`SendInput` 只报告事件入队成功，目标程序收下
+/// 再丢掉我们完全看不见；Chrome/Electron 这类目标连插入符都不给，实测过），
+/// 所以唯一可靠的兜底就是"永远留一份"。改为默认开。
+fn migrate(cfg: &mut Config) -> bool {
+    if cfg.version >= CURRENT_VERSION {
+        return false;
+    }
+    // 旧默认值 Ctrl+` → Ctrl+Win。**只看升版本这一次**：以前它每次启动都跑，
+    // 于是主人后来自己把快捷键改成 Ctrl+` 时，下次启动就被悄悄改回 Ctrl+Win，
+    // 界面上一个字都不提 —— `migration_leaves_user_hotkeys_alone` 的清单里
+    // 恰好漏了这一项，所以这个毛病一直没被抓住。
+    migrate_legacy_default_hotkey(cfg);
+    // 1 → 2：`keep_on_clipboard` 老默认是关的，而它兜的恰恰是"字没打进目标程序"
+    // 这一档 —— 那一档**无法核实**（`SendInput` 只报告事件入队成功，目标程序收下
+    // 再丢掉我们完全看不见；Chrome/Electron 这类目标连插入符都不给，实测过），
+    // 所以唯一可靠的兜底就是"永远留一份"。改为默认开。
+    //
+    // 老配置里这个值是"从没动过"留下的默认 false，还是主人真的关过 ——
+    // 两者在文件里长得一模一样，分不出来。按"漏掉主人说的话"比"覆盖一次
+    // 剪贴板"更糟来取舍：统一打开。不想要的在设置里关掉即可，
+    // version 已经是 2，下次启动不会再被打开。
+    if !cfg.options.keep_on_clipboard {
+        cfg.options.keep_on_clipboard = true;
+        crate::log::log("配置升级：识别结果改为默认留一份到剪贴板（可在设置里关掉）");
+    }
+    cfg.version = CURRENT_VERSION;
+    // 版本号本身就是要落盘的改动，所以这里一律返回 true（幂等靠上面那句早退保证）
     true
 }
 
@@ -236,12 +283,11 @@ pub fn load_or_default() -> Result<(Config, bool)> {
     // ponytail: 配置损坏时回退默认值，不让用户被一个坏文件卡死
     match serde_json::from_str::<Config>(&text) {
         Ok(mut cfg) => {
-            if migrate_legacy_default_hotkey(&mut cfg) {
-                crate::log::log("旧默认快捷键 Ctrl+` 已升级为 Ctrl+Win（可在设置窗口里改）");
+            if migrate(&mut cfg) {
                 if let Err(e) = cfg.save() {
                     // 写回失败不影响这次启动：内存里已经是新值，下次启动会再试一遍。
-                    // 但必须留下痕迹 —— 否则主人下次开还是老快捷键，又会以为"没改"。
-                    crate::log::log(format!("升级快捷键后写回配置失败: {e}"));
+                    // 但必须留下痕迹 —— 否则主人下次开还是老样子，又会以为"没改"。
+                    crate::log::log(format!("升级配置后写回失败（下次启动会再试一遍）: {e}"));
                 }
             }
             Ok((cfg, false))
@@ -369,6 +415,24 @@ mod tests {
         }
     }
 
+    /// 回归（主人自己改的快捷键会被悄悄改回去）：**已经是当前版本的配置**，
+    /// 哪怕快捷键正好等于旧版默认值（Ctrl+反引号键），也一个字都不许动。
+    ///
+    /// 旧实现每次都跑热键迁移，于是"版本已经是 2、主人明确设成 Ctrl+`"的配置
+    /// 下次启动会被改回 Ctrl+Win —— 主人只会觉得"我改了它自己变回去了"。
+    /// 这条与 `migration_leaves_user_hotkeys_alone` 的区别：那条测的是纯函数，
+    /// 这条测的是"版本号决定要不要迁移"这层判断。
+    #[test]
+    fn migration_never_overwrites_a_current_config() {
+        let mut cfg = Config {
+            version: CURRENT_VERSION,
+            hotkey: "ctrl+`".into(),
+            ..Config::default()
+        };
+        assert!(!migrate(&mut cfg), "已是当前版本就不该动它");
+        assert_eq!(cfg.hotkey, "ctrl+`", "主人自己设的快捷键被改回默认值了");
+    }
+
     /// 升级后的配置要能真的存下来、读回来还是新值（否则只是内存里好看）。
     #[test]
     fn migrated_hotkey_survives_a_save_and_reload() {
@@ -428,15 +492,48 @@ mod tests {
     }
 
     /// 老配置文件里没有这两个新开关，必须能读、且拿到我们定的默认值。
-    /// 两者默认相反，各自有理由：
-    /// - 兜底默认**开**：只在逐字注入已经失败时才动剪贴板，且先存后还；
-    /// - 常驻默认**关**：它会让主人原来复制的内容一去不回。
+    /// 两者默认都**开**，理由见 `Options::default` 的说明：
+    /// 字到底有没有打进目标程序**无法核实**，只有"永远留一份"才兜得住 ——
+    /// 主人报的"输入没进去、剪贴板里也找不到"就是这个默认值造成的。
     #[test]
     fn clipboard_options_default_for_old_configs() {
         let cfg: Config =
             serde_json::from_str(r#"{"options":{"live_typing":true}}"#).expect("旧配置必须还能读");
         assert!(cfg.options.clipboard_fallback, "兜底应默认开");
-        assert!(!cfg.options.keep_on_clipboard, "常驻剪贴板应默认关");
+        assert!(cfg.options.keep_on_clipboard, "留一份应默认开");
+    }
+
+    /// 1 → 2 的迁移：老配置里 `keep_on_clipboard: false` 必须被打开，
+    /// 否则主人升级后行为一点没变（他报的 bug 依旧）。同时 version 要写上去。
+    #[test]
+    fn migration_v1_turns_on_keep_on_clipboard() {
+        let mut cfg = Config {
+            version: 1,
+            ..Config::default()
+        };
+        cfg.options.keep_on_clipboard = false; // 老默认值：关
+        assert!(migrate(&mut cfg), "老版本必须被升级");
+        assert!(cfg.options.keep_on_clipboard, "升级后应改为留一份");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+
+        // 幂等：升级过之后不能再改，否则每次启动都写一遍配置
+        assert!(!migrate(&mut cfg), "升级过一次就不该再改动");
+    }
+
+    /// 迁移过之后主人自己关掉的开关，绝不能被再次打开 ——
+    /// 这是"升级逻辑顺手改掉主人设置"的现场，用户会当成程序不听话。
+    #[test]
+    fn migration_respects_a_later_explicit_choice() {
+        let mut cfg = Config {
+            version: CURRENT_VERSION,
+            ..Config::default()
+        };
+        cfg.options.keep_on_clipboard = false;
+        assert!(!migrate(&mut cfg), "已是当前版本就不该动它");
+        assert!(
+            !cfg.options.keep_on_clipboard,
+            "主人升级后明确关掉的开关被重新打开了"
+        );
     }
 
     /// 保存必须是"要么整体成功、要么旧文件原封不动"。

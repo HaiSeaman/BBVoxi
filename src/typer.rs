@@ -81,29 +81,6 @@ fn tail_after_units(text: &str, committed: usize) -> String {
     String::new()
 }
 
-/// 逐字注入被拒之后的兜底配置（来自设置里的两个开关）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Fallback {
-    /// 改用剪贴板粘贴再试一次。
-    ///
-    /// 默认**关**：单测与 `muted` 都不该在无声无息中动主人的剪贴板，
-    /// 由 `session` 按设置显式打开。
-    pub paste: bool,
-    /// 「识别结果总留一份到剪贴板」：开着就永不还原主人原来的内容
-    pub keep_on_clipboard: bool,
-}
-
-/// 主人原来的剪贴板内容。三态是必要的 —— `Option<String>` 分不清
-/// "还没看过"和"看过了但里面没有文本（是图片/文件）"，而这两种情况的
-/// 处理完全不同（前者要去看，后者不必再看也不必还原）。
-enum OriginalClipboard {
-    /// 还没快照过
-    Pending,
-    /// 看过了，但主人的剪贴板里没有文本（图片、文件，或正被别的程序占用）
-    NotText,
-    Text(String),
-}
-
 pub struct LiveTyper {
     sent: String,
     /// 是否边说话边打字（来自设置）
@@ -117,10 +94,9 @@ pub struct LiveTyper {
     muted: bool,
     /// 开始录音时的前台窗口。之后每次输入前都要拿当前窗口跟它核对
     watch: Option<isize>,
-    /// 逐字注入被拒时的兜底方式
-    fallback: Fallback,
-    /// 主人原来的剪贴板内容（只在第一次兜底粘贴之前看一眼，见 `paste`）
-    original: OriginalClipboard,
+    /// 逐字注入被拒时是否改用剪贴板粘贴再试一次（见 `with_paste_fallback`）。
+    /// 默认**关**：单测与 `muted` 都不该在无声无息中动主人的剪贴板。
+    paste_fallback: bool,
 }
 
 impl LiveTyper {
@@ -133,16 +109,16 @@ impl LiveTyper {
             away: false,
             muted: false,
             watch,
-            fallback: Fallback::default(),
-            original: OriginalClipboard::Pending,
+            paste_fallback: false,
         }
     }
 
-    /// 挂上兜底配置。做成链式方法而不是 `new` 的第三个参数：
-    /// `Fallback::default()` 是"什么都不做"，既有调用点（含单测）
-    /// 因此一个字都不用改，也就不会有人不小心让单测去动真剪贴板。
-    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
-        self.fallback = fallback;
+    /// 挂上"注入被拒时改用剪贴板粘贴"这条兜底（来自设置）。
+    ///
+    /// 为什么做成链式方法而不是 `new` 的第三个参数：默认是**关**，既有调用点
+    /// （含大量单测）因此一个字都不用改，也就不会有人不小心让单测去动真剪贴板。
+    pub fn with_paste_fallback(mut self, on: bool) -> Self {
+        self.paste_fallback = on;
         self
     }
 
@@ -271,9 +247,9 @@ impl LiveTyper {
                 Ok(committed) => {
                     let tail = tail_after_units(&planned.append, committed);
                     let e = anyhow!("逐字注入只提交了 {committed}/{expected} 个字符");
-                    return self.paste_fallback(&tail, desired, e);
+                    return self.paste_via_clipboard(&tail, desired, e);
                 }
-                Err(e) => return self.paste_fallback(&planned.append, desired, e),
+                Err(e) => return self.paste_via_clipboard(&planned.append, desired, e),
             }
         }
         self.sent = desired.to_string();
@@ -298,9 +274,9 @@ impl LiveTyper {
     ///
     /// 但 UIPI 拦下的是**整个** `SendInput`，那时候粘贴同样会失败 ——
     /// 所以先看错误类型，别白试一次、也别多报一次错。
-    fn paste_fallback(&mut self, append: &str, desired: &str, e: anyhow::Error) -> Result<()> {
+    fn paste_via_clipboard(&mut self, append: &str, desired: &str, e: anyhow::Error) -> Result<()> {
         let denied = e.downcast_ref::<injector::AccessDenied>().is_some();
-        if !self.fallback.paste || denied {
+        if !self.paste_fallback || denied {
             self.failure = Some(e.to_string());
             return Err(e);
         }
@@ -324,31 +300,17 @@ impl LiveTyper {
 
     /// 走一次剪贴板粘贴。
     ///
-    /// 主人原来的内容**只在第一次粘贴之前快照一次**。每次粘贴都重新快照的话，
-    /// 第二次快照到的就是**我们自己上一次写进去的那个片段** —— 最后"还原"
-    /// 会把这个碎片留在主人的剪贴板里，比干脆不还原还糟。
+    /// 写完**不再还原**主人原来的剪贴板内容（1.3.2 起改的）。原来会先存后还，
+    /// 结果是：这段救回来的文字在 300 毫秒后又被我们自己擦掉 —— 而主人事后到
+    /// 剪贴板里找它时，**什么也找不到**（他报的就是这个）。何况"粘贴到底成没成"
+    /// 和"逐字注入成没成"一样无法核实（`SendInput` 只报告事件入队），
+    /// 把唯一的退路（自己 Ctrl+V 一次）也抹掉毫无道理。
+    /// 主人剪贴板里原来的内容会被这段文字顶掉 —— 这是「识别结果留一份」
+    /// 那条设置本来就写明的代价（见 `config::Options::keep_on_clipboard`）。
     fn paste(&mut self, append: &str) -> Result<()> {
-        if should_snapshot(self.fallback.keep_on_clipboard, &self.original) {
-            self.original = match clipboard::read_text() {
-                Some(text) => OriginalClipboard::Text(text),
-                None => OriginalClipboard::NotText,
-            };
-        }
         clipboard::write_text(append)?;
-        let seq = clipboard::sequence();
-        injector::paste()?;
-        if let OriginalClipboard::Text(previous) = &self.original {
-            clipboard::schedule_restore(previous.clone(), seq);
-        }
-        Ok(())
+        injector::paste()
     }
-}
-
-/// 此刻该不该去看主人的剪贴板（纯函数：这个判断错一次，
-/// 主人原来复制的内容就会被我们自己的碎片顶掉）
-fn should_snapshot(keep_on_clipboard: bool, state: &OriginalClipboard) -> bool {
-    // 开着"总留一份"就是明确表示不还原，那连看都不必看
-    !keep_on_clipboard && matches!(state, OriginalClipboard::Pending)
 }
 
 #[cfg(test)]
@@ -435,33 +397,14 @@ mod tests {
     /// 只要有一个用例默认开着粘贴，它就会往**真实剪贴板**里写东西，
     /// 把开发机上主人正复制的内容洗掉。
     #[test]
-    fn fallback_is_off_by_default() {
-        let f = Fallback::default();
-        assert!(!f.paste, "默认不能开粘贴兜底");
-        assert!(!f.keep_on_clipboard, "默认不能常驻剪贴板");
-    }
-
-    /// 回归（会把主人原来的剪贴板内容弄丢）：一次会话里可能兜底粘贴好几次
-    /// （每来一条中间结果就是一次）。若每次都重新快照，第二次快照到的就是
-    /// **我们自己上一次写进去的片段**，最后"还原"会把这个碎片留在主人的
-    /// 剪贴板里 —— 比不还原还糟。
-    #[test]
-    fn original_clipboard_is_snapshotted_only_once() {
+    fn paste_fallback_is_off_by_default() {
         assert!(
-            should_snapshot(false, &OriginalClipboard::Pending),
-            "还没看过时应该去看一次"
+            !LiveTyper::new(true, None).paste_fallback,
+            "默认不能开粘贴兜底"
         );
         assert!(
-            !should_snapshot(false, &OriginalClipboard::Text("主人复制的东西".into())),
-            "已经看过就必须复用那次快照，不能再去看（看到的是我们自己的碎片）"
-        );
-        assert!(
-            !should_snapshot(false, &OriginalClipboard::NotText),
-            "已经确认没有文本可还原，也不必再看"
-        );
-        assert!(
-            !should_snapshot(true, &OriginalClipboard::Pending),
-            "「总留一份」明确表示不还原，连看都不必看"
+            LiveTyper::new(true, None).with_paste_fallback(true).paste_fallback,
+            "显式打开后应该生效（否则这个开关就是摆设）"
         );
     }
 

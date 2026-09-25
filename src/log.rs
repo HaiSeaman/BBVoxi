@@ -58,6 +58,16 @@ pub fn log(msg: impl AsRef<str>) {
     }
     let _reset = InLogGuard;
 
+    // 单测里**只写 stderr，不碰文件**：日志文件是主人排障用的现场记录，
+    // 而 `cargo test` 会大量调用被测代码（`Shared::update`、`Typer::guard`……），
+    // 每跑一次测试就往主人的真实日志里灌一堆"主人切到了别的窗口"这种假现场，
+    // 排查时会被带偏（这次就被带偏过一次：把测试输出当成了真实使用记录）。
+    // 仍然写 stderr：测试失败时 cargo 会把 stderr 打出来，调试信息不丢。
+    if cfg!(test) {
+        let _ = writeln!(std::io::stderr(), "{}", msg.as_ref());
+        return;
+    }
+
     let Some(path) = log_path() else { return };
     // 锁中毒（别的线程写日志时 panic）也要继续持有这把锁，
     // 否则后续日志会并发写同一个文件、内容互相穿插。

@@ -35,6 +35,10 @@ const COMPRESSION_GZIP: u8 = 0b0001;
 /// 就能让上层把它当成"同一个片段"，后到的快照整段覆盖前一个（见本文件 `parse`）。
 const DOUBAO_FINAL_ID: i64 = 0;
 
+/// 解压一帧的字节上限（见 `decode_frame` 里的说明）。
+/// 正常帧是几百字节到几十 KB，8MB 留足了余量；超过就按"这帧解不出来"处理。
+const MAX_DECOMPRESSED_FRAME: usize = 8 * 1024 * 1024;
+
 /// 连续解帧失败多少次就上报错误（坏帧不能无限被静默吞掉）。
 const DECODE_FAILURE_LIMIT: u32 = 5;
 
@@ -299,8 +303,14 @@ fn decode(bytes: &[u8]) -> Option<Frame> {
     offset += 4;
     let payload = bytes.get(offset..offset + size)?;
     let data = if compression == COMPRESSION_GZIP {
+        // 解压要设上限：对端（或中间环节）出问题时不至于让我们按"声明的长度"一路
+        // 解到一个天文数字，把常驻进程的内存吃光。正常一帧几百字节到几十 KB，
+        // 8MB 已经高得离谱 —— 超过就按"这帧解不出来"处理（跟校验失败同一条路）。
         let mut out = Vec::new();
-        GzDecoder::new(payload).read_to_end(&mut out).ok()?;
+        GzDecoder::new(payload)
+            .take(MAX_DECOMPRESSED_FRAME as u64)
+            .read_to_end(&mut out)
+            .ok()?;
         out
     } else {
         payload.to_vec()

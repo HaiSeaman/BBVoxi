@@ -164,6 +164,69 @@ fn push_key_stroke(buf: &mut Vec<INPUT>, vk: VIRTUAL_KEY) {
     push_key(buf, vk, scan, true);
 }
 
+/// 补一次完整的 Win 按下+松开。
+///
+/// 用途：组合里带 Win 时，Win 的按下由键盘钩子接管（见 `hotkey::Hold`），
+/// 当主人**只是想按 Win 打开开始菜单**时，欠他的那次按键在这里还回去。
+///
+/// 为什么不干脆放行原始按下：
+/// - 放行了它就再也擦不掉 —— 松开时外壳必弹开始菜单抢走焦点，正在说话的主人
+///   这次识别结果一个字都打不进目标程序；
+/// - 吞掉松开也不行 —— 外壳会以为 Win 一直按着，之后主人随便敲个字母都会触发
+///   Win+X（打开资源管理器）。
+///
+/// 这两条都在真机上用注入探针确认过，而"补一整套按下+松开"实测能让开始菜单
+/// 照常弹出、且系统里 Win 的状态是干净的。
+///
+/// Win 是扩展键，按下与松开都必须带 `KEYEVENTF_EXTENDEDKEY`
+/// （与 `hotkey::MODIFIERS` 表里的标注一致）。
+pub fn press_win(win: u32) -> Result<()> {
+    let mut buf: Vec<INPUT> = Vec::with_capacity(2);
+    win_press_events(&mut buf, win);
+    flush_all(&mut buf)
+}
+
+/// 组装「补一次完整 Win 按键」的事件序列（与 `press_win` 分开，便于单测校验：
+/// 单测里绝不能真的注入一次 Win 按下+松开 —— 那会当场弹出开始菜单）
+fn win_press_events(buf: &mut Vec<INPUT>, win: u32) {
+    push_win(buf, win, false);
+    push_win(buf, win, true);
+}
+
+/// 一次提交「Win 按下 + 某个键按下」：主人按的是 Win+E 这类系统组合键。
+///
+/// 为什么**必须同一次 `SendInput`**：外壳判断 Win 组合键靠的是"收到这个键时
+/// Win 是否已经按下"。分两次提交、或先把当前键放行再补 Win，外壳都会先收到
+/// 那个键（那时它以为 Win 没按下），组合键失效、字母被当普通字符打出去 ——
+/// 这三种顺序都拿注入探针实测过，只有同批次提交才生效。
+///
+/// 当前键的虚拟键码与扫描码都照原样带上：只读扫描码的程序（游戏、部分远程桌面）
+/// 才认得出来（与 `push_key_stroke`、`paste_events` 同一口径）。
+pub fn win_then_key(win: u32, key_vk: u32, scan: u16, extended: bool) -> Result<()> {
+    let mut buf: Vec<INPUT> = Vec::with_capacity(2);
+    win_then_key_events(&mut buf, win, key_vk, scan, extended);
+    flush_all(&mut buf)
+}
+
+/// 组装「Win 按下 + 当前键按下」的事件序列（与 `win_then_key` 分开，便于单测）
+fn win_then_key_events(buf: &mut Vec<INPUT>, win: u32, key_vk: u32, scan: u16, extended: bool) {
+    push_win(buf, win, false);
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    buf.push(keyboard_input(VIRTUAL_KEY(key_vk as u16), scan, flags));
+}
+
+/// Win 键的按下/松开。扩展键标记必须带，否则外壳认不出这是一次 Win 按键。
+fn push_win(buf: &mut Vec<INPUT>, win: u32, keyup: bool) {
+    let mut flags = KEYEVENTF_EXTENDEDKEY;
+    if keyup {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    buf.push(keyboard_input(VIRTUAL_KEY(win as u16), 0, flags));
+}
+
 /// 退格删除：实时输入时用来回退被识别修正的文字
 pub fn backspace(count: usize) -> Result<()> {
     if count == 0 {
@@ -464,5 +527,65 @@ mod tests {
         assert_eq!(typeable_units("a\r\nb"), 3, "\\r 不产生按键，不该计入");
         // 代理对（生僻字）编码成 2 个单元，按 2 算
         assert_eq!(typeable_units("\u{20BB7}"), 2);
+    }
+
+    /// 补发的 Win 按键必须是「按下 → 松开」，而且要带扩展键标记与我们的标记。
+    /// 事件序列单独测：真调 `press_win` 会当场弹出开始菜单。
+    #[test]
+    fn win_press_replay_is_down_then_up_with_extended_flag() {
+        let mut buf = Vec::new();
+        win_press_events(&mut buf, 0x5B);
+        assert_eq!(buf.len(), 2, "一次完整按键 = 按下 + 松开");
+        for ev in &buf {
+            let ki = unsafe { ev.Anonymous.ki };
+            assert_eq!(ki.wVk.0, 0x5B);
+            assert_ne!(
+                ki.dwFlags.0 & KEYEVENTF_EXTENDEDKEY.0,
+                0,
+                "Win 是扩展键，少了这个标记外壳认不出来"
+            );
+            assert_eq!(ki.dwExtraInfo, INJECT_TAG, "缺标记会被自己的钩子当成真按键");
+        }
+        assert_eq!(
+            unsafe { buf[0].Anonymous.ki.dwFlags.0 } & KEYEVENTF_KEYUP.0,
+            0,
+            "第一个事件必须是按下"
+        );
+        assert_ne!(
+            unsafe { buf[1].Anonymous.ki.dwFlags.0 } & KEYEVENTF_KEYUP.0,
+            0,
+            "第二个事件必须是松开"
+        );
+    }
+
+    /// Win+X 的补发顺序必须是「Win↓ 在前、当前键↓ 在后」，且在**同一个批次**里。
+    /// 先放行当前键、再补 Win 的话，外壳收不到组合键（探针实测失效）。
+    #[test]
+    fn win_then_key_replay_puts_win_down_first() {
+        let mut buf = Vec::new();
+        win_then_key_events(&mut buf, 0x5B, 0x45, 0x12, false);
+        assert_eq!(buf.len(), 2, "两条事件必须同批提交，不能分两次");
+        let seq: Vec<(u16, u32, u16)> = buf
+            .iter()
+            .map(|i| {
+                let ki = unsafe { i.Anonymous.ki };
+                (ki.wVk.0, ki.dwFlags.0, ki.wScan)
+            })
+            .collect();
+        assert_eq!(seq[0].0, 0x5B, "第一条必须是 Win 按下");
+        assert_eq!(seq[0].1 & KEYEVENTF_KEYUP.0, 0, "Win 是按下");
+        assert_eq!(seq[1].0, 0x45, "紧接着才是当前键");
+        assert_eq!(seq[1].1 & KEYEVENTF_KEYUP.0, 0, "当前键也是按下");
+        assert_eq!(seq[1].2, 0x12, "当前键的扫描码要原样带上（读扫描码的程序才认）");
+        assert_ne!(seq[0].1 & KEYEVENTF_EXTENDEDKEY.0, 0, "Win 是扩展键");
+
+        // 扩展键的另一侧：当前键带扩展位时也要照带上（如 Win+方向键）
+        let mut buf2 = Vec::new();
+        win_then_key_events(&mut buf2, 0x5B, 0x25, 0x4B, true);
+        assert_ne!(
+            unsafe { buf2[1].Anonymous.ki.dwFlags.0 } & KEYEVENTF_EXTENDEDKEY.0,
+            0,
+            "当前键是扩展键时要带上扩展位"
+        );
     }
 }

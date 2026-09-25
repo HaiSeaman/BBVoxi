@@ -17,8 +17,7 @@ use anyhow::{anyhow, Result};
 use std::time::Duration;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -122,35 +121,27 @@ pub fn read_text() -> Option<String> {
     }
 }
 
-/// 剪贴板序号。主人中途复制了别的东西时它会变 —— 还原之前先核对它，
-/// 才不会把等待期间主人新复制的内容覆盖掉。
-pub fn sequence() -> u32 {
-    unsafe { GetClipboardSequenceNumber() }
-}
-
-/// 延迟还原主人原来的剪贴板内容。
+/// 写入之后再回读核对一次，返回"回读是否和写进去的一致"。
 ///
-/// 为什么延迟：粘贴是异步的，目标程序（尤其富格式和远程桌面）可能在
-/// `Ctrl+V` 之后才真正去读剪贴板，立刻还原会读到一个空剪贴板。
+/// 为什么值得多这一步：`SetClipboardData` 报成功，只说明**内核收下了**；
+/// 剪贴板管理器或另一个正在写的程序完全可能立刻把它改掉。主人事后到剪贴板里
+/// 找不到我们那句话时，日志里得有线索（他报的正是"提示说复制好了，但找不到"）。
 ///
-/// 为什么放到独立线程：这里跑在会话的 tokio 工作线程上，睡 300ms 会把
-/// 主人紧接着的下一次录音指令堵在队列里。
-///
-/// `seq` = 我们写完自己那份之后的序列号。
-pub fn schedule_restore(previous: String, seq: u32) {
-    const RESTORE_DELAY: Duration = Duration::from_millis(300);
-    std::thread::spawn(move || {
-        std::thread::sleep(RESTORE_DELAY);
-        if sequence() != seq {
-            // 期间有人写过剪贴板 —— 那是主人刚复制的东西，比我们手里的原文更新
-            crate::log::log("剪贴板已被其他程序改写，不还原之前的内容");
-            return;
+/// 注意：这里**不还原**主人原来的内容，也不重试 —— 回读对不上就如实记一条，
+/// 由调用方在提示里说清楚（写自己那份永远优先："一个字都不能丢"比"别动剪贴板"重要）。
+pub fn write_text_verified(text: &str) -> Result<bool> {
+    write_text(text)?;
+    match read_text() {
+        Some(back) if back == text => Ok(true),
+        Some(_) => {
+            crate::log::log("剪贴板回读的内容与刚写入的不一致（可能被别的程序改写）");
+            Ok(false)
         }
-        match write_text(&previous) {
-            Ok(()) => crate::log::log("已还原主人原来的剪贴板内容"),
-            Err(e) => crate::log::log(format!("还原剪贴板失败：{e}")),
+        None => {
+            crate::log::log("剪贴板回读不到文本（可能被别的程序占用或改写）");
+            Ok(false)
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -187,16 +178,50 @@ mod tests {
         );
     }
 
+    /// 回归（主人报的那个 bug）：结果写进剪贴板之后**不许**被我们自己擦掉。
+    ///
+    /// 以前"兜底粘贴"是先存后还：写进去的那段字 300 毫秒后被还原成主人原来的
+    /// 内容，主人事后到剪贴板里找，自然什么也找不到。现在写进去就留在那儿。
+    ///
+    /// 同样标 `#[ignore]`：它要真的动开发机上的剪贴板（跑完会尽量还原）。
+    ///
+    /// 注意：**两条剪贴板手测必须串行跑**（`--test-threads=1`）。
+    /// 剪贴板是"打开—写入—关闭"的独占资源，而 `OpenClipboard(None)` 是**任务级**
+    /// 关联：并行跑时另一条用例的 `CloseClipboard` 会把我们的打开状态一起收走，
+    /// 于是 `EmptyClipboard` 报"线程没有打开的剪贴板"（0x8007058A）——
+    /// 那是测试互相踩，不是剪贴板有问题。程序里只有一个会话线程碰剪贴板，
+    /// 不存在这个交叉。
+    #[test]
+    #[ignore = "会动真实剪贴板；手动跑：cargo test clipboard -- --ignored --test-threads=1"]
+    fn written_result_stays_on_the_clipboard() {
+        let saved = read_text();
+        let text = "BBVoxi 留在剪贴板里的结果";
+        assert!(
+            write_text_verified(text).unwrap(),
+            "刚写完就该回读到同一份内容"
+        );
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            read_text().as_deref(),
+            Some(text),
+            "结果被别的东西擦掉了（以前那个'先存后还'的老毛病）"
+        );
+        if let Some(saved) = saved {
+            write_text(&saved).expect("还原原来的剪贴板内容失败");
+        }
+    }
+
     /// 真刀真枪跑一遍 Win32 剪贴板。`GlobalAlloc(GMEM_MOVEABLE)` /
     /// `SetClipboardData` / `GetClipboardData` 这条链路的细节（句柄所有权、
     /// UTF-16、NUL 结尾）靠纯函数是测不出来的 —— 写错一个地方就是一整段
     /// 乱码或者一次访问违例。
     ///
     /// 标了 `#[ignore]`：它会**真的动开发机上的剪贴板**（读完会试着还原），
-    /// 所以不进 `cargo test` 的默认集合。需要验证时手动跑：
-    /// `cargo test clipboard -- --ignored --nocapture`
+    /// 所以不进 `cargo test` 的默认集合。需要验证时手动跑（且与另一条剪贴板用例
+    /// **串行**跑，原因见 `written_result_stays_on_the_clipboard` 上的说明）：
+    /// `cargo test clipboard -- --ignored --test-threads=1 --nocapture`
     #[test]
-    #[ignore = "会动真实剪贴板；需要时手动跑：cargo test clipboard -- --ignored"]
+    #[ignore = "会动真实剪贴板；手动跑：cargo test clipboard -- --ignored --test-threads=1"]
     fn roundtrip_through_the_real_clipboard() {
         // 主人原本复制的是图片/文件时 read_text 拿不到内容（延迟渲染），
         // 那种情况还原不了 —— 这正是"只还原得了文本"这条限制的现场。

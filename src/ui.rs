@@ -270,6 +270,12 @@ impl SettingsApp {
             (p.danger, "录音中".to_string())
         } else if snap.error.is_some() {
             (p.danger, "出错了".to_string())
+        } else if snap.kept_on_clipboard {
+            // 有提示（结果改走剪贴板了）时不能再显示"就绪"：托盘那边已经切到
+            // "该看一眼"的图标，两处说不一样的话，主人不知道该信谁。
+            (p.warn, "结果在剪贴板".to_string())
+        } else if snap.notice.is_some() {
+            (p.warn, "有提示".to_string())
         } else if self.capturing {
             // 与「录音中」一字之差完全分不清，改成明确指向快捷键
             (p.warn, "改键中".to_string())
@@ -436,26 +442,28 @@ impl SettingsApp {
             );
             ui.add_space(4.0);
 
-            // 剪贴板相关的两个开关都在客户端起作用，与选哪家服务商无关
+            // 剪贴板相关的两个开关都在客户端起作用，与选哪家服务商无关。
+            //
+            // 两条说明都必须如实：模拟按键到底有没有落进目标程序，`SendInput`
+            // 是**看不出来**的（它只报告"事件已入队"），所以第二条才是真正兜底的那条。
             ui.checkbox(
                 &mut self.edit.options.clipboard_fallback,
                 RichText::new("输入被拒时用剪贴板粘贴兜底").size(13.0),
             );
             ui.label(
-                RichText::new(
-                    "目标程序不认模拟按键时改走 Ctrl+V；粘贴成功后会还原你原来的剪贴板内容",
-                )
-                .size(11.0)
-                .color(p.muted),
+                RichText::new("系统真的拦下模拟按键时（如管理员权限窗口），改走 Ctrl+V 再试一次")
+                    .size(11.0)
+                    .color(p.muted),
             );
             ui.add_space(4.0);
             ui.checkbox(
                 &mut self.edit.options.keep_on_clipboard,
-                RichText::new("识别结果总留一份到剪贴板").size(13.0),
+                RichText::new("识别结果总留一份到剪贴板（推荐）").size(13.0),
             );
             ui.label(
                 RichText::new(
-                    "输入成功也留一份，随时可以 Ctrl+V；开启后不再还原你原来的剪贴板内容",
+                    "字到底有没有打进目标程序无法核实，所以每次识别都留一份，随时可 Ctrl+V；\
+                     代价是你原来复制的内容会被顶掉",
                 )
                 .size(11.0)
                 .color(p.muted),
@@ -580,6 +588,16 @@ impl SettingsApp {
                 ui.label(RichText::new(body).size(14.0).color(p.text));
             } else if let Some(err) = &snap.error {
                 ui.label(RichText::new(err).size(13.0).color(p.danger));
+            } else if let Some(notice) = &snap.notice {
+                // 结果已放进剪贴板（通常是录音途中切了窗口）。用提醒色而不是危险色：
+                // 这不是故障，但主人得知道"这次的字没自动打出去，去 Ctrl+V 粘"。
+                // 这句话**不再靠弹窗**送到主人眼前（见 `Shared::notice_clipboard_handoff`），
+                // 留在这里是为了他打开设置窗时能看明白发生了什么。
+                ui.label(RichText::new(notice).size(13.0).color(p.warn));
+                if !snap.last_result.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&snap.last_result).size(14.0).color(p.text));
+                }
             } else if !snap.last_result.is_empty() {
                 ui.label(RichText::new(&snap.last_result).size(14.0).color(p.text));
             } else {
@@ -591,6 +609,18 @@ impl SettingsApp {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new("测试结果只显示在这里，不会往其他程序里打字。")
+                        .size(11.0)
+                        .color(p.muted),
+                );
+            }
+            // 「结果在剪贴板」这句话只说给"找不到时想找"的主人听，而且**只在真的
+            // 留住了**（写完又回读核对过）的时候才说 —— 以前这里只看"开关开着 +
+            // 有结果"，于是复制失败的那一次也照样写着"留在了剪贴板"，主人照着去
+            // Ctrl+V 却什么也粘不出来（正是他报的那个坑，只是从弹窗搬进了窗口）。
+            if snap.kept_on_clipboard && !snap.recording && !snap.last_result.is_empty() {
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new("这份结果也留在了剪贴板，随时可以 Ctrl+V")
                         .size(11.0)
                         .color(p.muted),
                 );
