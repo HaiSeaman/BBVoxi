@@ -1,7 +1,8 @@
 [package]
 name = "bbvoxi"
-# Cargo 要求 version 为 SemVer 三段式（1.3.0），但对外发布的 exe/tag/文档统一用 v1.3
-version = "1.3.0"
+# Cargo 要求 version 为 SemVer 三段式（1.3.1）；界面上以 v1.3.1 原样显示，
+# 主人靠它分辨"我测的到底是不是新版"
+version = "1.3.1"
 edition = "2021"
 description = "BBVoxi - Windows 语音输入法：按住快捷键说话，松开即自动输入到光标处"
 rust-version = "1.80"

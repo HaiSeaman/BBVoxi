@@ -8,6 +8,9 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=assets/bbvoxi.rc");
+    // 声明依赖 RC 环境变量：否则用户若在第一次构建**之后**才装 Windows SDK 并设置了
+    // RC，cargo 认为 build.rs 的输入没变就不会重跑，exe 会一直没有图标。
+    println!("cargo:rerun-if-env-changed=RC");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

@@ -82,8 +82,13 @@ pub fn write_text(text: &str) -> Result<()> {
         }
         std::ptr::copy_nonoverlapping(units.as_ptr(), dst as *mut u16, units.len());
         let _ = GlobalUnlock(hglobal);
-        // 到这一步新内容已经就位，紧接着换上：中间没有任何可失败的步骤
-        EmptyClipboard()?;
+        // 到这一步新内容已经就位，紧接着换上：中间没有任何可失败的步骤。
+        // 但清空失败也要**手动**把这块全局内存还回去 —— 用 `?` 直接返回会漏掉
+        // GlobalFree，而 GMEM_MOVEABLE 是系统全局内存，泄漏了会一直挂在进程里。
+        if let Err(e) = EmptyClipboard() {
+            let _ = GlobalFree(Some(hglobal));
+            return Err(anyhow!("清空剪贴板失败：{e}"));
+        }
         // 成功之后所有权归系统，不能再 GlobalFree —— 释放它会留下悬空句柄
         if let Err(e) = SetClipboardData(format(), Some(HANDLE(hglobal.0))) {
             let _ = GlobalFree(Some(hglobal));

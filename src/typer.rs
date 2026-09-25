@@ -60,6 +60,27 @@ fn plan(blocked: bool, sent: &str, desired: &str) -> Option<Diff> {
     (!planned.is_noop()).then_some(planned)
 }
 
+/// 取 `text` 里前 `committed` 个编码单元（按 `injector::type_text` 的口径）之后
+/// 剩下的尾巴。逐字注入只进去一部分时，只有这段尾巴需要改走剪贴板补上 ——
+/// 把整段重粘会和已经打进去的字重复。
+///
+/// 提交数正好落在一个字符中间（代理对被拆开）时无法表示半个字符，
+/// 保守起见从那个字符开始整段重粘：宁可重复半个字形，也不悄悄丢字。
+fn tail_after_units(text: &str, committed: usize) -> String {
+    let mut used = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if used >= committed {
+            return text[idx..].to_string();
+        }
+        let n = if ch == '\r' { 0 } else { ch.len_utf16() };
+        if used + n > committed {
+            return text[idx..].to_string();
+        }
+        used += n;
+    }
+    String::new()
+}
+
 /// 逐字注入被拒之后的兜底配置（来自设置里的两个开关）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Fallback {
@@ -174,12 +195,6 @@ impl LiveTyper {
         }
     }
 
-    /// 此刻是否不在目标窗口里。收尾遇到这种情况会一个字都不输入，
-    /// 改由 `session` 把结果放到剪贴板（见 `session::run_session` 的收尾段）。
-    pub fn is_away(&self) -> bool {
-        self.away
-    }
-
     /// 实时阶段调用：把目标程序里的文本调整成 `desired`。
     /// 关闭实时输入时什么都不做（不记账），避免收尾时误以为已经打过字。
     ///
@@ -197,25 +212,41 @@ impl LiveTyper {
 
     /// 会话收尾调用：把目标程序里的文本对账成最终识别结果。
     ///
-    /// 但不在目标窗口里、以及测试模式例外：一个字符都不输入。
-    /// 前者 `sent` 记的是打在旧窗口里的字，对新窗口做退格会删掉主人的内容；
-    /// 后者连设置窗都不该被写进去。
+    /// 返回 `Result<bool>`，三态的含义是调用方（`session`）必须区别对待的：
+    /// - `Ok(true)`：文本已交付到目标程序，**或**本来就处于正确状态、无需输入；
+    /// - `Ok(false)`：本次**放弃输入**（主人切到了别的窗口）—— 一个字都没写进去，
+    ///   调用方必须改用剪贴板交付，否则主人这句话就凭空消失了；
+    /// - `Err(_)`：注入失败（管理员窗口、被拦、粘贴兜底也没成……），同样要用剪贴板兜底。
     ///
     /// `now` = 此刻的前台窗口。**这一步不能省**：主人松手之后、收尾之前完全
     /// 可能又切走了窗口（等最终结果时尤其容易），此刻补打和退格都会落到别人家。
-    pub fn finish(&mut self, desired: &str, now: Option<isize>) -> Result<()> {
+    pub fn finish(&mut self, desired: &str, now: Option<isize>) -> Result<bool> {
         self.guard(now);
         // 之前某一步注入已经失败 → 之后一个字都不再输入（避免反复报错），
         // 但**必须把原因抛出去**：调用方正是靠这个 Err 把整段结果放进剪贴板的。
         // 这里要是返回 Ok，主人刚说的话两条路都走不通 —— 既不进目标程序、
-        // 也不进剪贴板，直接丢掉（`blocked()` 把失败也算作禁止注入，
-        // 所以走 `plan()` 只会得到一个"什么都不做"的 Ok）。
+        // 也不进剪贴板，直接丢掉。
         if let Some(reason) = &self.failure {
             return Err(anyhow!("{reason}"));
         }
+        // 测试模式：结果只回显在设置窗里，「永不外打」是软件对主人的承诺。
+        // 返回 true 表示"无需（也严禁）再由调用方兜底" —— 这条路绝不许碰剪贴板。
+        if self.muted {
+            return Ok(true);
+        }
+        // 主人切走了窗口：退格会删掉别的窗口里的内容、整段重打也是打错地方，
+        // 所以一个字都不输入。返回 false，让调用方把完整结果放进剪贴板 ——
+        // 这是此刻唯一安全的交付方式（既不动别人的窗口，又把文字交到主人手上）。
+        if self.away {
+            return Ok(false);
+        }
         match plan(self.blocked(), &self.sent, desired) {
-            Some(planned) => self.execute(planned, desired),
-            None => Ok(()),
+            Some(planned) => {
+                self.execute(planned, desired)?;
+                Ok(true)
+            }
+            // 已经就是期望的状态，无需任何输入
+            None => Ok(true),
         }
     }
 
@@ -231,8 +262,18 @@ impl LiveTyper {
             }
         }
         if !planned.append.is_empty() {
-            if let Err(e) = injector::type_text(&planned.append) {
-                return self.paste_fallback(&planned.append, desired, e);
+            let expected = injector::typeable_units(&planned.append);
+            match injector::type_text(&planned.append) {
+                // 只有"实际提交数 == 期望数"才算整段打进目标程序，这时才记账。
+                Ok(committed) if committed >= expected => {}
+                // 只提交了一部分：多出来的尾巴必须改走剪贴板补上，
+                // 而且只粘这段尾巴 —— 粘整段会和已经打进去的部分重复。
+                Ok(committed) => {
+                    let tail = tail_after_units(&planned.append, committed);
+                    let e = anyhow!("逐字注入只提交了 {committed}/{expected} 个字符");
+                    return self.paste_fallback(&tail, desired, e);
+                }
+                Err(e) => return self.paste_fallback(&planned.append, desired, e),
             }
         }
         self.sent = desired.to_string();
@@ -447,7 +488,7 @@ mod tests {
     fn switching_windows_stops_input_even_when_live_typing_was_off() {
         let mut t = LiveTyper::new(false, Some(100));
         t.guard(Some(200));
-        assert!(t.is_away(), "关着实时输入时切走窗口也应停止自动输入");
+        assert!(t.away, "关着实时输入时切走窗口也应停止自动输入");
         t.finish("x", Some(200)).unwrap();
         assert!(t.sent.is_empty(), "整段文字被打进了主人切过去的那个窗口");
     }
@@ -462,11 +503,11 @@ mod tests {
     fn returning_to_the_original_window_resumes_typing() {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(200));
-        assert!(t.is_away(), "切到别的窗口后应暂停");
+        assert!(t.away, "切到别的窗口后应暂停");
         assert!(t.blocked(), "在别的窗口里时必须禁止注入");
 
         t.guard(Some(100));
-        assert!(!t.is_away(), "回到原窗口应恢复");
+        assert!(!t.away, "回到原窗口应恢复");
         assert!(!t.blocked(), "恢复后不应再禁止注入");
         assert!(t.enabled, "恢复不该动到主人的「边说话边打字」设置");
         assert!(t.sent.is_empty(), "单测里没注入过，sent 不该凭空出现内容");
@@ -494,7 +535,7 @@ mod tests {
     fn guard_stops_typing_after_the_window_changes() {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(200));
-        assert!(t.is_away(), "切到别的窗口后必须停止实时输入");
+        assert!(t.away, "切到别的窗口后必须停止实时输入");
     }
 
     /// 同一个窗口时不能误伤：实时输入要照常工作
@@ -503,7 +544,7 @@ mod tests {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(100));
         assert!(t.enabled, "同一个窗口不该被停用");
-        assert!(!t.is_away());
+        assert!(!t.away);
     }
 
     /// 拿不到窗口句柄时不拦：不能因为读不到句柄就把主人的输入停掉
@@ -593,10 +634,51 @@ mod tests {
     fn finish_types_nothing_while_in_another_window() {
         let mut t = LiveTyper::new(true, Some(100));
         t.guard(Some(200)); // 主人切走了
-        t.finish("x", Some(200)).unwrap();
+        let delivered = t.finish("x", Some(200)).unwrap();
+        assert!(!delivered, "放弃输入时必须返回 false，调用方才改用剪贴板");
         assert!(
             t.sent.is_empty(),
             "不在目标窗口里时 finish 仍然输入了字符（会打到别的程序里）"
         );
+    }
+
+    /// 回归（主人的话既不进目标程序也不进剪贴板，凭空消失）：
+    /// 主人切走了窗口时，`finish` 必须返回 `Ok(false)` 明确表示"放弃输入"，
+    /// 这样调用方才知道要把结果放进剪贴板。返回 `Ok(true)` 会让两条交付路都断掉。
+    #[test]
+    fn away_finish_reports_abandoned_input() {
+        let mut t = LiveTyper::new(true, Some(100));
+        t.guard(Some(200)); // 主人切到别的窗口
+        assert!(
+            !t.finish("你好", Some(200)).unwrap(),
+            "切走窗口时必须返回 false（放弃输入），由调用方改用剪贴板"
+        );
+    }
+
+    /// 测试模式的收尾必须返回 `Ok(true)`：它表示"文本已由我们处理妥当、
+    /// 无需调用方再兜底"。返回 false 会让 `session` 把结果写进剪贴板 ——
+    /// 而「测试结果只显示在窗口里、绝不外泄」是软件对主人的承诺。
+    #[test]
+    fn muted_finish_reports_delivered_so_caller_never_touches_clipboard() {
+        let mut t = LiveTyper::muted();
+        assert!(
+            t.finish("你好", Some(100)).unwrap(),
+            "测试模式收尾必须返回 true，严禁让调用方走剪贴板"
+        );
+        assert!(t.sent.is_empty(), "测试模式不该注入任何字符");
+    }
+
+    /// 兜底粘贴只能粘"没成功提交的那一段尾巴"：
+    /// 已经打进去的前缀再粘一遍就会重复（这正是收尾重复出字的根因）。
+    #[test]
+    fn tail_after_units_returns_only_the_uncommitted_suffix() {
+        // 提交了 2 个单元（"你好"）→ 尾巴是剩下的
+        assert_eq!(tail_after_units("你好世界。", 2), "世界。");
+        // 全部提交 → 没有尾巴
+        assert_eq!(tail_after_units("你好", 2), "");
+        // 一个都没提交 → 整段都是尾巴
+        assert_eq!(tail_after_units("你好", 0), "你好");
+        // \r 不产生按键、不计入提交数：提交 3 个单元时应跳过 \r
+        assert_eq!(tail_after_units("a\r\nbc", 3), "c");
     }
 }

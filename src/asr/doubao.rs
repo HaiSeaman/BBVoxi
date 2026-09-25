@@ -6,6 +6,7 @@
 
 use super::{pcm_bytes, Kind, Parsed};
 use crate::config::{DoubaoConfig, Options};
+use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -26,13 +27,32 @@ const FLAG_WITH_EVENT: u8 = 0b0100;
 const SERIALIZATION_JSON: u8 = 0b0001;
 const COMPRESSION_GZIP: u8 = 0b0001;
 
+/// 上报定稿时使用的固定片段编号（**不是**服务端编号，豆包协议里没有句子编号）。
+///
+/// 为什么需要它：二遍识别（`definite=true`）会**改写**前面的结果，而改写后的版本
+/// 必须"替换"旧内容而不是"追加"（否则主人屏幕上就是同一句出现两遍）。
+/// `Transcript` 的替换语义是按编号触发的 —— 给豆包整段定稿快照固定用同一个编号，
+/// 就能让上层把它当成"同一个片段"，后到的快照整段覆盖前一个（见本文件 `parse`）。
+const DOUBAO_FINAL_ID: i64 = 0;
+
+/// 连续解帧失败多少次就上报错误（坏帧不能无限被静默吞掉）。
+const DECODE_FAILURE_LIMIT: u32 = 5;
+
 pub struct Doubao {
     stream_mode: u8,
     options: Options,
     /// 留一帧缓冲，最后一帧要打「结束包」标记
     buffered: Option<Vec<u8>>,
-    /// 已经计入最终文本的 utterances 数量
-    consumed: usize,
+    /// 已经上报过的「完整定稿文本」快照。
+    ///
+    /// 以前这里放的是 **服务端 utterances 数组下标**（只增不减的游标），但二遍
+    /// 识别会改写/重排/缩短那个数组，游标必然错位：数组一缩，`while consumed <
+    /// list.len()` 就再也不成立，后面的定稿全丢；改写版落到新下标又会被当成新句
+    /// 追加，变成"多打一份字"。改用「上次报出去的完整快照」做比较基准，彻底不依赖
+    /// 下标。
+    reported: String,
+    /// 连续解帧失败次数（成功一次即清零）
+    decode_failures: u32,
     finished: bool,
 }
 
@@ -43,12 +63,14 @@ impl Doubao {
             stream_mode: if cfg.high_accuracy { 1 } else { 2 },
             options: options.clone(),
             buffered: None,
-            consumed: 0,
+            reported: String::new(),
+            decode_failures: 0,
             finished: false,
         }
     }
 
-    pub fn start_messages(&self) -> Vec<Message> {
+    /// 启动指令（返回 Result：压缩失败要往上抛，见 `gzip`）
+    pub fn start_messages(&self) -> Result<Vec<Message>> {
         let body = json!({
             "audio": { "format": "pcm", "codec": "raw", "rate": 16_000, "bits": 16, "channel": 1 },
             "request": {
@@ -63,13 +85,14 @@ impl Doubao {
                 "end_window_size": 800
             }
         });
-        vec![frame(
+        let payload = gzip(body.to_string().as_bytes())?;
+        Ok(vec![frame(
             MSG_FULL_CLIENT_REQUEST,
             0,
             SERIALIZATION_JSON,
             COMPRESSION_GZIP,
-            &gzip(body.to_string().as_bytes()),
-        )]
+            &payload,
+        )])
     }
 
     pub fn audio_messages(&mut self, pcm: &[i16]) -> Vec<Message> {
@@ -111,8 +134,32 @@ impl Doubao {
             _ => return Parsed::Ignored,
         };
         let Some(frame) = decode(&bytes) else {
+            // 坏帧不能整帧静默吞掉（以前直接变成 Ignored，排障时完全无从下手）。
+            // 记一条日志，且只打印**前 16 个字节**的 hex，不打印整帧（帧可能很大）。
+            self.decode_failures += 1;
+            let head: String = bytes
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("");
+            crate::log::log(format!(
+                "豆包响应无法解帧（连续第 {} 次）：帧长 {} 字节，前 16 字节 {head}",
+                self.decode_failures,
+                bytes.len()
+            ));
+            // 连续多次都解不出来，说明协议对不上（而不是偶发坏帧）：上报错误结束会话
+            if self.decode_failures >= DECODE_FAILURE_LIMIT {
+                self.finished = true;
+                return Parsed::Error(format!(
+                    "豆包连续 {} 帧无法解析（协议疑似不匹配），最近一帧前 16 字节：{head}",
+                    self.decode_failures
+                ));
+            }
             return Parsed::Ignored;
         };
+        // 解帧成功：连续失败计数清零
+        self.decode_failures = 0;
         // v3 的响应正文里根本没有 code 字段（顶层就是 audio_info / result），
         // 错误码只在「错误帧」的帧头里。之前用 unwrap_or(-1) 兜底，
         // 于是每一条正常的响应都被当成 code=-1 的错误 —— 一开录就报错。
@@ -130,20 +177,26 @@ impl Doubao {
         }
 
         let result = &frame.payload["result"];
-        let mut newly_final = String::new();
+        // 每次都把**当前全部定稿片段**拼成一个「完整快照」，不再维护"已消费下标"当游标。
+        //
+        // 为什么这么改：二遍识别（definite=true）会改写、甚至重排/缩短 utterances
+        // 数组。用下标游标时——数组一缩，`while consumed < list.len()` 就永不成立，
+        // 后面所有定稿直接丢失（主人后半段话没了）；改写版落到"新下标"又会被当成
+        // 新句无条件追加（主人看到"多打一份字"）。改成快照 + 内容比较后，重复帧被
+        // 挡掉、改写帧整段替换（替换靠下面固定的 `DOUBAO_FINAL_ID`，见字段注释）。
+        let mut definite = String::new();
         let mut partial = String::new();
         if let Some(list) = result["utterances"].as_array() {
-            while self.consumed < list.len() {
-                let u = &list[self.consumed];
-                if !u["definite"].as_bool().unwrap_or(false) {
-                    break;
-                }
+            for u in list {
                 let text = u["text"].as_str().unwrap_or("").trim();
-                if !text.is_empty() {
-                    newly_final.push_str(text);
+                if text.is_empty() {
+                    continue;
                 }
-                self.consumed += 1;
+                if u["definite"].as_bool().unwrap_or(false) {
+                    definite.push_str(text);
+                }
             }
+            // 当前这句还没定稿的尾部：只取最后一条非定稿片段
             if let Some(last) = list.last() {
                 if !last["definite"].as_bool().unwrap_or(false) {
                     partial = last["text"].as_str().unwrap_or("").trim().to_string();
@@ -158,6 +211,12 @@ impl Doubao {
         if frame.flags & FLAG_LAST_PACKET != 0 {
             self.finished = true;
         }
+        // 定稿快照和上次一样（重复帧）就不再上报：不重复是"多打一份字"的另一半保证
+        let mut newly_final = String::new();
+        if !definite.is_empty() && definite != self.reported {
+            self.reported = definite.clone();
+            newly_final = definite;
+        }
         // `finished` 必须跟着文本一起上报：最后一包可能同时带着新定稿的句子，
         // 只回文本的话会话就等不到结束（主人松手后白等 8 秒超时）。
         if !newly_final.is_empty() {
@@ -165,12 +224,14 @@ impl Doubao {
                 kind: Kind::Final,
                 text: newly_final,
                 finished: self.finished,
+                id: Some(DOUBAO_FINAL_ID),
             }
         } else if !partial.is_empty() {
             Parsed::Text {
                 kind: Kind::Partial,
                 text: partial,
                 finished: self.finished,
+                id: None,
             }
         } else if self.finished {
             Parsed::Finished
@@ -234,8 +295,7 @@ fn decode(bytes: &[u8]) -> Option<Frame> {
         code = i32::from_be_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?);
         offset += 4;
     }
-    let size =
-        u32::from_be_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?) as usize;
+    let size = u32::from_be_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?) as usize;
     offset += 4;
     let payload = bytes.get(offset..offset + size)?;
     let data = if compression == COMPRESSION_GZIP {
@@ -303,10 +363,16 @@ fn error_hint(code: i32) -> Option<&'static str> {
     }
 }
 
-fn gzip(data: &[u8]) -> Vec<u8> {
+/// gzip 压缩；失败**必须**往上返回 Err。
+///
+/// 之前是 `let _ = enc.write_all(...)` + `finish().unwrap_or_default()`：压缩一出错
+/// 就悄悄回退成空 payload，可帧头里还写着「已压缩」标志 —— 服务端只会回一个语义
+/// 模糊的协议错误，排障时完全看不出真正原因。宁可报错，也不发出标志与实际内容
+/// 自相矛盾的帧。
+fn gzip(data: &[u8]) -> Result<Vec<u8>> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    let _ = enc.write_all(data);
-    enc.finish().unwrap_or_default()
+    enc.write_all(data).context("gzip 压缩启动指令失败")?;
+    enc.finish().context("gzip 压缩启动指令失败")
 }
 
 #[cfg(test)]
@@ -320,7 +386,7 @@ mod tests {
     #[test]
     fn full_client_request_header_matches_protocol() {
         let d = Doubao::new(&cfg(), &Options::default());
-        let msgs = d.start_messages();
+        let msgs = d.start_messages().expect("启动帧压缩不应失败");
         let Message::Binary(bytes) = &msgs[0] else {
             panic!("应为二进制帧")
         };
@@ -343,7 +409,8 @@ mod tests {
         let mut c = cfg();
         c.high_accuracy = true;
         let d = Doubao::new(&c, &Options::default());
-        let Message::Binary(bytes) = &d.start_messages()[0] else {
+        let start = d.start_messages().expect("启动帧压缩不应失败");
+        let Message::Binary(bytes) = &start[0] else {
             panic!()
         };
         let mut out = Vec::new();
@@ -393,6 +460,8 @@ mod tests {
         }
     }
 
+    /// 定稿改成了「整段快照」上报：每包给出的是**当前全部定稿片段**的拼接，
+    /// 由上层按固定编号做"同号替换"，从而既不会重复、也能覆盖被改写的旧版本。
     #[test]
     fn parses_streaming_and_definite_utterances() {
         let mut d = Doubao::new(&cfg(), &Options::default());
@@ -415,7 +484,7 @@ mod tests {
             }
             _ => panic!("应返回稳态结果"),
         }
-        // 下一包：第二句也变为稳态，且标记为最后一包
+        // 下一包：第二句也变为稳态，且标记为最后一包 → 快照为全部定稿
         let body2 = json!({
             "audio_info": { "duration": 3696 },
             "result": { "utterances": [
@@ -426,11 +495,89 @@ mod tests {
         match d.parse(real_frame(0b0011, Some(1), &body2.to_string(), false)) {
             Parsed::Text { kind, text, .. } => {
                 assert_eq!(kind, Kind::Final);
-                assert_eq!(text, "世界"); // 只发新增的，不重复
+                assert_eq!(text, "你好世界"); // 整段快照，靠上层同号替换覆盖
             }
-            _ => panic!("应返回新增稳态结果"),
+            _ => panic!("应返回稳态结果"),
         }
         assert!(d.finished);
+    }
+
+    /// 回归（"后半段话没了"）：二遍识别会把 utterances 数组改写变短。
+    /// 旧实现用只增不减的下标当游标，数组一缩 `while consumed < list.len()`
+    /// 就永不成立，之后所有定稿都被丢掉。改按内容快照后必须能继续收到新定稿。
+    #[test]
+    fn later_definite_is_not_lost_when_the_array_shrinks() {
+        let mut d = Doubao::new(&cfg(), &Options::default());
+        let b1 = json!({ "result": { "utterances": [
+            { "text": "甲", "definite": true },
+            { "text": "乙", "definite": true }
+        ] } });
+        d.parse(server_frame(&b1.to_string()));
+        // 数组被改写缩短（只剩甲）
+        let b2 = json!({ "result": { "utterances": [ { "text": "甲", "definite": true } ] } });
+        d.parse(server_frame(&b2.to_string()));
+        // 数组回来且新增丙的定稿 —— 用旧游标这里会永远收不到
+        let b3 = json!({ "result": { "utterances": [
+            { "text": "甲", "definite": true },
+            { "text": "乙", "definite": true },
+            { "text": "丙", "definite": true }
+        ] } });
+        match d.parse(server_frame(&b3.to_string())) {
+            Parsed::Text { text, .. } => {
+                assert!(
+                    text.contains('丙'),
+                    "数组缩短后，后续定稿不能被丢掉：{text}"
+                )
+            }
+            other => panic!("应上报定稿，实际：{other:?}"),
+        }
+    }
+
+    /// 回归（"多打一份字"）：定稿被二遍识别改写后必须**替换**旧版本，而不是追加；
+    /// 同一句话重复上报也不能重复。
+    #[test]
+    fn rewritten_definite_replaces_instead_of_appending() {
+        use crate::asr::Transcript;
+
+        let mut d = Doubao::new(&cfg(), &Options::default());
+        let mut t = Transcript::default();
+        let b1 = json!({ "result": { "utterances": [
+            { "text": "你好", "definite": true },
+            { "text": "世界", "definite": false }
+        ] } });
+        t.absorb(d.parse(server_frame(&b1.to_string())));
+        assert_eq!(t.final_text, "你好");
+
+        // 改写版（带标点）落进新下标、且数组变短：必须整段替换
+        let b2 =
+            json!({ "result": { "utterances": [ { "text": "你好，世界。", "definite": true } ] } });
+        t.absorb(d.parse(server_frame(&b2.to_string())));
+        assert_eq!(
+            t.final_text, "你好，世界。",
+            "改写后的定稿必须替换旧版本，不能追加成两份"
+        );
+
+        // 同一句话再上报一次：内容没变，不重复
+        t.absorb(d.parse(server_frame(&b2.to_string())));
+        assert_eq!(t.final_text, "你好，世界。", "重复上报不能多打一份字");
+    }
+
+    /// 坏帧不能被整帧静默吞掉：先记日志，连续多次解不出来再上报错误。
+    #[test]
+    fn undecodable_frames_are_logged_then_reported_as_error() {
+        let mut d = Doubao::new(&cfg(), &Options::default());
+        // 帧头声称带序号（flags=0x01）但总长只有 4 字节 → decode 取不到序号，返回 None
+        let junk = Message::binary(vec![0x11u8, 0x91, 0x00, 0x00]);
+        for i in 1..DECODE_FAILURE_LIMIT {
+            assert!(
+                matches!(d.parse(junk.clone()), Parsed::Ignored),
+                "坏帧第 {i} 次只记日志，不该直接结束会话"
+            );
+        }
+        match d.parse(junk.clone()) {
+            Parsed::Error(e) => assert!(e.contains("无法解析"), "连续坏帧应上报错误：{e}"),
+            other => panic!("连续 {DECODE_FAILURE_LIMIT} 次坏帧应上报错误，实际：{other:?}"),
+        }
     }
 
     /// 回归：服务端在建连后立刻下发的这条「只有 log_id」的帧，
@@ -520,9 +667,9 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn live_probe_dump_frames() {
+        use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::tungstenite::http::HeaderValue;
-        use tokio_tungstenite::connect_async;
 
         let key = std::env::var("BBVOXI_DOUBAO_KEY").expect("需要 BBVOXI_DOUBAO_KEY");
         let url = std::env::var("BBVOXI_DOUBAO_URL")
@@ -551,12 +698,19 @@ mod tests {
 
         // 全量客户端请求（BBVOXI_DOUBAO_NOSTREAM=1 时走高精度 nostream 端点）
         let mut c = cfg();
-        if std::env::var("BBVOXI_DOUBAO_NOSTREAM").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("BBVOXI_DOUBAO_NOSTREAM")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             c.high_accuracy = true;
         }
         let d = Doubao::new(&c, &Options::default());
-        let start = d.start_messages();
-        println!("=== 发送启动帧 {} 字节：{:02x?}", start[0].clone().into_data().len(), &start[0].clone().into_data()[..8]);
+        let start = d.start_messages().expect("启动帧压缩不应失败");
+        println!(
+            "=== 发送启动帧 {} 字节：{:02x?}",
+            start[0].clone().into_data().len(),
+            &start[0].clone().into_data()[..8]
+        );
         sink.send(start[0].clone()).await.unwrap();
         let mut parser = Doubao::new(&cfg(), &Options::default());
 
@@ -630,7 +784,9 @@ mod tests {
         };
         println!(
             "[帧] type={mt:#06b} flags={flags:#06b} ser={ser} comp={comp} seq={seq:?} code={code:?} size={size}\n     正文：{}",
-            &text[..std::cmp::min(text.len(), 800)]
+            // 按**字符**截断，不能按字节切 String：正文是中文时按字节切必然 panic
+            // （byte index 800 is not a char boundary）
+            text.chars().take(800).collect::<String>()
         );
         println!("     解析结果：{parsed}");
     }
@@ -638,7 +794,7 @@ mod tests {
     /// 按真实协议拼一条服务端 full server response（0b1001）
     fn real_frame(flags: u8, seq: Option<i32>, json_body: &str, gz: bool) -> Message {
         let payload: Vec<u8> = if gz {
-            gzip(json_body.as_bytes())
+            gzip(json_body.as_bytes()).expect("测试帧压缩不应失败")
         } else {
             json_body.as_bytes().to_vec()
         };

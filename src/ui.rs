@@ -126,6 +126,13 @@ pub struct SettingsApp {
     applied_autostart: bool,
     capturing: bool,
     hotkey_error: Option<String>,
+    /// 捕捉过程中记下的「当前凑齐的修饰键」。
+    ///
+    /// 为什么需要它：像 Ctrl+Win 这种**纯修饰键组合**没有主键可听，而 egui 只为
+    /// 非修饰键产生按键事件（Ctrl / Win 自己按下去，egui 那边什么都没有）。
+    /// 所以只能一边读钩子的修饰键状态一边等 —— 等主人把手指全部松开，
+    /// 那一刻记下的才是完整组合（见 `capture_step`）。
+    pending_mods: Option<hotkey::Mods>,
     /// 上一次 `ui()` 被绘制的时刻。改键捕捉的生命周期靠它兜底，见
     /// `reap_capture_if_ui_gone`。
     painted_at: Instant,
@@ -152,6 +159,7 @@ impl SettingsApp {
             applied_autostart: autostart,
             capturing: false,
             hotkey_error: None,
+            pending_mods: None,
             painted_at: Instant::now(),
         }
     }
@@ -354,7 +362,11 @@ impl SettingsApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if self.capturing {
-                    ui.label(RichText::new("请按下新的组合键…").size(14.0).color(p.warn));
+                    ui.label(
+                        RichText::new("请按下新的组合键（松开后生效）")
+                            .size(14.0)
+                            .color(p.warn),
+                    );
                     if ghost_button(ui, p, "取消").clicked() {
                         self.end_capture();
                     }
@@ -390,7 +402,17 @@ impl SettingsApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "支持 Ctrl / Alt / Shift + 字母、数字、F1~F12 或空格；按下时会拦截该组合键",
+                    "修饰键 Ctrl / Alt / Shift / Win 随意搭配（1~4 个都行），主键支持字母、数字、\
+                     F1~F24、空格、方向键、翻页键和符号键；也可以整组只用修饰键（如 Ctrl + Win，\
+                     先按住 Ctrl 再按 Win，全部松开后生效）。按下时会拦截该组合键。",
+                )
+                .size(11.5)
+                .color(p.muted),
+            );
+            ui.label(
+                RichText::new(
+                    "只有单独一个普通键（如 a）和单独一个修饰键（如 Ctrl）不能当快捷键：\
+                     前者会在所有程序里吞掉这个键，后者的「按住说话」和 Ctrl+C 分不开。",
                 )
                 .size(11.5)
                 .color(p.muted),
@@ -533,9 +555,13 @@ impl SettingsApp {
                 let t = ui.ctx().input(|i| i.time);
                 let pulse = (0.55 + 0.45 * (t * 4.0).sin()) as f32;
                 ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 4.0, p.danger.gamma_multiply(0.35 + 0.65 * pulse));
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        4.0,
+                        p.danger.gamma_multiply(0.35 + 0.65 * pulse),
+                    );
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!("录音中 {}", clock(snap.elapsed())))
@@ -583,7 +609,8 @@ impl SettingsApp {
                 ui.painter().circle_filled(rect.center(), 3.0, color);
                 ui.add_space(2.0);
                 ui.add(
-                    egui::Label::new(RichText::new(msg).size(12.0).color(color).strong()).truncate(),
+                    egui::Label::new(RichText::new(msg).size(12.0).color(color).strong())
+                        .truncate(),
                 );
             });
             ui.add_space(6.0);
@@ -677,6 +704,8 @@ impl SettingsApp {
     fn begin_capture(&mut self, ctx: &egui::Context) {
         self.capturing = true;
         self.hotkey_error = None;
+        // 上一轮留下的半截修饰键状态，不能带到这一轮来
+        self.pending_mods = None;
         self.paused.store(true, Ordering::Relaxed);
         // 捕捉期间钩子是暂停的，按键会原样进到窗口。
         // 若这之前焦点还停在某个输入框（比如密钥框），按下的字母会被插进去，
@@ -690,7 +719,27 @@ impl SettingsApp {
 
     fn end_capture(&mut self) {
         self.capturing = false;
+        self.pending_mods = None;
         self.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// 记下/应用一个新录到的快捷键。
+    ///
+    /// 统一走 `parse(to_config())` 当校验器，而不是直接信任录到的东西：
+    /// 录出来的组合有可能**不合法**（比如只按下一个 Shift），
+    /// 校验器就是唯一的把关口，跟"主人手打配置字符串"走的是同一套规则。
+    fn commit_hotkey(&mut self, candidate: Hotkey) {
+        self.pending_mods = None;
+        match hotkey::parse(&candidate.to_config()) {
+            Ok(hk) => {
+                self.edit.hotkey = hk.to_config();
+                hotkey::set_current(hk);
+                self.hotkey_error = None;
+                self.end_capture();
+                self.status = Some((true, format!("快捷键已改为 {}", hk.display())));
+            }
+            Err(e) => self.hotkey_error = Some(e.to_string()),
+        }
     }
 
     fn handle_capture(&mut self, ctx: &egui::Context) {
@@ -702,41 +751,38 @@ impl SettingsApp {
             self.end_capture();
             return;
         }
+        // 捕捉期间得持续重绘，否则 eframe 只按需泵消息，
+        // `current_mods()` 的变化就看不到、松手那一刻会漏掉
         ctx.request_repaint();
-        let (key, mods) = ctx.input(|i| {
-            let key = i.events.iter().find_map(|e| match e {
-                egui::Event::Key {
-                    key, pressed: true, ..
-                } => Some(*key),
-                _ => None,
-            });
-            (key, i.modifiers)
-        });
-        let Some(key) = key else { return };
-        if key == egui::Key::Escape {
+
+        // 主键只从 egui 事件里取；修饰键一律读钩子。
+        //
+        // 为什么不读 `i.modifiers`：egui 的 `Modifiers` 里**根本没有 Win 这一项**，
+        // 它只知道 ctrl/alt/shift/mac_cmd —— 靠它录 Ctrl+Win 会永远缺一块。
+        // 钩子那边左右分开的键码都认得（见 `hotkey::MODIFIERS`），所以以它为准。
+        let key = ctx.input(|i| take_main_key(&i.events));
+        // Esc 单独按下 = 取消录制（符合主人直觉）。但**带着修饰键的 Esc 是主键**：
+        // `MAIN_KEYS` 里本来就有 Esc，之前这里一刀切地取消，导致 Ctrl+Esc 这类
+        // 组合永远录不进去（表里说支持、实际录不到，属于名不副实）。
+        if key == Some(egui::Key::Escape) && hotkey::current_mods() == hotkey::Mods::default() {
             self.end_capture();
             return;
         }
-        let Some(vk) = egui_key_to_vk(key) else {
-            self.hotkey_error = Some("该按键暂不支持，请用字母、数字、F1~F12 或空格".into());
-            return;
+        let main = match key {
+            Some(k) => match hotkey::egui_key_to_vk(k) {
+                Some(vk) => Some(vk),
+                None => {
+                    self.hotkey_error = Some(
+                        "这个按键不能当快捷键，请换一个（字母、数字、F1~F24、方向键或符号）".into(),
+                    );
+                    self.pending_mods = None;
+                    return;
+                }
+            },
+            None => None,
         };
-        let candidate = Hotkey {
-            ctrl: mods.ctrl,
-            alt: mods.alt,
-            shift: mods.shift,
-            win: false,
-            vk,
-        };
-        match hotkey::parse(&candidate.to_config()) {
-            Ok(hk) => {
-                self.edit.hotkey = hk.to_config();
-                hotkey::set_current(hk);
-                self.hotkey_error = None;
-                self.end_capture();
-                self.status = Some((true, format!("快捷键已改为 {}", hk.display())));
-            }
-            Err(e) => self.hotkey_error = Some(e.to_string()),
+        if let Some(hk) = capture_step(hotkey::current_mods(), main, &mut self.pending_mods) {
+            self.commit_hotkey(hk);
         }
     }
 
@@ -859,6 +905,73 @@ fn capture_is_stale(capturing: bool, idle: Duration) -> bool {
     capturing && idle > CAPTURE_IDLE_LIMIT
 }
 
+/// 改键捕捉走一步，返回录完的快捷键（还没录完返回 `None`）。
+///
+/// 抽成纯函数：录键牵扯「按了修饰键还没松」「先松主键还是先松修饰键」这些时序，
+/// 只有能单测才敢说它是对的。真正碰系统的部分（钩子状态、egui 事件）都在调用方，
+/// 这里只做判断。
+///
+/// 参数：
+/// * `mods` —— 此刻真正按住的修饰键（来自钩子，含 Win）
+/// * `main` —— 这一帧新按下的**主键**虚拟键码（没有就是 `None`）
+/// * `pending` —— 跨帧记忆：手指全松开那一刻，靠它拼出纯修饰键组合
+///
+/// 两条出口：
+/// 1. 出现了主键 → 立刻成组合（Ctrl+Win 归修饰键，主键就是被按的那个）；
+/// 2. 没有任何修饰键按住、但 `pending` 里有东西 → 说明刚才握着一把修饰键全松手了，
+///    补上主键（`vk = 0`）成纯修饰键组合。合法性交给 `commit_hotkey` 里的校验器。
+///
+/// **`pending` 只增不减**（关键，Ctrl+Win 录不上的另一半原因）：手指是一根根
+/// 松开的，`mods` 会逐帧变小；若每帧都用"当前按住的"覆盖记忆，最后留下的只是
+/// **最后松开的那根手指**（Ctrl+Win 会变成"只剩 Win"），校验器当然不认 ——
+/// 表现为"我明明按了 Ctrl+Win，却提示至少要两个修饰键"。所以只记住凑齐得
+/// 最多的那一刻：数量更多才替换，同样多则取更晚的（中间误碰一下别的修饰键，
+/// 之后按的组合仍然盖得过去）。
+fn capture_step(
+    mods: hotkey::Mods,
+    main: Option<u32>,
+    pending: &mut Option<hotkey::Mods>,
+) -> Option<Hotkey> {
+    let as_hotkey = |m: hotkey::Mods, vk: u32| Hotkey {
+        ctrl: m.ctrl,
+        alt: m.alt,
+        shift: m.shift,
+        win: m.win,
+        vk,
+    };
+    if let Some(vk) = main {
+        return Some(as_hotkey(mods, vk));
+    }
+    let count = |m: hotkey::Mods| m.ctrl as u8 + m.alt as u8 + m.shift as u8 + m.win as u8;
+    if mods != hotkey::Mods::default() {
+        // 用 `map_or` 不用 `is_none_or`：后者是 Rust 1.82 才有的 API，
+        // 本工程声明的最低版本是 1.80（写在 Cargo.toml 里），不能指标。
+        if pending.map_or(true, |p| count(mods) >= count(p)) {
+            *pending = Some(mods);
+        }
+        return None;
+    }
+    pending.take().map(|m| as_hotkey(m, 0))
+}
+
+/// 从这一帧的事件里挑出「主键」。
+///
+/// 两件必须做的事：
+/// 1. **跳过修饰键自己**。egui 0.35 会把左右 Ctrl / Win **也**作为按键事件发出来
+///    （见 egui-winit 的 `KeyCode::ControlLeft => Key::ControlLeft`），而修饰键不是
+///    主键 —— 它们由钩子统一记录（`hotkey::current_mods`）。要是当成主键送进
+///    `egui_key_to_vk`，会被判成"不支持"：主人**刚按下 Ctrl 的瞬间**捕捉就报错、
+///    还把半截状态清空，于是 Ctrl+Win 永远录不出来。
+/// 2. 只认按下（`pressed: true`），松开的事件不要。
+fn take_main_key(events: &[egui::Event]) -> Option<egui::Key> {
+    events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key, pressed: true, ..
+        } if !hotkey::is_modifier_key(*key) => Some(*key),
+        _ => None,
+    })
+}
+
 /// 项目地址（「项目地址」按钮打开的那个链接）
 const PROJECT_URL: &str = "https://github.com/HaiSeaman/BBVoxi";
 
@@ -966,77 +1079,8 @@ fn clock(d: std::time::Duration) -> String {
     format!("{:02}:{:02}", d.as_secs() / 60, d.as_secs() % 60)
 }
 
-/// egui 按键 → Windows 虚拟键码（覆盖常用键）
-fn egui_key_to_vk(key: egui::Key) -> Option<u32> {
-    use egui::Key;
-    let vk = match key {
-        Key::Num0 => 0x30,
-        Key::Num1 => 0x31,
-        Key::Num2 => 0x32,
-        Key::Num3 => 0x33,
-        Key::Num4 => 0x34,
-        Key::Num5 => 0x35,
-        Key::Num6 => 0x36,
-        Key::Num7 => 0x37,
-        Key::Num8 => 0x38,
-        Key::Num9 => 0x39,
-        Key::A => 0x41,
-        Key::B => 0x42,
-        Key::C => 0x43,
-        Key::D => 0x44,
-        Key::E => 0x45,
-        Key::F => 0x46,
-        Key::G => 0x47,
-        Key::H => 0x48,
-        Key::I => 0x49,
-        Key::J => 0x4A,
-        Key::K => 0x4B,
-        Key::L => 0x4C,
-        Key::M => 0x4D,
-        Key::N => 0x4E,
-        Key::O => 0x4F,
-        Key::P => 0x50,
-        Key::Q => 0x51,
-        Key::R => 0x52,
-        Key::S => 0x53,
-        Key::T => 0x54,
-        Key::U => 0x55,
-        Key::V => 0x56,
-        Key::W => 0x57,
-        Key::X => 0x58,
-        Key::Y => 0x59,
-        Key::Z => 0x5A,
-        Key::F1 => 0x70,
-        Key::F2 => 0x71,
-        Key::F3 => 0x72,
-        Key::F4 => 0x73,
-        Key::F5 => 0x74,
-        Key::F6 => 0x75,
-        Key::F7 => 0x76,
-        Key::F8 => 0x77,
-        Key::F9 => 0x78,
-        Key::F10 => 0x79,
-        Key::F11 => 0x7A,
-        Key::F12 => 0x7B,
-        Key::Space => 0x20,
-        Key::Enter => 0x0D,
-        Key::Tab => 0x09,
-        Key::Backspace => 0x08,
-        Key::Backtick => 0xC0,
-        Key::Minus => 0xBD,
-        Key::Equals => 0xBB,
-        Key::OpenBracket => 0xDB,
-        Key::CloseBracket => 0xDD,
-        Key::Backslash => 0xDC,
-        Key::Semicolon => 0xBA,
-        Key::Quote => 0xDE,
-        Key::Comma => 0xBC,
-        Key::Period => 0xBE,
-        Key::Slash => 0xBF,
-        _ => return None,
-    };
-    Some(vk)
-}
+// 旧的本地 `egui_key_to_vk` 已删除：它和 hotkey.rs 各维护一份键表，
+// 迟早对不上（分号就是这么坏的）。现在统一走 `hotkey::egui_key_to_vk`。
 
 #[cfg(test)]
 mod tests {
@@ -1083,14 +1127,190 @@ mod tests {
         );
     }
 
+    /// 主键映射必须覆盖主人可能按的各种键，且映射表要认得方向键和符号键
+    /// （旧版本这里只有字母数字和 F1~F12，主人按方向键会被判成"不支持"）。
     #[test]
     fn key_mapping_covers_letters_digits_and_function_keys() {
+        use hotkey::egui_key_to_vk;
         assert_eq!(egui_key_to_vk(egui::Key::A), Some(0x41));
         assert_eq!(egui_key_to_vk(egui::Key::Num1), Some(0x31));
         assert_eq!(egui_key_to_vk(egui::Key::F9), Some(0x78));
         assert_eq!(egui_key_to_vk(egui::Key::Space), Some(0x20));
         assert_eq!(egui_key_to_vk(egui::Key::Backtick), Some(0xC0));
-        assert_eq!(egui_key_to_vk(egui::Key::ArrowDown), None);
+        assert_eq!(egui_key_to_vk(egui::Key::ArrowDown), Some(0x28));
+        assert_eq!(egui_key_to_vk(egui::Key::PageUp), Some(0x21));
+        assert_eq!(egui_key_to_vk(egui::Key::Semicolon), Some(0xBA));
+        // 修饰键自己不是主键（它由钩子记录），映射表里不该有它们
+        assert_eq!(egui_key_to_vk(egui::Key::ControlLeft), None);
+        assert_eq!(egui_key_to_vk(egui::Key::SuperLeft), None);
+    }
+
+    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// 从事件里挑主键时必须**跳过修饰键自己**。
+    ///
+    /// 这是 Ctrl+Win 录不上的直接原因：egui 0.35 会把左右 Ctrl / Win 也作为
+    /// 按键事件发出来，旧代码把它们当主键送进映射表 → 判成"不支持" → 捕捉当场
+    /// 报错并清空半截状态。主人看到的是"我按了 Ctrl，界面就红字报错"。
+    #[test]
+    fn take_main_key_skips_modifier_keys() {
+        // 只按了 Ctrl：修饰键事件必须被跳过，不能当成主键
+        assert_eq!(
+            take_main_key(&[key_event(egui::Key::ControlLeft, true)]),
+            None
+        );
+        assert_eq!(
+            take_main_key(&[key_event(egui::Key::SuperLeft, true)]),
+            None
+        );
+        // Ctrl + A：Ctrl 被跳过，A 就是主键
+        assert_eq!(
+            take_main_key(&[
+                key_event(egui::Key::ControlLeft, true),
+                key_event(egui::Key::A, true)
+            ]),
+            Some(egui::Key::A)
+        );
+        // 松开的事件不算（pressed: false）
+        assert_eq!(take_main_key(&[key_event(egui::Key::A, false)]), None);
+    }
+
+    /// Ctrl+Win 必须能录上，**不管哪根手指先松**。
+    ///
+    /// 旧代码每帧用"此刻按住的修饰键"覆盖记忆：手指一根根松开，最后留下的只是
+    /// 最后松的那根（Ctrl+Win 变成"只剩 Win"），校验器报"纯修饰键组合至少要两个
+    /// 修饰键"。主人折腾半天也存不进去。这里把两种松手顺序都钉死。
+    #[test]
+    fn capture_step_keeps_ctrl_win_regardless_of_release_order() {
+        // 复用 `CTRL_WIN` 常量，同一份数据不写两遍（写两遍就会有一天只改一处、
+        // 测试还全绿）；期望值直接用 `Hotkey::default()` —— 录出来的必须正好是
+        // 出厂默认值，这一条同时把「默认 = Ctrl+Win」钉死在测试里。
+        let ctrl_only = hotkey::Mods {
+            win: false,
+            ..CTRL_WIN
+        };
+        let win_only = hotkey::Mods {
+            ctrl: false,
+            ..CTRL_WIN
+        };
+
+        // 顺序一：先按 Ctrl → 再按 Win → 松开 Ctrl → 再松开 Win
+        let mut pending = None;
+        assert_eq!(capture_step(ctrl_only, None, &mut pending), None);
+        assert_eq!(capture_step(CTRL_WIN, None, &mut pending), None);
+        assert_eq!(
+            capture_step(win_only, None, &mut pending),
+            None,
+            "先松 Ctrl 不能把记忆缩小"
+        );
+        assert_eq!(
+            capture_step(hotkey::Mods::default(), None, &mut pending),
+            Some(Hotkey::default()),
+            "全部松开时必须录到 Ctrl+Win，而不是「只剩 Win」"
+        );
+
+        // 顺序二：先按 Ctrl → 再按 Win → 松开 Win → 再松开 Ctrl
+        let mut pending = None;
+        assert_eq!(capture_step(ctrl_only, None, &mut pending), None);
+        assert_eq!(capture_step(CTRL_WIN, None, &mut pending), None);
+        assert_eq!(
+            capture_step(ctrl_only, None, &mut pending),
+            None,
+            "先松 Win 同样不能缩小记忆"
+        );
+        assert_eq!(
+            capture_step(hotkey::Mods::default(), None, &mut pending),
+            Some(Hotkey::default()),
+            "两种松手顺序都必须录到 Ctrl+Win"
+        );
+    }
+
+    const CTRL_WIN: hotkey::Mods = hotkey::Mods {
+        ctrl: true,
+        alt: false,
+        shift: false,
+        win: true,
+    };
+
+    /// 有主键时立刻成组合，修饰键（含 Win）原样带过去。
+    ///
+    /// 这是 Ctrl+Win 能被录下来的关键：Win 不在 egui 的 `Modifiers` 里，
+    /// 只能从钩子读 —— 这个用例把"读钩子"这件事的结果钉死。
+    #[test]
+    fn capture_with_main_key_combines_hook_modifiers() {
+        let mut pending = None;
+        let got = capture_step(CTRL_WIN, Some(0x31), &mut pending).expect("按下主键就该成组合");
+        assert_eq!(
+            got,
+            Hotkey {
+                ctrl: true,
+                alt: false,
+                shift: false,
+                win: true,
+                vk: 0x31,
+            }
+        );
+        assert_eq!(hotkey::parse(&got.to_config()).unwrap(), got);
+        assert!(pending.is_none(), "已经录完了，不该再留半截状态");
+    }
+
+    /// 纯修饰键组合：手指全松开的那一刻才算录完。
+    #[test]
+    fn capture_commits_pure_modifier_combo_on_release() {
+        let mut pending = None;
+        assert_eq!(
+            capture_step(CTRL_WIN, None, &mut pending),
+            None,
+            "还按着不放，不能提前定案（也许主人还要补个主键）"
+        );
+        assert_eq!(pending, Some(CTRL_WIN), "要先记住凑齐了什么");
+
+        let got =
+            capture_step(hotkey::Mods::default(), None, &mut pending).expect("全部松手就该成组合");
+        assert_eq!(got.to_config(), "ctrl+win");
+        assert_eq!(got.display(), "Ctrl + Win");
+        assert!(pending.is_none(), "定案后必须清空，否则下一帧会再报一次");
+        assert_eq!(
+            capture_step(hotkey::Mods::default(), None, &mut pending),
+            None,
+            "清空之后不能重复触发"
+        );
+    }
+
+    /// 只按一个修饰键 → 不合法，由 `commit_hotkey` 里的校验器挡下来。
+    /// 这里守住"录到的候选确实会被挡"这件事，否则会悄悄存下一个没法用的快捷键。
+    #[test]
+    fn capture_rejects_single_modifier() {
+        let mut pending = None;
+        let ctrl_only = hotkey::Mods {
+            ctrl: true,
+            ..hotkey::Mods::default()
+        };
+        assert_eq!(capture_step(ctrl_only, None, &mut pending), None);
+        let got = capture_step(hotkey::Mods::default(), None, &mut pending).expect("松手后成候选");
+        assert!(
+            hotkey::parse(&got.to_config()).is_err(),
+            "只按一个修饰键必须被挡下来"
+        );
+    }
+
+    /// 空手点一下「重新录制」又原样松开，什么都不该录到。
+    #[test]
+    fn capture_without_any_key_records_nothing() {
+        let mut pending = None;
+        assert_eq!(
+            capture_step(hotkey::Mods::default(), None, &mut pending),
+            None
+        );
+        assert!(pending.is_none());
     }
 
     #[test]

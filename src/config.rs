@@ -153,7 +153,10 @@ impl Default for Config {
         Self {
             version: 1,
             provider: Provider::default(),
-            hotkey: "ctrl+1".into(),
+            // 默认「Ctrl + Win」：这个组合在 Windows 上几乎没有程序占用，
+            // 又是纯修饰键组合（不需要再记一个主键），按住说话最顺手。
+            // 左右 Ctrl 都认（见 hotkey 模块的说明）。
+            hotkey: "ctrl+win".into(),
             qwen: QwenConfig::default(),
             doubao: DoubaoConfig::default(),
             tencent: TencentConfig::default(),
@@ -162,8 +165,52 @@ impl Default for Config {
     }
 }
 
+/// 老版本的默认快捷键（Ctrl + `）。
+///
+/// 用它来判断"主人从没改过快捷键"：只要配置里的值解析出来还是这个组合，
+/// 就说明是旧版留下的默认值。比字符串比较稳（大小写、写法差异都能认出来）。
+fn legacy_default_hotkey() -> crate::hotkey::Hotkey {
+    crate::hotkey::Hotkey {
+        ctrl: true,
+        alt: false,
+        shift: false,
+        win: false,
+        vk: 0xC0,
+    }
+}
+
+/// 把旧默认值升级成新版默认值（Ctrl + Win），返回是否改动了配置。
+///
+/// 为什么必须有这一步：只改 `Config::default()` 救不了**已经存在的配置文件** ——
+/// 程序启动是"文件在就用文件里的值"，于是主人升级后打开一看还是老快捷键，
+/// 怎么改代码都没用。这是"我明明让你改了、你就是没改"的直接原因。
+/// 主人自己改过的任何组合都会原样保留，只有"一次都没动过"的旧默认值才升级。
+fn migrate_legacy_default_hotkey(cfg: &mut Config) -> bool {
+    let Ok(old) = crate::hotkey::parse(&cfg.hotkey) else {
+        return false;
+    };
+    if old != legacy_default_hotkey() {
+        return false;
+    }
+    cfg.hotkey = Config::default().hotkey;
+    true
+}
+
 fn dir() -> Result<PathBuf> {
     dirs::config_dir().context("无法定位系统配置目录")
+}
+
+/// 原子写用的临时文件路径：文件名带上进程 id。
+///
+/// 为什么必须带 pid：以前固定叫 `config.json.tmp`，两个实例同时保存（或同一实例里
+/// 启动时的迁移写回与设置窗保存撞在一起）会互相覆盖这一个临时文件，可能把对方写到
+/// 一半的半截内容改名成正式配置 —— 配置损坏、API Key 丢失。带上 pid 后各写各的。
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!("{stem}.{}.tmp", std::process::id()))
 }
 
 /// 返回 (配置, 是否首次运行即配置文件不存在)
@@ -172,11 +219,33 @@ pub fn load_or_default() -> Result<(Config, bool)> {
     if !file.exists() {
         return Ok((Config::default(), true));
     }
-    let text = std::fs::read_to_string(&file)
-        .with_context(|| format!("读取配置失败: {}", file.display()))?;
+    // 读失败（文件被写坏成非法 UTF-8、权限被拒、被独占锁住等）也回退默认值，而不是把
+    // 错误往上抛：main 里的 `?` 传播出去后，release 版是 windows_subsystem="windows"，
+    // 既没有控制台也不会写日志，主人只看到"双击毫无反应"，连哪里坏了都不知道。
+    // 语义注意：只有"文件不存在"才算首次运行，读失败**不算**（不能拿它当首次运行处理）。
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::log::log(format!(
+                "读取配置文件失败（{}），已回退默认配置: {e}",
+                file.display()
+            ));
+            return Ok((Config::default(), false));
+        }
+    };
     // ponytail: 配置损坏时回退默认值，不让用户被一个坏文件卡死
     match serde_json::from_str::<Config>(&text) {
-        Ok(cfg) => Ok((cfg, false)),
+        Ok(mut cfg) => {
+            if migrate_legacy_default_hotkey(&mut cfg) {
+                crate::log::log("旧默认快捷键 Ctrl+` 已升级为 Ctrl+Win（可在设置窗口里改）");
+                if let Err(e) = cfg.save() {
+                    // 写回失败不影响这次启动：内存里已经是新值，下次启动会再试一遍。
+                    // 但必须留下痕迹 —— 否则主人下次开还是老快捷键，又会以为"没改"。
+                    crate::log::log(format!("升级快捷键后写回配置失败: {e}"));
+                }
+            }
+            Ok((cfg, false))
+        }
         Err(e) => {
             // 不能用 eprintln!：release 下 windows_subsystem="windows"，没有控制台，
             // 这一行会直接消失。这里不是"恢复默认"就完了 —— 主人需要知道凭据为什么没了。
@@ -200,7 +269,7 @@ impl Config {
         // 直接覆盖写的话，写到一半崩溃/断电会留下半截坏文件，下次启动只能
         // 静默回退默认配置（凭据全丢）。同卷内的改名是原子的：要么旧文件，
         // 要么完整的新文件，不会出现"半截"状态。
-        let tmp = path.with_extension("json.tmp");
+        let tmp = temp_path(path);
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -238,6 +307,83 @@ mod tests {
         assert_eq!(cfg.qwen.model, QWEN_MODEL);
         assert_eq!(cfg.doubao.resource_id, DOUBAO_RESOURCE);
         assert_eq!(cfg.tencent.engine_model_type, "Hy-ASR-3.0-preview");
+    }
+
+    /// 默认快捷键必须是「Ctrl + Win」，而且必须真的能解析出来 ——
+    /// 默认值写错一个词，首次启动就会在日志里报"快捷键无法解析"并悄悄回退。
+    #[test]
+    fn default_hotkey_is_ctrl_win() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkey, "ctrl+win");
+        let hk = crate::hotkey::parse(&cfg.hotkey).expect("默认快捷键必须能解析");
+        assert!(hk.ctrl && hk.win && !hk.alt && !hk.shift);
+        assert!(hk.is_pure_modifiers(), "默认组合不该带主键");
+        assert_eq!(hk.display(), "Ctrl + Win");
+        assert_eq!(hk.to_config(), cfg.hotkey, "存回配置还要是同一个写法");
+    }
+
+    /// 旧版默认值 Ctrl+` 必须自动升级成 Ctrl+Win。
+    ///
+    /// 这是主人"改了默认值却看不到变化"的根因：程序用已存在的配置文件里的值，
+    /// 改代码里的默认值对它无效。这条测试守住升级这件事真的会发生。
+    #[test]
+    fn migrates_legacy_default_hotkey_to_ctrl_win() {
+        let mut cfg = Config {
+            hotkey: "ctrl+`".into(),
+            ..Config::default()
+        };
+        assert!(
+            migrate_legacy_default_hotkey(&mut cfg),
+            "旧默认值必须被升级"
+        );
+        assert_eq!(cfg.hotkey, "ctrl+win");
+        assert!(
+            !migrate_legacy_default_hotkey(&mut cfg),
+            "已经升级过就不能再动，否则每次启动都写一遍配置"
+        );
+    }
+
+    /// 主人自己改过的组合，一个都不许动。
+    ///
+    /// 升级逻辑最容易犯的错就是"顺手把别人的设置也改了"：那样主人配好的
+    /// Alt+Q 会在某次启动后悄悄变成 Ctrl+Win，而界面上不会有任何提示。
+    #[test]
+    fn migration_leaves_user_hotkeys_alone() {
+        for user in [
+            "ctrl+alt+a",
+            "f9",
+            "shift+win",
+            "ctrl+shift",
+            "alt+1",
+            "ctrl+win",
+        ] {
+            let mut cfg = Config {
+                hotkey: user.into(),
+                ..Config::default()
+            };
+            assert!(
+                !migrate_legacy_default_hotkey(&mut cfg),
+                "{user} 不该被改写"
+            );
+            assert_eq!(cfg.hotkey, user, "{user} 必须原样保留");
+        }
+    }
+
+    /// 升级后的配置要能真的存下来、读回来还是新值（否则只是内存里好看）。
+    #[test]
+    fn migrated_hotkey_survives_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("bbvoxi_migrate_{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = Config {
+            hotkey: "ctrl+`".into(),
+            ..Config::default()
+        };
+        assert!(migrate_legacy_default_hotkey(&mut cfg));
+        cfg.save_to(&path).unwrap();
+        let back: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.hotkey, "ctrl+win");
+        let hk = crate::hotkey::parse(&back.hotkey).unwrap();
+        assert!(hk.ctrl && hk.win && hk.is_pure_modifiers());
     }
 
     #[test]
@@ -307,23 +453,40 @@ mod tests {
             ..Default::default()
         };
         original.save_to(&path).unwrap();
-        assert!(
-            !path.with_extension("json.tmp").exists(),
-            "保存成功后不该留下临时文件"
-        );
+        assert!(!temp_path(&path).exists(), "保存成功后不该留下临时文件");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        // 制造写入失败：在临时文件该在的位置放一个同名目录，写它必然失败
-        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        // 制造写入失败：在临时文件该在的位置放一个同名目录，写它必然失败。
+        // 临时路径必须用 temp_path 算（带进程 id）：否则造出的障碍位置和程序真正
+        // 写的位置对不上，这条测试就退化成"永远通过"，再坏也发现不了。
+        std::fs::create_dir(temp_path(&path)).unwrap();
         let broken = Config {
             provider: Provider::Tencent,
             ..Default::default()
         };
-        assert!(broken.save_to(&path).is_err(), "写临时文件失败时必须如实报错");
+        assert!(
+            broken.save_to(&path).is_err(),
+            "写临时文件失败时必须如实报错"
+        );
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, before, "保存失败时旧配置必须原封不动");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 临时文件名必须带上进程 id。
+    ///
+    /// 守的是"两个实例同时保存不会互相覆盖临时文件"：固定名字下，一方可能把另一方
+    /// 写到一半的半截内容改名成正式配置（配置损坏、API Key 丢失）。
+    #[test]
+    fn temp_path_carries_process_id() {
+        let path = std::path::Path::new("config.json");
+        let tmp = temp_path(path);
+        assert_eq!(
+            tmp.file_name().unwrap().to_str().unwrap(),
+            format!("config.{}.tmp", std::process::id())
+        );
+        assert_ne!(tmp, path, "临时文件不能就是目标文件本身（否则没有原子性）");
     }
 }

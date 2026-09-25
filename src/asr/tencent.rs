@@ -68,16 +68,30 @@ fn parse_json(text: &str) -> Parsed {
     // 注意 `finished` 要跟着文本一起上报：腾讯会把 `final=1` 和最后一句的文本
     // 放进同一个包。若这里只判 slice_type，这一包就被当成普通文本，
     // 会话永远等不到结束 —— 主人松手后要白等满 8 秒超时。
+    // `id: None`：腾讯的协议里没有句子编号，无法按编号去重（见 `Transcript`）。
     match slice_type {
         2 if !text.is_empty() => Parsed::Text {
             kind: Kind::Final,
             text,
             finished: is_final,
+            id: None,
         },
         1 if !text.is_empty() => Parsed::Text {
             kind: Kind::Partial,
             text,
             finished: is_final,
+            id: None,
+        },
+        // 首帧：腾讯会把 slice_type 报成 0（还不是稳态），但**已经带上了识别文本**。
+        // 以前这里直接落到下面的 `_ if is_final => Finished` / `_ => Ignored`，
+        // 这一整段文本就被丢掉了 —— 短音频（只有首帧就结束）的主人会看到
+        // "没有识别到内容"。所以这里必须把文本补上：非终包按中间结果报，
+        // 终包按定稿（finished=true）报，否则会话还得多等 8 秒超时。
+        0 if !text.is_empty() => Parsed::Text {
+            kind: if is_final { Kind::Final } else { Kind::Partial },
+            text,
+            finished: is_final,
+            id: None,
         },
         _ if is_final => Parsed::Finished,
         _ => Parsed::Ignored,
@@ -279,21 +293,81 @@ mod tests {
     /// `slice_type` 的合法值只有 0/1/2；字段缺失必须按 0（"不是稳态/终态"）
     /// 处理，落到与 0 相同的分支，绝不能因为"字段没来"就当成别的东西。
     ///
-    /// 注意这条用例**不是**用来区分 `unwrap_or(0)` 和 `unwrap_or(-1)` 的 ——
-    /// 在当前这组分支里两者结果一样。它守的是分支本身：将来有人给 0 或负值
-    /// 加上文本分支时，这里会立刻红。
+    /// 0 的情况后来加上了文本分支（首帧就带文本，见下面两条用例），所以这里的
+    /// 期望随之变成"按 0 分支处理"：非终包是中间结果、终包是定稿。它守的仍然是
+    /// "缺字段落到 0 分支"，而不是被当成某个别的值。
     #[test]
     fn missing_slice_type_stays_in_the_value_domain() {
-        // 缺 slice_type、有文本、非终包 → 按 0 → 不进任何文本分支
-        assert!(matches!(
-            parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":0}"#),
-            Parsed::Ignored
-        ));
-        // 缺 slice_type、有文本、是终包 → 结束（文本分支要求 slice_type 为 1 或 2）
-        assert!(matches!(
-            parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":1}"#),
-            Parsed::Finished
-        ));
+        // 缺 slice_type、有文本、非终包 → 按 0 → 中间结果
+        match parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":0}"#) {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+                ..
+            } => {
+                assert_eq!(kind, Kind::Partial);
+                assert_eq!(text, "你好");
+                assert!(!finished);
+            }
+            other => panic!("缺 slice_type 应落到 0 分支（中间结果），实际：{other:?}"),
+        }
+        // 缺 slice_type、有文本、是终包 → 按 0 分支 → 定稿并结束
+        match parse_json(r#"{"code":0,"result":{"voice_text_str":"你好"},"final":1}"#) {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+                ..
+            } => {
+                assert_eq!(kind, Kind::Final);
+                assert_eq!(text, "你好");
+                assert!(finished);
+            }
+            other => panic!("缺 slice_type 应落到 0 分支（定稿），实际：{other:?}"),
+        }
+    }
+
+    /// 回归（"没有识别到内容"）：`slice_type == 0`（首帧）且带文本时，
+    /// 非终包必须按中间结果上报，不能被无条件丢掉。
+    #[test]
+    fn first_slice_with_text_is_reported_as_partial() {
+        match parse_json(
+            r#"{"code":0,"result":{"slice_type":0,"voice_text_str":"你好"},"final":0}"#,
+        ) {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+                ..
+            } => {
+                assert_eq!(kind, Kind::Partial);
+                assert_eq!(text, "你好");
+                assert!(!finished);
+            }
+            other => panic!("首帧带文本应按中间结果上报，实际：{other:?}"),
+        }
+    }
+
+    /// 回归（"没有识别到内容"）：`slice_type == 0` 且这一包就是终包时，
+    /// 必须按定稿（`finished: true`）上报 —— 否则整段文本连同结束标记一起消失。
+    #[test]
+    fn final_first_slice_with_text_is_reported_as_final() {
+        match parse_json(
+            r#"{"code":0,"result":{"slice_type":0,"voice_text_str":"你好"},"final":1}"#,
+        ) {
+            Parsed::Text {
+                kind,
+                text,
+                finished,
+                ..
+            } => {
+                assert_eq!(kind, Kind::Final);
+                assert_eq!(text, "你好");
+                assert!(finished, "终包标记必须一起上报，否则会话白等 8 秒");
+            }
+            other => panic!("终态首帧带文本应按定稿上报，实际：{other:?}"),
+        }
     }
 
     #[test]

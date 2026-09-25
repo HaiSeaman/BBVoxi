@@ -37,12 +37,23 @@ fn main() -> Result<()> {
     // --settings：即使已配置也直接打开设置窗（方便手动查看/排障）
     let force_settings = std::env::args().any(|a| a == "--settings");
     let (win_w, win_h, win_pos) = window_geometry();
+    // 只有「第一次运行（还没配过密钥）」「显式 --settings」和「主人自己双击 exe」
+    // 才需要露脸；**开机自启一个弹窗都不许有**，直接静默缩到托盘后台。
+    // 区分"开机自启"和"双击"靠：启动项里的 --autostart 参数，或"老格式启动项 +
+    // 系统刚开机"（见 `autostart::launched_at_boot`）。只看注册表里有没有我们的路径
+    // 会把"手动双击"也误判成自启，窗口一个都不弹。
+    let autostart_launch = autostart::launched_at_boot();
+    let start_visible = first_run || force_settings || !autostart_launch;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([win_w, win_h])
             .with_min_inner_size([460.0, 560.0])
-            .with_position(win_pos)
-            .with_visible(first_run || force_settings)
+            .with_position(if start_visible { win_pos } else { HIDDEN_POS })
+            // 光靠这一句**不够**：eframe 在首帧渲染完之后会无条件
+            // `window.set_visible(true)`（见 epi_integration::post_rendering），
+            // 那一下会把窗口顶出来。真正的隐藏靠 App::logic 里每帧补发的
+            // Visible(false)，这里配合把窗口建在屏幕外，让那一帧也看不见。
+            .with_visible(start_visible)
             .with_icon(window_icon()),
         ..Default::default()
     };
@@ -53,11 +64,30 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             setup_cjk_font(&cc.egui_ctx);
             ui::setup_style(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc, cfg, force_settings, wake)))
+            Ok(Box::new(App::new(
+                cc,
+                cfg,
+                force_settings,
+                start_visible,
+                win_pos,
+                wake,
+            )))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("启动界面失败：{e}"))
+    .map_err(|e| {
+        // release 版是 windows_subsystem="windows"，没有控制台；直接把错误抛出去
+        // 主人只会看到"双击毫无反应"，连哪一步挂了都不知道。先写日志再返回。
+        log::log(format!("启动界面失败：{e}"));
+        anyhow::anyhow!("启动界面失败：{e}")
+    })
 }
+
+/// 启动时不需要露脸就把窗口建在屏幕外，避免首个渲染帧被 eframe 强行显示时闪一下。
+/// 这里是 Windows 上沿用多年的「藏窗口」坐标，远在虚拟桌面之外。
+const HIDDEN_POS: [f32; 2] = [-32000.0, -32000.0];
+
+/// 托盘创建失败后的重试间隔（见 `App::logic`）
+const TRAY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 跨实例唤醒：第二个实例通过命名事件通知第一个实例打开设置窗。
 /// 事件创建失败只损失该功能（返回 None），不影响主流程。
@@ -85,12 +115,9 @@ impl WakeEvent {
     fn signal_running_instance() {
         use windows::Win32::System::Threading::{CreateEventW, SetEvent};
         unsafe {
-            if let Ok(h) = CreateEventW(
-                None,
-                false,
-                false,
-                windows::core::w!("BBVoxi_ShowSettings"),
-            ) {
+            if let Ok(h) =
+                CreateEventW(None, false, false, windows::core::w!("BBVoxi_ShowSettings"))
+            {
                 let _ = SetEvent(h);
             }
         }
@@ -158,7 +185,13 @@ fn single_instance_lock() -> bool {
                 Box::leak(Box::new(h)); // 进程存活期间保持持有
                 !already
             }
-            _ => true,
+            _ => {
+                // CreateMutexW 失败（极少见）时按"首个实例"继续跑：不能因为一次失败就
+                // 不让主人用程序。但这意味着可能真跑出两个实例（双托盘、双键盘钩子），
+                // 必须在日志里留下明确记录，否则这种怪现象根本无从排查。
+                log::log("创建单实例互斥量失败，按首个实例继续启动（可能与其它实例共存）");
+                true
+            }
         }
     }
 }
@@ -199,7 +232,9 @@ struct App {
     shared: Arc<Shared>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
     tray: Option<TrayIcon>,
-    tray_failed: bool,
+    /// 上一次创建托盘失败的时刻（None = 还没失败过）。失败后要退避重试，见 `logic`：
+    /// 托盘是开机静默启动后**唯一**的可见入口，永久放弃等于主人再也看不到任何界面。
+    tray_failed_at: Option<std::time::Instant>,
     tray_state: TrayState,
     /// 上一次写入托盘菜单的录音状态（None = 尚未设置过）
     tray_recording: Option<bool>,
@@ -207,8 +242,18 @@ struct App {
     tray_tooltip: Option<String>,
     /// 启动时要求把设置窗置前（--settings）
     focus_once: bool,
-    /// 下一帧把设置窗抢到前台（刚显示的窗口立刻 SetForegroundWindow 会失败）
-    pending_focus: bool,
+    /// 「请求把设置窗抢到前台」时记下的帧号；只在帧号**变大之后**才真的发 Focus。
+    /// 为什么记帧号而不是一个 bool：在同一个 `logic()` 里刚 `Visible(true)` 就紧接着
+    /// 发 `Focus` 时，窗口还没真正显示出来，SetForegroundWindow 经常失败（表现为
+    /// "窗口开了但压在别的窗口下面"）。必须至少跨过一帧再抢。
+    pending_focus_at: Option<u64>,
+    /// 窗口现在**应该**是可见的吗（false = 常驻后台，只在托盘里有）
+    shown: bool,
+    /// 是否显示过一次。启动时窗口建在屏幕外，第一次显示才需要搬回居中；
+    /// 之后再显示就不搬了，免得把主人自己拖到的位置又拽回来。
+    ever_shown: bool,
+    /// 正常居中的窗口位置（见 `window_geometry`）
+    win_pos: [f32; 2],
     /// 重复启动 exe 时的唤醒通道
     wake: Option<WakeEvent>,
     open_item: MenuItem,
@@ -221,9 +266,15 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         cfg: Config,
         force_settings: bool,
+        start_visible: bool,
+        win_pos: [f32; 2],
         wake: Option<WakeEvent>,
     ) -> Self {
-        log::log("BBVoxi 启动");
+        log::log(if start_visible {
+            "BBVoxi 启动（显示设置窗）"
+        } else {
+            "BBVoxi 启动（静默后台，不弹窗）"
+        });
         let shared = Arc::new(Shared::new(cc.egui_ctx.clone()));
         let cfg_shared = Arc::new(Mutex::new(cfg.clone()));
         let cmd_tx = session::spawn(cfg_shared.clone(), shared.clone());
@@ -233,7 +284,7 @@ impl App {
             Ok(hk) => hk,
             Err(e) => {
                 log::log(format!(
-                    "快捷键配置「{}」无法解析（{e}），已回退默认 Ctrl+1",
+                    "快捷键配置「{}」无法解析（{e}），已回退默认 Ctrl+Win",
                     cfg.hotkey
                 ));
                 hotkey::Hotkey::default()
@@ -256,12 +307,15 @@ impl App {
             shared,
             cmd_tx,
             tray: None,
-            tray_failed: false,
+            tray_failed_at: None,
             tray_state: TrayState::Idle,
             tray_recording: None,
             tray_tooltip: None,
             focus_once: force_settings,
-            pending_focus: false,
+            pending_focus_at: None,
+            shown: start_visible,
+            ever_shown: start_visible,
+            win_pos,
             wake,
             open_item: MenuItem::new("打开设置", true, None),
             record_item: MenuItem::new("开始录音", true, None),
@@ -284,8 +338,28 @@ impl App {
     /// 弹出设置窗。焦点下一帧再抢：刚显示的窗口立刻 SetForegroundWindow
     /// 在 Windows 上经常失败，表现为"窗口开了但压在其他窗口下面"。
     fn show_settings(&mut self, ctx: &egui::Context) {
+        // 静默启动时窗口是建在屏幕外的（见 HIDDEN_POS），第一次露脸要先搬回居中。
+        // 只在第一次搬：之后主人把它拖到哪儿，下次打开就还在哪儿。
+        if !self.ever_shown {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                self.win_pos[0],
+                self.win_pos[1],
+            )));
+        }
+        self.ever_shown = true;
+        self.shown = true;
+        // 显示之前先解除最小化：窗口处于最小化状态时 winit 会跳过抢焦点，
+        // 主人把设置窗最小化后，从托盘"打开设置"或双击 exe 都恢复不回来。
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        self.pending_focus = true;
+        // 抢前台至少延后一帧（原因见 `pending_focus_at` 的注释）
+        self.pending_focus_at = Some(ctx.cumulative_pass_nr());
+    }
+
+    /// 收起窗口到托盘（进程继续在后台跑）
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.shown = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     /// 托盘图标与菜单文案跟随录音状态
@@ -335,12 +409,35 @@ impl App {
 impl eframe::App for App {
     /// eframe 0.35：窗口隐藏时仍会调用 logic，托盘状态都在这里维护
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.tray.is_none() && !self.tray_failed {
+        // 会话线程请求显示设置窗（例如录音失败、结果改放剪贴板，得让主人看见提示）。
+        // 必须放在下面那句 `Visible(false)` **之前**：`show_settings` 会把 `shown`
+        // 置回 true，同一帧就不会再被"收起"的补发盖掉（这正是这个请求位的意义）。
+        if self.shared.take_show_request() {
+            self.show_settings(ctx);
+        }
+
+        // 「启动后直接缩在后台」这件事必须在这里补发，不能只靠 NativeOptions 的
+        // `with_visible(false)`：eframe 在首帧渲染完之后会**无条件**把窗口设成可见
+        // （epi_integration::post_rendering），那一下会盖掉我们的隐藏请求。
+        // 窗口隐藏时 eframe 照常每帧调用 logic，所以这里补发一定生效。
+        if !self.shown {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // 托盘是开机静默启动后**唯一**的可见入口：创建失败不能永久放弃（那样主人从此
+        // 看不到任何界面），改为每 30 秒退避重试一次，等托盘服务恢复后自动补上。
+        let tray_retry_due = self
+            .tray_failed_at
+            .map_or(true, |t| t.elapsed() >= TRAY_RETRY_INTERVAL);
+        if self.tray.is_none() && tray_retry_due {
             match self.build_tray() {
-                Ok(t) => self.tray = Some(t),
+                Ok(t) => {
+                    self.tray = Some(t);
+                    self.tray_failed_at = None;
+                }
                 Err(e) => {
-                    log::log(format!("创建托盘图标失败：{e}"));
-                    self.tray_failed = true;
+                    log::log(format!("创建托盘图标失败（30 秒后重试）：{e}"));
+                    self.tray_failed_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -366,17 +463,20 @@ impl eframe::App for App {
             self.show_settings(ctx);
         }
 
-        // 上一帧刚显示了窗口，现在抢前台（时机见 show_settings 的注释）
-        if self.pending_focus {
-            self.pending_focus = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // 抢前台：只有真的**跨过了一帧**才发 Focus（时机见 `pending_focus_at` 的注释）。
+        // 同一个 logic() 里 `Visible(true)` 与 `Focus` 同帧下发，经常抢不到前台。
+        if let Some(at) = self.pending_focus_at {
+            if ctx.cumulative_pass_nr() > at {
+                self.pending_focus_at = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
         }
 
         // 关闭按钮 = 隐藏到托盘，不退出进程
         if ctx.input(|i| i.viewport().close_requested()) {
             self.settings.cancel_capture();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hide_window(ctx);
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {

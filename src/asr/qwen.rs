@@ -98,11 +98,14 @@ fn parse_json(text: &str, ready: &mut bool) -> Parsed {
             } else {
                 Kind::Partial
             };
-            // 千问的结束是单独一条 task-finished，不会跟文本同包
+            // 千问的结束是单独一条 task-finished，不会跟文本同包。
+            // `sentence_id` 用来对"同一句被重复上报"做幂等（见 `Transcript`）：
+            // 没有它，服务端把某句的定稿多发一次，主人屏幕上就是同一句两遍。
             Parsed::Text {
                 kind,
                 text,
                 finished: false,
+                id: sentence["sentence_id"].as_i64(),
             }
         }
         _ => Parsed::Ignored,
@@ -144,7 +147,10 @@ mod tests {
             ),
             Parsed::Ignored
         ));
-        assert!(ready, "task-started 必须把 ready 置起来（否则不会开始送音频）");
+        assert!(
+            ready,
+            "task-started 必须把 ready 置起来（否则不会开始送音频）"
+        );
 
         let finished = parse_json(
             r#"{"header":{"event":"task-finished"},"payload":{}}"#,
@@ -179,9 +185,14 @@ mod tests {
             r#"{"header":{"event":"result-generated"},"payload":{"output":{"sentence":{"text":"今天天气不错。","sentence_end":true,"sentence_id":1}},"usage":{"duration":3}}}"#,
         );
         match fin {
-            Parsed::Text { kind, text, .. } => {
+            Parsed::Text { kind, text, id, .. } => {
                 assert_eq!(kind, Kind::Final);
                 assert_eq!(text, "今天天气不错。");
+                assert_eq!(
+                    id,
+                    Some(1),
+                    "必须把 sentence_id 带出来：没有它，同一句被重复上报时就会多打一份字"
+                );
             }
             _ => panic!("应解析出最终结果"),
         }

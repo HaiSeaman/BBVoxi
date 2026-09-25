@@ -52,34 +52,62 @@ fn push_modifier_reset(buf: &mut Vec<INPUT>) {
     }
 }
 
-pub fn type_text(text: &str) -> Result<()> {
+/// 逐字注入。返回值 = **实际提交成功的 UTF-16 编码单元数**（`\r` 不计入）。
+///
+/// 为什么不只返回 Ok/Err：`SendInput` 只保证"事件进了系统队列"，目标程序
+/// 完全可能只收下一部分（被 UIPI 拦、队列满、程序自己吞掉）。上层 `typer`
+/// 必须知道这段文字到底进去多少 —— 没进去的尾巴才有机会改走剪贴板补上；
+/// 只凭 Ok 就当整段成功，会让主人眼看着"打出去了"其实丢了半句。
+pub fn type_text(text: &str) -> Result<usize> {
     if text.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let mut buf: Vec<INPUT> = Vec::with_capacity(BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len());
     push_modifier_reset(&mut buf);
+    // 修饰键重置只出现在第一个批次里，换算"提交了几个字符"时要先把它扣掉
+    let mut header = crate::hotkey::MODIFIERS.len();
+    let mut committed = 0usize; // 已确认提交成功的编码单元数
+    let mut batch_units = 0usize; // 当前批次里已排入的编码单元数
     for unit in text.encode_utf16() {
         match unit {
-            0x0A => {
-                push_key(&mut buf, VK_RETURN, 0, false);
-                push_key(&mut buf, VK_RETURN, 0, true);
-            }
+            // 回车/Tab 走命名键，但必须带真实扫描码：只读扫描码的程序
+            // （游戏、部分远程桌面）看不见 wScan=0 的键，会出现"字打了、换行却没反应"。
+            0x0A => push_key_stroke(&mut buf, VK_RETURN),
             0x0D => continue, // \r\n 里只处理 \n
-            0x09 => {
-                push_key(&mut buf, VK_TAB, 0, false);
-                push_key(&mut buf, VK_TAB, 0, true);
-            }
+            0x09 => push_key_stroke(&mut buf, VK_TAB),
             _ => {
                 // UTF-16 编码单元直接送，代理对天然被拆成两次，生僻字/emoji 也能输入
                 push_unicode(&mut buf, unit, false);
                 push_unicode(&mut buf, unit, true);
             }
         }
+        batch_units += 1;
         if buf.len() >= BATCH_CHARS * 2 {
-            flush(&mut buf)?;
+            committed += flush_batch(&mut buf, batch_units, header)?;
+            header = 0;
+            batch_units = 0;
         }
     }
-    flush(&mut buf)
+    committed += flush_batch(&mut buf, batch_units, header)?;
+    Ok(committed)
+}
+
+/// `type_text` 的提交计数口径：UTF-16 编码单元里除去 `\r` 的数量。
+/// 调用方拿它当"期望值"，和 `type_text` 的返回值比对，才知道有没有打全。
+pub fn typeable_units(text: &str) -> usize {
+    text.encode_utf16().filter(|u| *u != 0x0D).count()
+}
+
+/// 提交一个批次，并把"内核实际接受的事件数"换算成**编码单元数**返回。
+fn flush_batch(buf: &mut Vec<INPUT>, units: usize, header: usize) -> Result<usize> {
+    let expected = buf.len();
+    let sent = flush(buf)?;
+    if sent >= expected {
+        return Ok(units);
+    }
+    // 只进去一部分：每单元 2 个事件，先扣掉不占字符的修饰键重置头。
+    // 返回真实提交数，让上层只对没进去的那段尾巴做兜底，避免重复粘贴。
+    Ok(sent.saturating_sub(header) / 2)
 }
 
 /// 剪贴板粘贴：注入一次 `Ctrl+V`。
@@ -99,7 +127,9 @@ pub fn type_text(text: &str) -> Result<()> {
 pub fn paste() -> Result<()> {
     let mut buf: Vec<INPUT> = Vec::with_capacity(crate::hotkey::MODIFIERS.len() * 2 + 5);
     paste_events(&mut buf);
-    flush(&mut buf)
+    // 粘贴是一串有先后的按键（Ctrl↓ V↓ V↑ Ctrl↑），只进去一半会留下卡住的 Ctrl，
+    // 所以这里要求整批都必须成功，不能用"部分成功也算过"的宽松口径。
+    flush_all(&mut buf)
 }
 
 /// 组装一次粘贴的按键序列（与 `paste` 分开，便于单测校验顺序与扫描码）
@@ -116,8 +146,22 @@ fn paste_events(buf: &mut Vec<INPUT>) {
 
 /// 虚拟键码 → 扫描码。查不到时返回 0，此时事件依然合法
 /// （与逐字注入的做法一致），只是读扫描码的程序看不到它。
+/// 这里用的 `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)` 就是"查不到时"的兜底来源：
+/// 它是 Windows 自己给的映射表，比我们手写一张表更靠谱。
 fn scan_code(vk: VIRTUAL_KEY) -> u16 {
     unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) as u16 }
+}
+
+/// 追加一次"按下+松开"，扫描码统一由 `scan_code` 取真实值。
+///
+/// 为什么专门抽出来：退格/回车/Tab 这类命名键以前传的是 `wScan = 0`，
+/// 而只读扫描码的程序（游戏、部分远程桌面）根本看不见它们 ——
+/// 会出现"字打出去了、退格却删不掉，回车也不换行"。这里和 `paste_events`
+/// 用同一套真实扫描码，两条路径的口径就一致了。
+fn push_key_stroke(buf: &mut Vec<INPUT>, vk: VIRTUAL_KEY) {
+    let scan = scan_code(vk);
+    push_key(buf, vk, scan, false);
+    push_key(buf, vk, scan, true);
 }
 
 /// 退格删除：实时输入时用来回退被识别修正的文字
@@ -128,13 +172,12 @@ pub fn backspace(count: usize) -> Result<()> {
     let mut buf: Vec<INPUT> = Vec::with_capacity(BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len());
     push_modifier_reset(&mut buf);
     for _ in 0..count {
-        push_key(&mut buf, VK_BACK, 0, false);
-        push_key(&mut buf, VK_BACK, 0, true);
+        push_key_stroke(&mut buf, VK_BACK);
         if buf.len() >= BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len() {
-            flush(&mut buf)?;
+            flush_all(&mut buf)?;
         }
     }
-    flush(&mut buf)
+    flush_all(&mut buf)
 }
 
 fn push_unicode(buf: &mut Vec<INPUT>, scan: u16, keyup: bool) {
@@ -171,19 +214,37 @@ fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT
     }
 }
 
-fn flush(buf: &mut Vec<INPUT>) -> Result<()> {
+/// 把一批事件交给系统，返回**内核实际接受的事件数**。
+///
+/// 一个都没进去时按错误抛出（含 UIPI 拦截）；只进去一部分时返回实际数量，
+/// 由调用方自己决定怎么办 —— 对逐字注入来说"少打几个字"不算整批失败，
+/// 可以把没进去的尾巴改走剪贴板；对粘贴/退格这类按键序列则不能将就。
+fn flush(buf: &mut Vec<INPUT>) -> Result<usize> {
     if buf.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let expected = buf.len() as u32;
     let sent = unsafe { SendInput(buf, size_of::<INPUT>() as i32) };
     buf.clear();
-    if sent != expected {
-        let err = unsafe { GetLastError() };
+    if sent == expected {
+        return Ok(sent as usize);
+    }
+    let err = unsafe { GetLastError() };
+    if sent == 0 || err.0 == ERROR_ACCESS_DENIED {
         if err.0 == ERROR_ACCESS_DENIED {
             return Err(anyhow::Error::new(AccessDenied));
         }
         return Err(anyhow!("模拟键盘输入失败（错误码 {}）", err.0));
+    }
+    Ok(sent as usize)
+}
+
+/// 要求整批都必须提交成功；只进去一部分就按失败报出来。
+fn flush_all(buf: &mut Vec<INPUT>) -> Result<()> {
+    let expected = buf.len();
+    let sent = flush(buf)?;
+    if sent != expected {
+        return Err(anyhow!("模拟键盘输入只提交了 {sent}/{expected} 个事件"));
     }
     Ok(())
 }
@@ -368,8 +429,40 @@ mod tests {
     #[test]
     fn newline_maps_to_enter_keycode() {
         let mut buf = Vec::new();
-        push_key(&mut buf, VK_RETURN, 0, false);
+        push_key_stroke(&mut buf, VK_RETURN);
         assert_eq!(unsafe { buf[0].Anonymous.ki.wVk }, VK_RETURN);
-        assert_eq!(unsafe { buf[0].Anonymous.ki.wScan }, 0);
+        assert_eq!(
+            unsafe { buf[0].Anonymous.ki.wScan },
+            scan_code(VK_RETURN),
+            "回车必须带真实扫描码（只读扫描码的程序才认，wScan=0 时它换不了行）"
+        );
+    }
+
+    /// 回归（字打了、退格删不掉 / 回车不换行）：退格、回车、Tab 以前都传
+    /// `wScan = 0`，而只读扫描码的程序（游戏、部分远程桌面）看不见这类事件。
+    /// 它们必须和 `paste_events` 一样带真实扫描码。
+    #[test]
+    fn named_keys_carry_real_scan_codes() {
+        for vk in [VK_BACK, VK_RETURN, VK_TAB] {
+            assert_ne!(scan_code(vk), 0, "{vk:?} 的扫描码不该是 0");
+            let mut buf = Vec::new();
+            push_key_stroke(&mut buf, vk);
+            assert_eq!(buf.len(), 2, "一次按键应该是「按下+松开」两个事件");
+            for ev in &buf {
+                let ki = unsafe { ev.Anonymous.ki };
+                assert_eq!(ki.wVk, vk, "命名键的虚拟键码要保留");
+                assert_ne!(ki.wScan, 0, "{vk:?} 的事件扫描码是 0，读扫描码的程序看不到");
+            }
+        }
+    }
+
+    /// `type_text` 的计数口径：UTF-16 单元数，但 `\r` 不计入
+    /// （`\r` 不产生事件）。上层靠它和返回值比对，口径写错就会误判成"没打全"。
+    #[test]
+    fn typeable_units_counts_units_without_cr() {
+        assert_eq!(typeable_units("你好"), 2);
+        assert_eq!(typeable_units("a\r\nb"), 3, "\\r 不产生按键，不该计入");
+        // 代理对（生僻字）编码成 2 个单元，按 2 算
+        assert_eq!(typeable_units("\u{20BB7}"), 2);
     }
 }

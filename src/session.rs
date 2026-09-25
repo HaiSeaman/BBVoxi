@@ -2,6 +2,7 @@
 //! 独立线程跑 tokio 运行时，UI 线程通过 Shared 快照读取状态。
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -39,6 +40,8 @@ impl Snapshot {
 pub struct Shared {
     inner: Mutex<Snapshot>,
     ctx: egui::Context,
+    /// 会话线程请求「把设置窗显示出来」的标志（见 `show_settings` / `take_show_request`）
+    show_request: AtomicBool,
 }
 
 impl Shared {
@@ -46,6 +49,7 @@ impl Shared {
         Self {
             inner: Mutex::new(Snapshot::default()),
             ctx,
+            show_request: AtomicBool::new(false),
         }
     }
 
@@ -54,9 +58,14 @@ impl Shared {
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Snapshot)) {
-        if let Ok(mut guard) = self.inner.lock() {
-            f(&mut guard);
-        }
+        // 锁中毒（上一次拿锁的线程 panic 了）时也把里面的数据取回来继续更新，
+        // 并记一条日志。以前是静默 `return` —— 界面会毫无反应，主人根本不知道
+        // 出了什么事，且此后所有状态更新都悄悄失效。
+        let mut guard = self.inner.lock().unwrap_or_else(|e| {
+            log::log("界面状态锁已中毒，取回其中的数据继续更新");
+            e.into_inner()
+        });
+        f(&mut guard);
         self.ctx.request_repaint();
     }
 
@@ -65,6 +74,25 @@ impl Shared {
     pub fn hide_settings(&self) {
         self.ctx
             .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// 请求把设置窗重新显示出来。
+    /// 放弃自动输入、改走剪贴板交付时用：主人得看得见"结果已放到剪贴板、
+    /// 按 Ctrl+V 粘贴"这句提示，否则他会以为这次识别什么都没出。
+    ///
+    /// 为什么不能在这里直接发 `Visible(true)`：`App::logic` 在"本程序认为窗口
+    /// 是收起的"（`shown == false`：静默启动、收起到托盘）状态下每帧都会补发一次
+    /// `Visible(false)`，会把这里的请求当场盖掉 —— 结果就是"想让主人看提示"
+    /// 却什么也看不见。所以这里只置一个请求位并唤醒界面，由 UI 线程走正规的
+    /// 显示流程（`App::show_settings`：更新 `shown`、搬回屏幕内、延后一帧抢焦点）。
+    pub fn show_settings(&self) {
+        self.show_request.store(true, Ordering::Relaxed);
+        self.ctx.request_repaint();
+    }
+
+    /// UI 线程取走「显示设置窗」请求（取走即清零）
+    pub fn take_show_request(&self) -> bool {
+        self.show_request.swap(false, Ordering::Relaxed)
     }
 
     fn fail(&self, message: impl Into<String>) {
@@ -142,10 +170,15 @@ async fn run_session(
     rx: &mut UnboundedReceiver<Cmd>,
     test: bool,
 ) {
-    let cfg = match cfg.lock() {
-        Ok(c) => c.clone(),
-        Err(_) => return,
-    };
+    // 锁中毒（上一次拿锁的线程 panic 了）不能让会话静默失败：把里面的配置
+    // 取回来继续用，并记一条日志，好让主人知道出了点异常。
+    let cfg = cfg
+        .lock()
+        .unwrap_or_else(|e| {
+            log::log("配置锁已中毒，取回其中的数据继续");
+            e.into_inner()
+        })
+        .clone();
 
     if !cfg.credentials_ready() {
         shared.fail("请先在设置中填写完整的服务商凭据");
@@ -224,6 +257,11 @@ async fn run_session(
     // 否则测试窗口会显示"录音中 00:07"却只录了 5 秒，看着像坏了。
     shared.update(|s| s.started = Some(Instant::now()));
 
+    // 采集流是不是「自己结束」的（rx 关闭）。只有这种情况才需要去看错误原因，
+    // 见循环结束后的处理。不能在分支里直接调 capture.error()：rx 正被 select
+    // 借用着，借用冲突编译不过。
+    let mut mic_ended = false;
+
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -234,12 +272,27 @@ async fn run_session(
             },
             frame = capture.rx.recv() => match frame {
                 Some(f) => {
-                    if let Err(e) = client.send_audio(&f).await {
-                        shared.fail(format!("{e:#}"));
-                        return;
+                    // 推流必须设超时：网络半死时 send_audio 会永久 await，
+                    // 于是 Cmd::Stop 再也收不到，会话与麦克风一起卡死 ——
+                    // 之后所有热键都失效。超时就按失败收场。
+                    match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&f)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            shared.fail(format!("{e:#}"));
+                            return;
+                        }
+                        Err(_) => {
+                            shared.fail("发送音频超时（网络不通），已结束本次录音");
+                            return;
+                        }
                     }
                 }
-                None => break, // 麦克风线程结束
+                // 采集线程结束（rx 关闭）：拔出麦克风等错误会让回调置位 stopped，
+                // 采集线程随之退出，这里就会收到 None。
+                None => {
+                    mic_ended = true;
+                    break;
+                }
             },
             msg = client.recv() => match msg {
                 Some(m) => {
@@ -264,13 +317,53 @@ async fn run_session(
         }
     }
 
-    // 收尾：把残留音频发完，再发结束指令
-    while let Ok(frame) = capture.rx.try_recv() {
-        if client.send_audio(&frame).await.is_err() {
-            break;
+    // 收尾：先把麦克风停掉，再收干残留音频，最后发结束指令。
+    //
+    // 为什么必须先停麦克风：不停的话采集线程还在以每 100ms 一帧的速度供货，
+    // 下面「收干」的 try_recv 就永远有新帧可读 —— 收干会变成「边录边发」，
+    // 会话迟迟收不了尾（原实现是在 drain 之后才 drop(capture)，正是这个毛病）。
+    //
+    // 这里用 capture.stop() 而不是直接 drop(capture)：stop 只让采集线程退出、
+    // 释放麦克风；接收端仍在我们手里，缓冲里已录下的帧还能读完，尾巴不丢。
+    capture.stop();
+
+    // 给采集线程一点时间收工再收干：它每 50ms 轮询一次停止标志，退出前会把
+    // 重采样器里压着的样本、以及不足一帧的残料补发进通道（见 `audio::Feed::push`）。
+    // 不留这个间隔，下面的收干循环就很可能抢在补发之前读到"通道已空" ——
+    // 尾巴照样丢，等于白补（主人听到的现象就是"最后一个字少一点"）。
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // 采集是自己结束的（rx 关闭）且带着错误：如实报「麦克风异常」。
+    // 不能含糊地说「没有识别到内容」—— 那会让主人以为是自己没说话，
+    // 其实是设备出了问题（被独占、被拔掉……）。
+    if mic_ended {
+        if let Some(msg) = capture.error() {
+            drop(capture);
+            shared.fail(format!("麦克风异常：{msg}"));
+            return;
         }
     }
-    drop(capture); // 释放麦克风
+
+    // 收干残留音频：上限 20 帧（约 2 秒）。残留再多也只是缓冲里陈旧的音频，
+    // 没必要全发；给上限是为了杜绝「理论上一直有残留」时卡死。
+    // 每一步同样加超时，网络不通时不能把会话挂死在这里。
+    for _ in 0..20 {
+        let Ok(frame) = capture.rx.try_recv() else {
+            break;
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::log(format!("收尾发送残留音频失败：{e:#}"));
+                break;
+            }
+            Err(_) => {
+                log::log("收尾发送残留音频超时（网络不通）");
+                break;
+            }
+        }
+    }
+    drop(capture); // 释放麦克风与接收端
 
     shared.update(|s| {
         s.hint = "正在识别…".into();
@@ -347,36 +440,42 @@ async fn run_session(
         return;
     }
 
-    // 收尾前的最后一道校验：主人可能在上一条结果之后、这段收尾之前又切走了窗口
-    // （等最终结果时尤其容易）。先判一次是为了把顺序理顺 —— 已经确定不输入了，
-    // 就不必再多此一举去收起设置窗。
-    typer.guard(foreground_window());
-    if typer.is_away() {
-        // `sent` 里记的是打在**原窗口**里的字：此刻做收尾对账，退格会删掉主人
-        // 现在这个窗口里的内容；把整段重打到这儿同样是打错地方。所以一个字都不输入。
-        //
-        // 但结果不能就这么算了 —— 把它放到剪贴板，主人至少还能 Ctrl+V 粘回去。
-        // 这正是"切走窗口"这个场景下唯一安全的交付方式：不动别人的窗口，
-        // 又把文字交到主人手上（他此刻的焦点就是他要粘的地方）。
-        log::log("主人此刻不在原窗口，已放弃自动输入（结果放进剪贴板）");
-        shared.report(hand_off_to_clipboard(
-            &text,
-            "录音途中切换了窗口，为避免打错地方，本次结果没有自动输入。已复制到剪贴板，按 Ctrl+V 粘贴",
-        ));
-        return;
-    }
-
     ensure_target_focus(shared).await;
     // 收尾：把最终文本同步到光标处。实时输入开着时通常只差最后几个字，
     // 关掉实时输入时则在这里一次性打出全文。
     //
-    // 当前窗口是必填参数：`finish` 会拿它再核对一次。即使上面那次校验将来被谁
-    // 删掉，这里也兜得住 —— 不会把补打和退格送进别的程序。
-    if let Err(e) = typer.finish(&text, foreground_window()) {
-        // 注入失败（管理员窗口、被拦、粘贴兜底也没成……）：错误照报，
-        // 但结果同时放进剪贴板 —— 否则主人只能去设置窗里手动选中复制。
-        shared.fail(hand_off_to_clipboard(&text, &format!("{e}")));
-        return;
+    // 当前窗口是必填参数：`finish` 会拿它再核对一次 —— 主人可能在上一条结果
+    // 之后、这段收尾之前又切走了窗口（等最终结果时尤其容易），漏掉校验
+    // 就会把补打和退格送进别的程序。
+    //
+    // `finish` 返回三态，调用方必须分开处理（这正是为了堵住"结果被静默丢弃"）：
+    //   Ok(true)  = 文本已交付到目标程序（或本来就无需输入），继续往下走；
+    //   Ok(false) = 本次**放弃输入**（主人切走了窗口），结果必须改走剪贴板；
+    //   Err(_)    = 注入失败（管理员窗口、被拦……），同样改走剪贴板并把原因报出来。
+    match typer.finish(&text, foreground_window()) {
+        Ok(true) => {}
+        Ok(false) => {
+            // `sent` 里记的是打在**原窗口**里的字：此刻做收尾对账，退格会删掉主人
+            // 现在这个窗口里的内容；把整段重打到这儿同样是打错地方。所以一个字都不输入。
+            //
+            // 但结果不能就这么算了 —— 把它放到剪贴板，主人至少还能 Ctrl+V 粘回去。
+            // 这正是"切走窗口"这个场景下唯一安全的交付方式：不动别人的窗口，
+            // 又把文字交到主人手上（他此刻的焦点就是他要粘的地方）。
+            log::log("主人此刻不在原窗口，已放弃自动输入（结果放进剪贴板）");
+            shared.show_settings();
+            shared.report(hand_off_to_clipboard(
+                &text,
+                "录音途中切换了窗口，为避免打错地方，本次结果没有自动输入。已复制到剪贴板，按 Ctrl+V 粘贴",
+            ));
+            return;
+        }
+        Err(e) => {
+            // 注入失败：错误照报，但结果同时放进剪贴板 —— 否则主人只能去设置窗里
+            // 手动选中复制。顺手把设置窗显示出来，主人才能看见这句提示。
+            shared.show_settings();
+            shared.fail(hand_off_to_clipboard(&text, &format!("{e}")));
+            return;
+        }
     }
 
     // 「识别结果总留一份到剪贴板」：成功输入也留一份。
@@ -486,4 +585,21 @@ async fn ensure_target_focus(shared: &Shared) {
     }
     #[cfg(not(windows))]
     let _ = shared;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「显示设置窗」必须是**一次性**的请求位：UI 线程取走后要清零。
+    /// 少了这个语义，会话线程每请求一次、界面就会被反复强制显示出来
+    /// （主人会看到窗口在他没点的时候自己跳出来）。
+    #[test]
+    fn show_request_is_taken_exactly_once() {
+        let shared = Shared::new(egui::Context::default());
+        assert!(!shared.take_show_request(), "初始不该有待处理的请求");
+        shared.show_settings();
+        assert!(shared.take_show_request(), "置位后应该能取到");
+        assert!(!shared.take_show_request(), "取走之后必须清零");
+    }
 }

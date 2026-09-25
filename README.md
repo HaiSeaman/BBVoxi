@@ -4,12 +4,12 @@
 
 
 
-> **最新版本**：v1.3（2026-09-24，Stable）
-> 详细发布说明见 [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
+> **最新版本**：v1.3.1（2026-09-25，Stable）
+> 详细发布说明见 [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
 
 按住一个全局快捷键说话，松开后识别结果**自动打到光标所在的位置**——就像输入法正常打字一样，没有多余窗口。
 
-- **单文件**：`BBVoxi-1.3.exe`，无需安装，双击即用
+- **单文件**：`BBVoxi-1.3.1.exe`，无需安装，双击即用
 - **边说话边打字**：识别结果实时写入光标处，识别被修正时自动回退重打（成熟输入法的做法）；双击 exe 可唤醒后台实例
 - **按多久说多久**：不限制单次录音时长
 - **打不进去也不丢字**：有些程序不认逐字注入（远程桌面、部分 Electron/Java），会自动改用剪贴板粘贴；连粘贴也不行时就把结果放进剪贴板，按 `Ctrl+V` 取回
@@ -21,13 +21,13 @@
 
 ### 直接用（推荐）
 
-从 Releases 下载 `BBVoxi-1.3.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
+从 Releases 下载 `BBVoxi-1.3.1.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
 
 ### 从源码构建
 
 ```bash
 cargo build --release     # 产物：target/release/bbvoxi.exe（约 8 MB）
-cargo test                # 单元测试（98 条）
+cargo test                # 单元测试（139 条）
 ```
 
 构建要求：Rust 1.80+（MSVC 工具链，Windows）。
@@ -46,16 +46,30 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 
 | 触发方式 | 行为 | 文本去向 |
 |---|---|---|
-| **按住快捷键**（默认 `Ctrl + 1`） | 按住期间录音，松开即结束并输入 | 直接打到光标处 |
+| **按住快捷键**（默认 `Ctrl + Win`） | 按住期间录音，松开即结束并输入 | 直接打到光标处 |
 | **托盘 → 开始录音 / 停止录音** | 点一次开始，再点一次结束（适合不想一直按着） | 直接打到光标处 |
 | **设置窗 → 测试识别（5 秒）** | 固定 5 秒自动结束，用来验证凭据与麦克风 | **只显示在窗口里**，不外打 |
 | 双击托盘图标 / 右键「打开设置」 | 打开设置窗 | — |
 | 设置窗 → 项目地址 | 用系统默认浏览器打开本仓库（`ShellExecuteW`，不经 shell 解析） | — |
 | 再次双击 BBVoxi.exe / 桌面快捷方式 | 已在运行时：唤起后台实例弹出设置窗（单实例保护） | — |
 | `bbvoxi.exe --settings` | 直接打开并置前设置窗（排查用） | — |
+| `bbvoxi.exe --autostart` | 静默后台启动，一个窗口都不弹（开机自启项用的就是这个参数） | — |
 
-快捷键可在设置里改成任意组合：`Ctrl / Alt / Shift` + `字母 / 数字 / F1~F12 / 空格`，
-改完点保存**立即生效**；按下时该组合键会被拦截（避免触发浏览器切标签等系统快捷键）。
+快捷键可在设置里改成任意组合：修饰键 `Ctrl / Alt / Shift / Win` **随意搭配**（1~4 个都行），
+主键覆盖字母、数字、`F1~F24`、空格、方向键、翻页键与符号键；也可以整组只用修饰键
+（默认的 `Ctrl + Win` 就是），松手即结束。改完点保存**立即生效**；按下时该组合键会被
+拦截（避免触发浏览器切标签、弹出开始菜单）。
+
+只有两条硬性安全线（不是限制键数，是不这么做会砸坏日常使用）：
+
+- **单独一个普通键**（如 `a`）不行 —— 会在所有程序里把这个键吞掉，等于键盘少一个键；
+- **单独一个修饰键**（如 `Ctrl`）不行 —— 分不出"按住说话"和 `Ctrl + C`。
+
+> `Ctrl + Win` 这类组合请**先按 Ctrl、再按 Win**：单独按 Win 必须放行给系统
+> （否则开始菜单就永久打不开了），所以"先按 Win"的话会先弹出开始菜单。
+
+> 从旧版本升上来的老配置（默认快捷键是 Ctrl + 键盘左上角那个反引号键）会在首次启动时
+> **自动升级**为 `Ctrl + Win`；自己改过的组合一律原样保留。
 
 ---
 
@@ -94,7 +108,7 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 | `session.rs` | 会话编排：采集→推流→收结果→打字→收尾对账 |
 | `ui.rs` | egui 设置窗：设计令牌、卡片分区、底部操作条、深浅双主题 |
 | `config.rs` | 配置模型 + 写死的官方接口地址 + `%APPDATA%` 持久化 |
-| `autostart.rs` | 开机自启（注册表 Run 项，切换后与真实状态对账） |
+| `autostart.rs` | 开机自启（注册表 Run 项，值里带 `--autostart` 以便开机静默启动；按路径判定是否真的指向本程序） |
 | `log.rs` | 滚动日志（单份上限 2MB，另留 2 份旧日志；多实例串行化） |
 
 ---
@@ -218,7 +232,7 @@ assets/       图标资源（icon.ico + 128/32 RGBA）+ bbvoxi.rc
 scripts/      make_icons.py（源图去背 → 透明图标一键生成）
 docs/         设计与修复报告 + 界面截图
 build.rs      用 Windows SDK rc.exe 把图标编译进 exe
-dist/         打包产物（BBVoxi-1.3.exe，不入库）
+dist/         打包产物（BBVoxi-1.3.1.exe，不入库）
 ```
 
 ---
@@ -227,12 +241,12 @@ dist/         打包产物（BBVoxi-1.3.exe，不入库）
 
 ```bash
 cargo build --release
-copy target\release\bbvoxi.exe dist\BBVoxi-1.3.exe
+copy target\release\bbvoxi.exe dist\BBVoxi-1.3.1.exe
 ```
 
-然后在 GitHub 新建 Release：Tag `v1.3`，标题 `BBVoxi 1.3`，上传 `dist\BBVoxi-1.3.exe`。
-（对外发布统一用两位版本号 `1.3`；`Cargo.toml` 内为满足 Cargo 的 SemVer 字段限制写 `1.3.0`。）
-可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.3.md](./docs/GITHUB发布文案-v1.3.md)。
+然后在 GitHub 新建 Release：Tag `v1.3.1`，标题 `BBVoxi 1.3.1`，上传 `dist\BBVoxi-1.3.1.exe`。
+（版本号三处一致：exe 文件名 / 界面显示 / GitHub Tag 都是 `1.3.1`，`Cargo.toml` 里同样写 `1.3.1`。）
+可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.3.1.md](./docs/GITHUB发布文案-v1.3.1.md)。
 
 > `dist/`、`*.exe`、构建产物与 `.workbuddy/` 已在 `.gitignore` 中忽略，不会进仓库。
 
@@ -274,7 +288,7 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.exe
 
 ## 十、版本与发布
 
-**当前**：v1.3（Stable，2026-09-24）
+**当前**：v1.3.1（Stable，2026-09-25）
 
 发布说明分两层组织：
 
@@ -283,9 +297,9 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.exe
 
 | 文档 | 说明 |
 |---|---|
-| [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
-| [docs/全量审查与修复报告-v1.3.md](./docs/全量审查与修复报告-v1.3.md) | 本轮的逐项根因分析、验证方式（TDD + 变异检查）与过程中出现的问题 |
-| [docs/GITHUB发布文案-v1.3.md](./docs/GITHUB发布文案-v1.3.md) | GitHub Release 标题与正文（复制粘贴用） |
-| [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 上一版发布说明 ｜ 所有版本索引、写作模板、手动发布流程 |
+| [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 · 发布检查表 |
+| [docs/全量审查与修复报告-v1.3.1.md](./docs/全量审查与修复报告-v1.3.1.md) | 本轮的逐项根因分析（32 项问题 / 修复 31 项）、验证方式与过程中的偏差记录 |
+| [docs/GITHUB发布文案-v1.3.1.md](./docs/GITHUB发布文案-v1.3.1.md) | GitHub Release 标题与正文（复制粘贴用）+ 发布前 30 秒自检清单 |
+| [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) ｜ [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 上一版发布说明 ｜ 上上版 ｜ 所有版本索引、写作模板、手动发布流程 |
 
 > 后续每个版本都会新增一份 `docs/RELEASE_v<版本号>.md`，并在「版本历史」追加索引行。发布流程见 `docs/版本历史.md` §4。

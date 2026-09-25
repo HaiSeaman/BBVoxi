@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -16,6 +16,26 @@ pub const FRAME_SAMPLES: usize = (TARGET_RATE as usize) / 10;
 
 pub struct Capture {
     pub rx: Receiver<Vec<i16>>,
+    /// 采集出错时的错误文本（采集线程写、会话读）
+    error: Arc<Mutex<Option<String>>>,
+    /// 请求采集线程收工（会话收尾时置位）
+    stopped: Arc<AtomicBool>,
+}
+
+impl Capture {
+    /// 采集过程中是否出过错（拔掉麦克风、设备被别的程序独占……）。
+    /// 会话在 `rx` 结束（收到 `None`）时读一次：有错就如实报"麦克风异常"，
+    /// 不要含糊地说"没有识别到内容"，否则主人会以为是自己的问题。
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 请求采集线程停下来并释放麦克风。
+    /// 它比直接 `drop(capture)` 好：`rx` 仍留在调用方手里，缓冲里已录下的帧
+    /// 还能读完，不会把尾巴（往往正是主人松手前的那几个字）一起丢掉。
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
 }
 
 pub fn start() -> Result<Capture> {
@@ -23,11 +43,17 @@ pub fn start() -> Result<Capture> {
     let (tx, rx) = channel::<Vec<i16>>(100);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
+    // stopped / error 在这里创建、由采集线程和 Capture 共享：
+    // 会话要能主动叫停采集（stop），出错时也要能读到原因（error）。
+    let stopped = Arc::new(AtomicBool::new(false));
+    let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let thread_stopped = stopped.clone();
+    let thread_error = error.clone();
+
     std::thread::Builder::new()
         .name("bbvoxi-audio".into())
         .spawn(move || {
-            let stopped = Arc::new(AtomicBool::new(false));
-            let stream = match build_stream(tx, stopped.clone()) {
+            let stream = match build_stream(tx, thread_stopped.clone(), thread_error) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -35,8 +61,9 @@ pub fn start() -> Result<Capture> {
                 }
             };
             let _ = ready_tx.send(Ok(()));
-            // 接收端被丢弃后回调会置位 stopped，此时结束采集
-            while !stopped.load(Ordering::Relaxed) {
+            // 停止条件有两个来源：会话主动 stop，或流自身出错时由回调置位。
+            // 接收端被丢弃后回调也会置位 stopped，此时结束采集。
+            while !thread_stopped.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
             }
             drop(stream);
@@ -44,13 +71,17 @@ pub fn start() -> Result<Capture> {
         .context("启动音频线程失败")?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Capture { rx }),
+        Ok(Ok(())) => Ok(Capture { rx, error, stopped }),
         Ok(Err(e)) => Err(anyhow!(e)),
         Err(_) => Err(anyhow!("音频线程异常退出")),
     }
 }
 
-fn build_stream(tx: Sender<Vec<i16>>, stopped: Arc<AtomicBool>) -> Result<cpal::Stream> {
+fn build_stream(
+    tx: Sender<Vec<i16>>,
+    stopped: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host.default_input_device().context("未检测到麦克风设备")?;
     let supported = device
@@ -66,7 +97,20 @@ fn build_stream(tx: Sender<Vec<i16>>, stopped: Arc<AtomicBool>) -> Result<cpal::
         bail!("麦克风参数异常：{in_rate}Hz / {channels}ch");
     }
 
-    let on_err = |e| crate::log::log(format!("麦克风采集错误：{e}"));
+    // 出错时只写日志是不够的：`stopped` 只在 channel 关闭时才置位，
+    // 拔掉麦克风后界面会一直显示"录音中"、会话永远收不到结束信号。
+    // 所以这里除了记日志，还要（1）把错误文本存到共享位置供会话读取，
+    // （2）置位 stopped 让采集线程退出、rx 关闭 —— 会话随即正常收尾并如实报错。
+    let on_err = {
+        let stopped = stopped.clone();
+        let error = error.clone();
+        move |e: cpal::StreamError| {
+            let msg = format!("{e}");
+            crate::log::log(format!("麦克风采集错误：{msg}"));
+            *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+            stopped.store(true, Ordering::Relaxed);
+        }
+    };
     let stream = match format {
         SampleFormat::F32 => {
             build::<f32>(&device, &config, in_rate, channels, tx, stopped, on_err)?
@@ -117,6 +161,7 @@ where
         sum: 0.0,
         counted: 0,
         dropped: false,
+        flushed: false,
     };
     device
         .build_input_stream(config, move |data: &[T], _| feed.push(data), on_err, None)
@@ -133,10 +178,30 @@ struct Feed {
     counted: usize,
     /// 是否已经因为缓冲满丢过帧（只记一次日志，避免刷屏）
     dropped: bool,
+    /// 停止后是否已经把残留尾帧补发过了（见 `push` 的开头，避免重复发）
+    flushed: bool,
 }
 
 impl Feed {
     fn push<T: ToF32>(&mut self, data: &[T]) {
+        // 停止录音后回调还可能再来最后一次：这时把不足一帧的残留样本、
+        // 以及重采样器里还压着的样本一起补发出去。不补的话它们会随
+        // `drop(stream)` 一起丢掉 —— 每次录音的尾巴会固定少最多 100ms 语音。
+        // 不补零：ASR 接受任意长度的 PCM，真实的短帧比"后面接一段假静音"更准。
+        if self.stopped.load(Ordering::Relaxed) {
+            if !self.flushed {
+                self.flushed = true;
+                // 升采样时一次 push 可能攒了好几个输出样本，先全部吐出来
+                while let Some(s) = self.resampler.flush() {
+                    self.frame.push(s);
+                }
+                if !self.frame.is_empty() {
+                    let tail = std::mem::take(&mut self.frame);
+                    let _ = self.tx.try_send(tail);
+                }
+            }
+            return;
+        }
         for s in data {
             self.sum += s.to_f32();
             self.counted += 1;
@@ -201,6 +266,16 @@ impl Resampler {
     pub fn pop(&mut self) -> Option<i16> {
         match self {
             Resampler::Down(d) => d.pop(),
+            Resampler::Up(u) => u.pop(),
+        }
+    }
+
+    /// 收尾时把还压在里面的样本吐出来（正常采样期间不要调用）。
+    /// 降采样会有一个"还没闭合的箱"，升采样可能攒了几个待取的输出样本 ——
+    /// 不吐出来它们就随重采样器一起丢掉，录音尾巴会少一截。
+    pub fn flush(&mut self) -> Option<i16> {
+        match self {
+            Resampler::Down(d) => d.finish(),
             Resampler::Up(u) => u.pop(),
         }
     }
@@ -302,6 +377,16 @@ impl Decimator {
     }
 
     pub fn pop(&mut self) -> Option<i16> {
+        self.ready.take()
+    }
+
+    /// 收尾专用：把当前正在积累的那个箱也闭合、送出去。
+    /// 正常采样期间不能调用（它会把还没攒够的箱提前封口，破坏分箱边界）；
+    /// 只在停止录音、要丢掉重采样器之前调一次，免得最后半个箱白白丢掉。
+    pub fn finish(&mut self) -> Option<i16> {
+        if self.ready.is_none() {
+            self.flush();
+        }
         self.ready.take()
     }
 
@@ -437,5 +522,68 @@ mod tests {
         let out = run(&mut r, &input);
         assert_eq!(out.len(), 16_000);
         assert!(out.iter().all(|v| (*v - 16383).abs() <= 1), "电平被改变");
+    }
+
+    /// 回归（每次录音尾巴固定少最多 100ms）：停止录音时，回调里那半帧
+    /// （不足一帧的残留）以前会随 `drop(stream)` 一起丢掉，主人最后那几个字
+    /// 常常听不完整。这里验证 `Feed` 在 stopped 置位后会把残留尾帧补发出去。
+    ///
+    /// 构造方式不走真麦克风、也不注入：直接搭一个 `Feed` + 内存 channel，
+    /// 先正常采一小段（不足一帧），再置位 stopped，然后模拟"最后一次回调"。
+    #[test]
+    fn stopping_flushes_the_partial_tail_instead_of_dropping_it() {
+        let (tx, mut rx) = channel::<Vec<i16>>(10);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut feed = Feed {
+            resampler: Resampler::new(TARGET_RATE, TARGET_RATE),
+            frame: Vec::new(),
+            tx,
+            stopped: stopped.clone(),
+            channels: 1,
+            sum: 0.0,
+            counted: 0,
+            dropped: false,
+            flushed: false,
+        };
+
+        // 正常采一小段，还凑不满一整帧
+        feed.push(&[0.1f32; 100]);
+        assert!(rx.try_recv().is_err(), "不足一帧时不该往外发，应该先攒着");
+
+        // 停止录音：下一次回调要把残留尾帧补发出去，而不是丢掉
+        stopped.store(true, Ordering::Relaxed);
+        feed.push(&[0.1f32; 10]);
+
+        let tail = rx
+            .try_recv()
+            .expect("停止后应把残留尾帧补发出去，而不是随 drop(stream) 丢掉");
+        assert!(
+            tail.len() >= 100,
+            "补发的尾帧要包含停止前攒下的样本，实际只有 {} 个",
+            tail.len()
+        );
+
+        // 只补发一次：再来回调也不该重复发
+        feed.push(&[0.1f32; 10]);
+        assert!(rx.try_recv().is_err(), "残留尾帧只能补发一次，不能重复");
+    }
+
+    /// `Decimator::finish` 要把当前正在积累的箱也收掉，
+    /// 否则最后半个箱会随重采样器一起丢掉（哪怕只有 1~2 个样本也不该丢）。
+    #[test]
+    fn decimator_finish_closes_the_last_unfinished_bin() {
+        let mut dec = Decimator::new(16_000, 16_000);
+        // 先喂两个样本：第一个样本的箱会在第二个样本进来时闭合并被取走
+        dec.push(0.5);
+        assert_eq!(dec.pop(), None);
+        dec.push(0.5);
+        assert_eq!(dec.pop(), Some(16383));
+        // 现在第二个样本还在箱里没闭合，finish 应把它收出来
+        assert_eq!(
+            dec.finish(),
+            Some(16383),
+            "收尾要把没闭合的最后一个箱吐出来"
+        );
+        assert_eq!(dec.pop(), None, "收干净之后不应再冒出来样本");
     }
 }
