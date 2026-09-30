@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use std::mem::size_of;
-use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
@@ -52,15 +52,47 @@ fn push_modifier_reset(buf: &mut Vec<INPUT>) {
     }
 }
 
-/// 逐字注入。返回值 = **实际提交成功的 UTF-16 编码单元数**（`\r` 不计入）。
+/// 一次逐字注入的结果。
+///
+/// 为什么把"进去多少"和"有没有失败"放进同一个结构：以前失败走 `Err`、
+/// 部分成功走 `Ok(数量)`，两条路各有一套语义 —— 结果跨批次失败的那一支把已经
+/// 打进去的字**整段重粘**了一遍，目标程序里出现两份同样的字（报告第 4 条）。
+/// 现在无论成败都如实报出"从开头连续提交成功的编码单元数"，调用方只有一条规则：
+/// **没进去的那段尾巴才需要补**。
+#[derive(Debug)]
+pub struct Injection {
+    /// 从文本开头算起、**连续**提交成功的 UTF-16 编码单元数
+    pub committed: usize,
+    /// 中途失败的原因（整段成功时为 `None`）
+    pub error: Option<anyhow::Error>,
+}
+
+impl Injection {
+    /// 整段都进去了吗（`expected` = 期望的编码单元数，见 [`typeable_units`]）
+    pub fn is_complete(&self, expected: usize) -> bool {
+        self.error.is_none() && self.committed >= expected
+    }
+}
+
+/// 逐字注入。返回值见 [`Injection`]。
 ///
 /// 为什么不只返回 Ok/Err：`SendInput` 只保证"事件进了系统队列"，目标程序
 /// 完全可能只收下一部分（被 UIPI 拦、队列满、程序自己吞掉）。上层 `typer`
 /// 必须知道这段文字到底进去多少 —— 没进去的尾巴才有机会改走剪贴板补上；
 /// 只凭 Ok 就当整段成功，会让主人眼看着"打出去了"其实丢了半句。
-pub fn type_text(text: &str) -> Result<usize> {
+pub fn type_text(text: &str) -> Injection {
+    type_text_with(text, flush_batch)
+}
+
+/// 按批次提交文本；提交动作做成参数，是为了能单测"部分失败时到底报了多少
+/// 已提交"（那个数直接决定上层会不会把整段重粘、打出重复的字）。
+fn type_text_with(
+    text: &str,
+    mut send: impl FnMut(&mut Vec<INPUT>, usize, usize) -> Result<usize>,
+) -> Injection {
+    let done = |committed: usize, error: Option<anyhow::Error>| Injection { committed, error };
     if text.is_empty() {
-        return Ok(0);
+        return done(0, None);
     }
     let mut buf: Vec<INPUT> = Vec::with_capacity(BATCH_CHARS * 2 + crate::hotkey::MODIFIERS.len());
     push_modifier_reset(&mut buf);
@@ -83,13 +115,30 @@ pub fn type_text(text: &str) -> Result<usize> {
         }
         batch_units += 1;
         if buf.len() >= BATCH_CHARS * 2 {
-            committed += flush_batch(&mut buf, batch_units, header)?;
+            match send(&mut buf, batch_units, header) {
+                Ok(n) if n >= batch_units => committed += n,
+                Ok(n) => {
+                    // 这一批只进去一部分：后面的批次**绝不能再发** —— 否则没进去的
+                    // 那段会变成"中间的空洞"，而调用方只会在尾巴上补粘
+                    // （"缺的一定在末尾"正是那条规则的前提），结果就是错位与重复。
+                    return done(
+                        committed + n,
+                        Some(anyhow!("模拟键盘输入只提交了 {n}/{batch_units} 个字符")),
+                    );
+                }
+                // 整批被拒：**已经进去的那一截要如实报出来**（旧实现在这里把计数丢了，
+                // 上层就会把整段重粘一遍）
+                Err(e) => return done(committed, Some(e)),
+            }
             header = 0;
             batch_units = 0;
         }
     }
-    committed += flush_batch(&mut buf, batch_units, header)?;
-    Ok(committed)
+    match send(&mut buf, batch_units, header) {
+        // 最后一批只进去一部分：缺的正好在尾巴上，按"部分成功"报，交给调用方补粘
+        Ok(n) => done(committed + n, None),
+        Err(e) => done(committed, Some(e)),
+    }
 }
 
 /// `type_text` 的提交计数口径：UTF-16 编码单元里除去 `\r` 的数量。
@@ -287,17 +336,45 @@ fn flush(buf: &mut Vec<INPUT>) -> Result<usize> {
         return Ok(0);
     }
     let expected = buf.len() as u32;
+    // 先清掉上一次留下的错误码再提交。`SendInput` **成功时不会写 GetLastError**，
+    // 不清的话读到的可能是几百毫秒前别的调用留下的「拒绝访问(5)」——
+    // 旧实现就是这么把"部分成功"误判成"被 UIPI 拦下"的：粘贴兜底被白白跳过
+    // （报告第 5 条）。
+    unsafe { SetLastError(ERROR_SUCCESS) };
     let sent = unsafe { SendInput(buf, size_of::<INPUT>() as i32) };
     buf.clear();
-    if sent == expected {
+    let err = unsafe { GetLastError() }.0;
+    classify(expected, sent, err).map_err(|failure| match failure {
+        SendFailure::Denied => anyhow::Error::new(AccessDenied),
+        SendFailure::Other(code) => anyhow!("模拟键盘输入失败（错误码 {code}）"),
+    })
+}
+
+/// 提交失败的两档：被 UIPI 拦下（连粘贴也没用）/ 其它原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailure {
+    Denied,
+    Other(u32),
+}
+
+/// 判定一次 `SendInput` 的结果（纯函数，方便把"陈旧错误码"这条规矩钉在单测里）。
+///
+/// 规则只有两条：
+/// 1. **一个事件都没进去**时才去看错误码（`GetLastError` 只在彻底失败时才有意义）；
+///    此时是 5（拒绝访问）就认定被 UIPI 拦下。
+/// 2. 部分成功（进去了几个，没进完）一律如实返回"进去了多少"，
+///    **不管错误码是什么** —— 它保留的是陈旧值，拿它做判断就会把部分成功
+///    误判成"被拦"，跳过本该做的粘贴兜底。
+fn classify(expected: u32, sent: u32, last_error: u32) -> Result<usize, SendFailure> {
+    if sent >= expected {
         return Ok(sent as usize);
     }
-    let err = unsafe { GetLastError() };
-    if sent == 0 || err.0 == ERROR_ACCESS_DENIED {
-        if err.0 == ERROR_ACCESS_DENIED {
-            return Err(anyhow::Error::new(AccessDenied));
-        }
-        return Err(anyhow!("模拟键盘输入失败（错误码 {}）", err.0));
+    if sent == 0 {
+        return Err(if last_error == ERROR_ACCESS_DENIED {
+            SendFailure::Denied
+        } else {
+            SendFailure::Other(last_error)
+        });
     }
     Ok(sent as usize)
 }
@@ -587,5 +664,129 @@ mod tests {
             0,
             "当前键是扩展键时要带上扩展位"
         );
+    }
+
+    /// 回归（"陈旧错误码被当真"，报告第 5 条）：`SendInput` **成功时不写
+    /// GetLastError**，线程里留着的是上一次别的调用留下的错误码。旧实现只要
+    /// "一个都没进去 **或** 错误码是 5" 就按"被 UIPI 拦下"处理 —— 于是
+    /// "部分成功 + 陈旧的 5"被误判成拦截，粘贴兜底被白白跳过。
+    #[test]
+    fn stale_error_code_never_turns_a_partial_success_into_denial() {
+        // 部分成功：不管错误码是什么，都如实按"进去了这么多"返回
+        assert_eq!(classify(32, 10, 5), Ok(10), "陈旧的 5 不能把部分成功变成拦截");
+        assert_eq!(classify(32, 10, 0), Ok(10));
+        assert_eq!(classify(32, 1, 5), Ok(1));
+        // 全部成功也一样
+        assert_eq!(classify(32, 32, 5), Ok(32));
+        // 一个事件都没进去：这时候错误码才有意义
+        assert_eq!(classify(32, 0, 5), Err(SendFailure::Denied));
+        assert_eq!(classify(32, 0, 87), Err(SendFailure::Other(87)));
+        // 数值相等但"少进去一个"也算部分成功（边界）
+        assert_eq!(classify(2, 1, 5), Ok(1));
+    }
+
+    /// 假提交器：按剧本决定每一批"实际进去多少个编码单元"。
+    ///
+    /// 为什么不真注入：`SendInput` 会打到你正在用的前台窗口（跑测试时就是终端），
+    /// 测试绝不能干这种事。真正要验证的是**分批与计数逻辑**，把它做成可替换的
+    /// 参数就能一条条钉死（与 `paste_events`/`win_press_events` 同一个套路）。
+    struct Script {
+        calls: usize,
+        plan: Vec<Result<usize, &'static str>>,
+    }
+
+    impl Script {
+        fn send(&mut self, buf: &mut Vec<INPUT>, units: usize, _header: usize) -> Result<usize> {
+            // 真正的提交（`flush`）成功与否都会把缓冲区清掉；假提交器也必须照做，
+            // 否则缓冲区越堆越大，"每满一批就提交"的节奏就完全不对了
+            buf.clear();
+            let step = self.plan.get(self.calls).copied().unwrap_or(Ok(units));
+            self.calls += 1;
+            match step {
+                Ok(n) => Ok(n.min(units)),
+                Err(msg) => Err(anyhow!(msg)),
+            }
+        }
+    }
+
+    /// 第一批装几个单元（修饰键重置占了开头 11 个事件的位置，
+    /// 所以第一批比后面的批次少装几个）
+    fn first_batch_units() -> usize {
+        let header = crate::hotkey::MODIFIERS.len();
+        (BATCH_CHARS * 2 - header).div_ceil(2)
+    }
+
+    fn run(text: &str, plan: Vec<Result<usize, &'static str>>) -> (Injection, usize) {
+        let mut script = Script { calls: 0, plan };
+        let out = type_text_with(text, |buf, units, header| script.send(buf, units, header));
+        (out, script.calls)
+    }
+
+    /// 正常情况：整段都提交成功，没有任何错误
+    #[test]
+    fn full_injection_reports_every_unit() {
+        let (out, calls) = run("你好世界", vec![]);
+        assert_eq!(out.committed, 4);
+        assert!(out.error.is_none());
+        assert_eq!(calls, 1, "4 个字一批就发完了");
+    }
+
+    /// 回归（**重复打字**，报告第 4 条）：某一批整批被拒时，**已经进去的那一截
+    /// 必须报出来** —— 调用方只有知道它，才能只补没进去的尾巴；不知道就会把
+    /// 整段重粘一遍，目标程序里就出现两份同样的字。
+    ///
+    /// 用三批的文本：被拒的那批必须是**循环里**的那一批。只有两批时第二批会走
+    /// "收尾提交"那条路，测不到这里（这一点是变异测试发现的）。
+    #[test]
+    fn a_rejected_batch_keeps_the_units_already_committed() {
+        let first = first_batch_units();
+        let text: String = "字".repeat(first + 16 + 13); // 三批
+        let (out, calls) = run(&text, vec![Ok(first), Err("被 UIPI 拦下")]);
+        assert_eq!(
+            out.committed, first,
+            "第一批已经进去的 {first} 个字必须报出来（旧实现直接丢成 0，上层就会整段重粘）"
+        );
+        assert!(out.error.is_some());
+        assert_eq!(calls, 2, "被拒之后不许再发第三批");
+    }
+
+    /// 批内部分成功：后面的批次**绝不能再发** —— 否则没进去的那段会变成
+    /// "中间的空洞"，而调用方只会把尾巴重粘（尾巴逻辑的前提是"缺的一定在末尾"），
+    /// 结果就是前后错位、重复打字。
+    #[test]
+    fn a_partial_batch_stops_further_batches() {
+        let first = first_batch_units();
+        let text: String = "字".repeat(first + 16 + 13); // 三批
+        let (out, calls) = run(&text, vec![Ok(first), Ok(4)]);
+        assert_eq!(out.committed, first + 4, "前缀 = 第一批 + 第二批进去的 4 个");
+        assert!(out.error.is_some(), "批内部分成功也要报失败");
+        assert_eq!(calls, 2, "第三批绝不能发出去");
+    }
+
+    /// 最后一批只进去一部分：缺的正好在尾巴上，按"部分成功"报（不是错误），
+    /// 由调用方补粘尾巴
+    #[test]
+    fn a_partial_final_batch_is_a_partial_success() {
+        let first = first_batch_units();
+        let text: String = "字".repeat(first + 9); // 两批
+        let (out, calls) = run(&text, vec![Ok(first), Ok(2)]);
+        assert_eq!(out.committed, first + 2);
+        assert!(
+            out.error.is_none(),
+            "最后一批的缺口在尾巴上，是部分成功，不该当成失败"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    /// `\r` 不产生按键事件：分批计数不能把它算进去（算进去会把批次切错，
+    /// 报给调用方的提交数也就跟着错）
+    #[test]
+    fn carriage_return_does_not_occupy_a_unit() {
+        // 会按键的单元 = 8 + 1（回车）+ 9 = 18（`\r` 不算）→ 两批
+        let text = format!("{}\r\n{}", "字".repeat(8), "字".repeat(9));
+        let (out, calls) = run(&text, vec![]);
+        assert_eq!(out.committed, 18);
+        assert!(out.error.is_none());
+        assert_eq!(calls, 2, "18 个单元要分两批发");
     }
 }

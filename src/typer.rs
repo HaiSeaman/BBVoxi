@@ -40,8 +40,22 @@ pub fn diff(sent: &str, desired: &str) -> Diff {
     }
 
     Diff {
-        backspaces: sent_chars.len() - common,
+        // 退格数按 **UTF-16 编码单元** 数（关键：与注入口径一致）。
+        // 注入是把文本按编码单元送进去的（一个代理对拆成两次 unicode 事件），
+        // 删除就必须按同一口径数：按「字符」数会让生僻字/emoji 少退一位，
+        // 在目标程序里留下半个代理对（乱码）。`\r` 不产生按键事件，算 0 ——
+        // 算进去就会多退一位，删掉前一个字符。
+        backspaces: sent_chars[common..].iter().map(|c| key_units(*c)).sum(),
         append: desired_chars[common..].iter().collect(),
+    }
+}
+
+/// 一个字符会占几个 UTF-16 编码单元（`\r` 不产生任何按键事件，算 0）
+fn key_units(ch: char) -> usize {
+    if ch == '\r' {
+        0
+    } else {
+        ch.len_utf16()
     }
 }
 
@@ -239,17 +253,19 @@ impl LiveTyper {
         }
         if !planned.append.is_empty() {
             let expected = injector::typeable_units(&planned.append);
-            match injector::type_text(&planned.append) {
-                // 只有"实际提交数 == 期望数"才算整段打进目标程序，这时才记账。
-                Ok(committed) if committed >= expected => {}
-                // 只提交了一部分：多出来的尾巴必须改走剪贴板补上，
-                // 而且只粘这段尾巴 —— 粘整段会和已经打进去的部分重复。
-                Ok(committed) => {
-                    let tail = tail_after_units(&planned.append, committed);
-                    let e = anyhow!("逐字注入只提交了 {committed}/{expected} 个字符");
-                    return self.paste_via_clipboard(&tail, desired, e);
-                }
-                Err(e) => return self.paste_via_clipboard(&planned.append, desired, e),
+            let result = injector::type_text(&planned.append);
+            // 只有"实际提交数 == 期望数"才算整段打进目标程序，这时才记账。
+            if !result.is_complete(expected) {
+                // 不管是"只进去一部分"还是"整批被拒"，规则都只有一条：
+                // **只补没进去的那段尾巴**。`Injection` 里带着"从开头连续进去了多少"，
+                // 所以这里不会再出现"整段重粘 → 目标程序里两份同样的字"（报告第 4 条：
+                // 跨批次的部分成功以前正是在这条路上被丢掉的）。
+                let tail = tail_after_units(&planned.append, result.committed);
+                let e = match result.error {
+                    Some(e) => e,
+                    None => anyhow!("逐字注入只提交了 {}/{} 个字符", result.committed, expected),
+                };
+                return self.paste_via_clipboard(&tail, desired, e);
             }
         }
         self.sent = desired.to_string();
@@ -373,11 +389,31 @@ mod tests {
     }
 
     #[test]
-    fn surrogate_chars_count_as_one() {
-        // 罕见字（代理对）按字符算退格数，与 Windows 的删除语义一致
-        let d = diff("𠮷野家", "𠮷野");
-        assert_eq!(d.backspaces, 1);
+    fn surrogate_chars_count_as_two_units() {
+        // 罕见字（代理对）按 UTF-16 编码单元算退格数：与注入口径一致，
+        // 少退一位会在目标程序里留下半个代理对（乱码）
+        let d = diff("a𠮷", "a");
+        assert_eq!(d.backspaces, 2);
         assert!(d.append.is_empty());
+    }
+
+    /// 回归（生僻字/emoji 会留下乱码）：退格数必须按 **UTF-16 编码单元** 数，
+    /// 与注入口径一致 —— 注入是把一个代理对拆成两次 unicode 事件送进去的，
+    /// 删除也必须按同一口径数；按「字符」数会少退一位，目标程序里就留下半个
+    /// 代理对（乱码）。`\r` 不产生任何按键事件，也不能算进去（算进去会多退
+    /// 一位，删掉前一个字符）。
+    #[test]
+    fn backspaces_count_utf16_units_like_the_injector_does() {
+        // 增补平面汉字（𠮷）在 UTF-16 里是 2 个单元 → 要退 2 次
+        assert_eq!(diff("𠮷", "").backspaces, 2);
+        assert_eq!(diff("a𠮷", "a").backspaces, 2, "生僻字要退满两个单元");
+        // emoji 同样是代理对
+        assert_eq!(diff("🙃", "").backspaces, 2);
+        // 普通汉字/字母还是 1 位（别把常规路径改坏）
+        assert_eq!(diff("你好", "你").backspaces, 1);
+        assert_eq!(diff("abc", "ab").backspaces, 1);
+        // 换行有按键事件（回车），要退；`\r` 没有，不能算
+        assert_eq!(diff("a\r\nb", "a").backspaces, 2, "\\n 和 b 各一位，\\r 不算");
     }
 
     /// 回归（会把字打进别的程序那个 bug）：

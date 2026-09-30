@@ -362,34 +362,6 @@ struct HookCtx {
 
 static CTX: OnceLock<HookCtx> = OnceLock::new();
 
-/// 补发 Win 键失败的次数与最近一次的错误码。
-///
-/// 为什么只记数字、不在钩子里写日志：低级键盘钩子**必须毫秒级返回**，而 `log()` 要
-/// 抢锁、写磁盘 —— 一旦被卡住（杀软扫描、磁盘忙），Windows 会**静默摘掉这个钩子**，
-/// 表现就是"快捷键突然全失效、Win 键开始乱弹"，日志里还什么都看不到。
-/// 所以钩子回调里只准动原子变量，真正的日志由会话线程在开新会话时补记
-/// （见 [`take_replay_failures`]）。
-static REPLAY_FAILURES: AtomicU32 = AtomicU32::new(0);
-static REPLAY_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
-
-/// 取走"上一次补发失败"的计数与错误码（取走即清零）。
-/// 由会话线程调用并写进日志 —— 见 [`REPLAY_FAILURES`] 的说明。
-pub fn take_replay_failures() -> (u32, u32) {
-    (
-        REPLAY_FAILURES.swap(0, Ordering::Relaxed),
-        REPLAY_LAST_ERROR.swap(0, Ordering::Relaxed),
-    )
-}
-
-/// 记一次补发失败。**只能在钩子回调里调**，所以只动原子变量。
-fn note_replay_failure() {
-    REPLAY_FAILURES.fetch_add(1, Ordering::Relaxed);
-    // 错误码取"最近一次 Win32 错误"：`injector` 的报错里其实也带着它，
-    // 但从 `anyhow::Error` 里拆字符串再解析太吵，这里重读一次更直接（读不到就是 0）。
-    let code = unsafe { windows::Win32::Foundation::GetLastError() }.0;
-    REPLAY_LAST_ERROR.store(code, Ordering::Relaxed);
-}
-
 // 当前生效的组合键，改动后立即生效（不必重启）。
 // 初值与 `Hotkey::default()`（Ctrl+Win，无主键）保持一致。
 static CURRENT_VK: AtomicU32 = AtomicU32::new(0);
@@ -451,12 +423,102 @@ pub fn apply_from_config(text: &str) -> Result<Hotkey> {
     Ok(hk)
 }
 
+/// 补发任务（钩子回调 → 补发线程）。
+///
+/// 为什么必须换一个线程去做注入：低级键盘钩子回调要在**毫秒级**返回，而
+/// `SendInput` 一旦被卡住（杀软扫描、输入法、远控软件拖慢），处理超过系统
+/// 300ms 的 LowLevelHooksTimeout，Windows 会**静默移除钩子** —— 表现是
+/// 快捷键全废、Win 键开始乱弹开始菜单，而日志里什么都没有（报告第 6 条）。
+/// 回调里只做一件事：把任务丢进通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayJob {
+    /// 补一整套 Win 按下+松开（主人只是想按 Win 打开开始菜单）
+    WinPress { win: u32 },
+    /// 一次提交「Win 按下 + 当前键按下」（主人按的是 Win+E 这类系统组合键）
+    WinThenKey {
+        win: u32,
+        vk: u32,
+        scan: u16,
+        extended: bool,
+    },
+}
+
+/// 补发通道。由 [`spawn`] 建立；钩子回调只往里塞任务（`std::sync::mpsc` 的
+/// `send` 不阻塞，回调里用它是安全的）。
+static REPLAY_TX: OnceLock<std::sync::mpsc::Sender<ReplayJob>> = OnceLock::new();
+
+/// 钩子上报的扩展键标记（`KBDLLHOOKSTRUCT.flags`）
+const LLKHF_EXTENDED: u32 = 0x01;
+
+/// 把"要补什么"翻译成补发任务（纯函数，便于单测 —— 钩子回调本身没法单测）
+fn replay_job(replay: Replay, vk: u32, flags: u32, scan: u16) -> Option<ReplayJob> {
+    match replay {
+        Replay::None => None,
+        Replay::WinPress(win) => Some(ReplayJob::WinPress { win }),
+        Replay::WinThenCurrentKey(win) => Some(ReplayJob::WinThenKey {
+            win,
+            vk,
+            scan,
+            extended: flags & LLKHF_EXTENDED != 0,
+        }),
+    }
+}
+
+/// 补发线程：真正执行注入，并在失败时写日志。
+///
+/// 这里写日志是安全的（不在钩子回调里）—— 所以旧版那套"钩子里只攒原子计数、
+/// 由会话线程补记日志"的账本（`take_replay_failures`）整套删掉了。
+fn replay_worker(rx: std::sync::mpsc::Receiver<ReplayJob>) {
+    for job in rx {
+        let outcome = match job {
+            ReplayJob::WinPress { win } => crate::injector::press_win(win),
+            ReplayJob::WinThenKey {
+                win,
+                vk,
+                scan,
+                extended,
+            } => crate::injector::win_then_key(win, vk, scan, extended),
+        };
+        if let Err(e) = outcome {
+            crate::log::log(format!(
+                "Win 键补发失败（{job:?}）：{e:#} —— 前台若是管理员权限窗口，注入会被系统\
+                 拦下，那种情况下按 Win 不会弹开始菜单"
+            ));
+        }
+    }
+}
+
+/// 全局快捷键没装上时，让界面看得见。
+///
+/// 回归（报告第 8 条）：`SetWindowsHookExW` 失败以前只写日志，仍然"一切正常" ——
+/// 托盘、设置窗全都在，实际一个键都没接管，主人只会觉得"按快捷键没反应"。
+/// 这里把话交给会话线程（它拿着界面状态），让它写进快照：托盘图标、状态胶囊、
+/// 设置窗里的那行字会一起亮起来。
+fn report_hook_failure(tx: &UnboundedSender<Cmd>, why: impl std::fmt::Display) {
+    let msg = format!("全局快捷键没能装上（{why}）：按快捷键不会有任何反应");
+    crate::log::log(&msg);
+    let _ = tx.send(Cmd::StartupFailure(msg));
+}
+
+/// 启动补发线程（钩子回调里的注入全部交给它做，理由见 [`ReplayJob`]）
+fn spawn_replay_worker() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = REPLAY_TX.set(tx);
+    if let Err(e) = std::thread::Builder::new()
+        .name("bbvoxi-replay".into())
+        .spawn(move || replay_worker(rx))
+    {
+        // 补发线程起不来只影响"Win 键还账"，钩子本身照常工作 —— 记日志即可
+        crate::log::log(format!("Win 键补发线程启动失败（按 Win 可能打不开开始菜单）：{e}"));
+    }
+}
+
 /// 启动钩子线程。`paused` 为 true 时钩子完全不起作用（供设置界面捕捉快捷键用）。
 pub fn spawn(hk: Hotkey, tx: UnboundedSender<Cmd>, paused: Arc<AtomicBool>) -> Result<()> {
     set_current(hk);
     crate::log::log(format!("注册全局快捷键：{}", hk.display()));
     CTX.set(HookCtx {
-        tx,
+        tx: tx.clone(),
         paused,
         ctrl: AtomicBool::new(false),
         alt: AtomicBool::new(false),
@@ -468,14 +530,18 @@ pub fn spawn(hk: Hotkey, tx: UnboundedSender<Cmd>, paused: Arc<AtomicBool>) -> R
         session_win: AtomicU32::new(0),
     })
     .ok();
+    spawn_replay_worker();
 
-    std::thread::Builder::new()
+    // 钩子线程自己一份 sender（装钩子失败要往界面上报，见 `report_hook_failure`）
+    let tx_hook = tx.clone();
+    let spawned = std::thread::Builder::new()
         .name("bbvoxi-hotkey".into())
-        .spawn(|| unsafe {
+        .spawn(move || unsafe {
             let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) {
                 Ok(h) => h,
                 Err(e) => {
-                    crate::log::log(format!("安装全局键盘钩子失败：{e}"));
+                    // 装不上就必须让主人看见（见 `report_hook_failure` 的说明）
+                    report_hook_failure(&tx_hook, e);
                     return;
                 }
             };
@@ -496,7 +562,12 @@ pub fn spawn(hk: Hotkey, tx: UnboundedSender<Cmd>, paused: Arc<AtomicBool>) -> R
                 DispatchMessageW(&msg);
             }
             let _ = UnhookWindowsHookEx(hook);
-        })?;
+        });
+    if let Err(e) = spawned {
+        // 线程都没起来：钩子自然也没装上，同样要让主人看见
+        report_hook_failure(&tx, &e);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -510,7 +581,6 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
     const LLKHF_INJECTED: u32 = 0x10;
-    const LLKHF_EXTENDED: u32 = 0x01;
     let injected = kb.flags.0 & LLKHF_INJECTED != 0;
     // 双保险：除了系统标记，还看我们自己的 dwExtraInfo 标记
     let ours = kb.dwExtraInfo == crate::injector::INJECT_TAG;
@@ -560,23 +630,18 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         ctx.pending_win.store(decision.pending_win, Ordering::Relaxed);
         ctx.session_win.store(decision.session_win, Ordering::Relaxed);
 
-        // 还账：Win 的按下被我们接管了，主人真正想干的那件事在这里补给他（见 `Replay`）。
-        // 补发放在状态写回之后，而且必须在返回之前 —— 我们注入的事件会被这个钩子
-        // 立刻重新收到（注入的一律原样放行），状态先落定，重入的那一次才只是"看一眼"。
-        // 这里**只记数字不写日志**（钩子回调里禁止 I/O，理由见 `REPLAY_FAILURES`）。
-        match decision.replay {
-            Replay::None => {}
-            Replay::WinPress(win) => {
-                if crate::injector::press_win(win).is_err() {
-                    note_replay_failure();
-                }
-            }
-            Replay::WinThenCurrentKey(win) => {
-                let extended = kb.flags.0 & LLKHF_EXTENDED != 0;
-                let scan = kb.scanCode as u16;
-                if crate::injector::win_then_key(win, vk, scan, extended).is_err() {
-                    note_replay_failure();
-                }
+        // 还账：Win 的按下被我们接管了，主人真正想干的那件事交给**补发线程**去做
+        // （见 `ReplayJob` 与 `replay_worker`）。
+        //
+        // 这里**绝不能自己注入**：低级键盘钩子回调必须在毫秒级返回，一旦被 `SendInput`
+        // 拖过系统的 300ms 超时，Windows 会静默摘掉钩子（快捷键全废、Win 键乱弹，
+        // 日志里什么都没有 —— 报告第 6 条）。回调里只做一件事：把任务丢进通道。
+        // 状态在**这之前**已经写回（`decide` 的结果落过原子变量），所以补发线程稍后
+        // 注入出来的事件被这个钩子重新收到时，看到的已经是落定的状态。
+        if let Some(job) = replay_job(decision.replay, vk, kb.flags.0, kb.scanCode as u16) {
+            if let Some(tx) = REPLAY_TX.get() {
+                // `std::sync::mpsc::Sender::send` 不阻塞（无界队列），回调里用它是安全的
+                let _ = tx.send(job);
             }
         }
 
@@ -1052,6 +1117,58 @@ mod tests {
                 vk: 0x31,
             };
             assert_eq!(mods_bits(&hk), bits, "位 {bits:04b} 打包回去不一致");
+        }
+    }
+
+    /// Win 键补发的任务映射：钩子回调里**不再自己注入**，而是把任务交给补发线程。
+    ///
+    /// 回归（报告第 6 条）：回调里直接 `SendInput`，一旦被卡过系统 300ms 的超时，
+    /// Windows 会静默摘掉钩子（快捷键全废、Win 键乱弹，日志里什么都没有）。
+    /// 这条用例把"该补什么"钉死，剩下的交给线程池。
+    #[test]
+    fn replay_jobs_are_built_from_the_decision() {
+        assert_eq!(replay_job(Replay::None, 0x45, 0, 0x12), None, "不用补就什么都不发");
+        assert_eq!(
+            replay_job(Replay::WinPress(0x5B), 0x5B, 0, 0),
+            Some(ReplayJob::WinPress { win: 0x5B }),
+            "单独按 Win：补一整套按下+松开"
+        );
+        assert_eq!(
+            replay_job(Replay::WinThenCurrentKey(0x5B), 0x45, LLKHF_EXTENDED, 0x12),
+            Some(ReplayJob::WinThenKey {
+                win: 0x5B,
+                vk: 0x45,
+                scan: 0x12,
+                extended: true
+            }),
+            "Win+E：一次提交「Win 按下 + 当前键」，扫描码与扩展位要照原样带过去"
+        );
+        assert_eq!(
+            replay_job(Replay::WinThenCurrentKey(0x5C), 0x25, 0, 0x4B),
+            Some(ReplayJob::WinThenKey {
+                win: 0x5C,
+                vk: 0x25,
+                scan: 0x4B,
+                extended: false
+            }),
+            "不带扩展位时也要如实报 false（右 Win + 方向键以外的键）"
+        );
+    }
+
+    /// 钩子没装上时必须报给界面。
+    ///
+    /// 回归（报告第 8 条）：`SetWindowsHookExW` 失败以前只写日志，程序"一切正常" ——
+    /// 托盘、设置窗都在，实际一个键都没接管，主人只会觉得"按快捷键没反应"。
+    #[test]
+    fn hook_install_failure_is_reported_to_the_ui() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+        report_hook_failure(&tx, "SetWindowsHookExW 失败");
+        match rx.try_recv() {
+            Ok(Cmd::StartupFailure(msg)) => {
+                assert!(msg.contains("SetWindowsHookExW"), "失败原因要带上：{msg}");
+                assert!(msg.contains("快捷键"), "要说清楚后果（按键没反应）：{msg}");
+            }
+            other => panic!("钩子装不上时必须上报一条启动失败，实际：{other:?}"),
         }
     }
 

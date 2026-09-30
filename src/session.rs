@@ -10,7 +10,7 @@ use crate::asr::AsrClient;
 use crate::config::Config;
 use crate::{audio, clipboard, log, typer};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     /// 按住说话开始
     Start,
@@ -18,6 +18,12 @@ pub enum Cmd {
     Stop,
     /// 设置页的连通性测试
     Test,
+    /// 启动阶段的子系统失败（目前是全局键盘钩子没装上）。
+    ///
+    /// 为什么走这条通道：键盘钩子那边不碰界面状态，而会话线程正好拿着 `Shared`，
+    /// 由它统一写进快照 —— 托盘图标、状态胶囊、设置窗里的那行字就会一起亮起来，
+    /// 而不是"看起来一切正常、按键全都没反应"（报告第 8 条）。
+    StartupFailure(String),
 }
 
 #[derive(Clone, Default)]
@@ -138,26 +144,26 @@ impl Shared {
     }
 }
 
-/// 把钩子攒下的「Win 键补发失败」落成日志。
+/// 后台识别线程起不来时的那句话（线程建不起来 / 运行时建不起来，两条路共用）。
 ///
-/// 钩子回调里**禁止 I/O**（会被 Windows 静默摘钩子，见 `hotkey::take_replay_failures`），
-/// 所以那边只记次数与错误码，真正的日志在这里补上 —— 会话线程做 I/O 是安全的。
-fn log_replay_failures() {
-    let (count, code) = crate::hotkey::take_replay_failures();
-    if count > 0 {
-        log::log(format!(
-            "上次有 {count} 次 Win 键补发失败（最近错误码 {code}）——前台若是管理员权限\
-             窗口，注入会被系统拦下，那种情况下按 Win 不会弹开始菜单"
-        ));
-    }
+/// 抽出来是为了能单测：这条上报影响主人的判断（是不是软件坏了、要不要重启），
+/// 措辞和"必须真的写进界面状态"这两件事都值得钉住。
+fn report_session_start_failure(shared: &Shared, why: impl std::fmt::Display) {
+    let msg = format!("后台识别线程启动失败（{why}）：快捷键不会有任何反应，请重启程序");
+    log::log(&msg);
+    shared.fail(msg);
 }
 
-/// 启动会话线程，返回命令发送端
+/// 启动会话线程，返回命令发送端。
+///
+/// 线程（或它内部的 tokio 运行时）起不来时，**界面必须看得见**：这条链一断，
+/// 之后按快捷键、点测试、托盘命令全都石沉大海，而窗口一切正常 ——
+/// 主人只会觉得"这软件坏了，按了没反应"（报告第 2 条：静默死亡）。
 pub fn spawn(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>) -> UnboundedSender<Cmd> {
     let (tx, rx) = unbounded_channel();
     let sender = tx.clone();
-    // 线程起不来必须记日志：之后所有命令都会静默发送失败，没有这条日志无从排查
-    if let Err(e) = std::thread::Builder::new()
+    let for_thread = shared.clone();
+    let spawned = std::thread::Builder::new()
         .name("bbvoxi-session".into())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -167,14 +173,18 @@ pub fn spawn(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>) -> UnboundedSender<Cm
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    log::log(format!("创建异步运行时失败：{e}"));
+                    // 线程起来了、运行时建不出来：同样是"按什么键都没反应"，
+                    // 一样要报到界面上（这里还拿着 shared，能直接写进快照）
+                    report_session_start_failure(&for_thread, e);
                     return;
                 }
             };
-            runtime.block_on(worker(cfg, shared, rx));
-        })
-    {
-        log::log(format!("会话线程启动失败：{e}"));
+            runtime.block_on(worker(cfg, for_thread, rx));
+        });
+    if let Err(e) = spawned {
+        // 线程都没起来：发送端照旧返回（App 的结构不用改），但消息已经没人收了 ——
+        // 必须让主人看见，而不是只写进日志
+        report_session_start_failure(&shared, e);
     }
     sender
 }
@@ -191,8 +201,6 @@ async fn worker(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>, mut rx: UnboundedR
                     // 低级键盘钩子必须毫秒级返回，里面做文件 I/O 一旦卡住（杀软、
                     // 磁盘忙），Windows 会**悄悄**把钩子摘掉 —— 表现就是"快捷键突然
                     // 全都没反应、Win 键开始乱弹开始菜单"，而且日志里什么都没有。
-                    // 钩子那边只攒原子计数，由这里落成日志。
-                    log_replay_failures();
                     log::log("开始录音（收到启动指令）");
                     run_session(&cfg, &shared, &mut rx, false).await
                 }
@@ -203,6 +211,10 @@ async fn worker(cfg: Arc<Mutex<Config>>, shared: Arc<Shared>, mut rx: UnboundedR
                 // 空闲时收到 Stop 忽略即可（录音中的 Stop 由 run_session 自己的
                 // 循环收走，不会落到这里）
                 Cmd::Stop => log::log("结束录音指令（当前没在录音，已忽略）"),
+                // 启动阶段的子系统失败（比如全局键盘钩子没装上）：写进界面状态 ——
+                // 托盘图标、状态胶囊、设置窗里的那行字会一起亮起来，主人不用猜
+                // "为什么按快捷键没反应"（报告第 8 条）。上报方已经记过日志，这里不重复记。
+                Cmd::StartupFailure(msg) => shared.fail(msg),
             }
         })
         .catch_unwind()
@@ -303,6 +315,15 @@ async fn run_session(
     // 借用着，借用冲突编译不过。
     let mut mic_ended = false;
 
+    // 会话是不是中途失败的。**失败不能直接 return** —— 那会跳过"给服务端发结束
+    // 指令、松手后等最终结果的窗口、发关闭帧"三件事，而服务端很可能已经把主人
+    // 说的那句定稿了：结果取不回来，「最近识别」就停在上一次的内容，
+    // 主人手里只剩半句中间结果（报告第 1 条）。所以失败只记原因、跳出循环，
+    // 收尾走**和正常路径完全相同**的那一套。
+    let mut failure: Option<String> = None;
+    // 推流那一步失败的标志：链路本身已经不可信，后面再发结束帧只会白等一个超时
+    let mut link_broken = false;
+
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
@@ -314,6 +335,9 @@ async fn run_session(
                 None => break,
                 // 已经在录音，重复的启动指令忽略
                 Some(Cmd::Start) | Some(Cmd::Test) => {}
+                // 启动阶段的子系统失败随时可能到（正常是刚开机那会儿）：
+                // 这里只提示、不打断正在进行的这次录音
+                Some(Cmd::StartupFailure(msg)) => shared.report(msg),
             },
             frame = capture.rx.recv() => match frame {
                 Some(f) => {
@@ -323,15 +347,14 @@ async fn run_session(
                     match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&f)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            // 会话半路失败也要把已经识别到的部分留给主人（见该函数说明）
-                            keep_partial_on_failure(shared, &cfg, &mut client);
-                            shared.fail(format!("{e:#}"));
-                            return;
+                            failure = Some(format!("{e:#}"));
+                            link_broken = true;
+                            break;
                         }
                         Err(_) => {
-                            keep_partial_on_failure(shared, &cfg, &mut client);
-                            shared.fail("发送音频超时（网络不通），已结束本次录音");
-                            return;
+                            failure = Some("发送音频超时（网络不通），已结束本次录音".into());
+                            link_broken = true;
+                            break;
                         }
                     }
                 }
@@ -353,7 +376,19 @@ async fn run_session(
                         break;
                     }
                 }
-                None => break,
+                // 读线程结束 = 连接断了。**不能当成正常收场**：那样收尾会继续
+                // 给一条死链路发结束帧、等满窗口，最后还可能报一句误导的
+                // "没有识别到内容，请靠近麦克风再说一次"（其实是连接没了）。
+                None => {
+                    if let Ending::LinkBroken(reason) = ending_after_reader_closed(
+                        client.state.done,
+                        client.state.last_error.is_some(),
+                    ) {
+                        failure.get_or_insert_with(|| reason.to_string());
+                        link_broken = true;
+                    }
+                    break;
+                }
             },
             // 正常录音不设时限（None 时这个分支永不就绪）
             _ = async {
@@ -387,35 +422,36 @@ async fn run_session(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // 采集是自己结束的（rx 关闭）且带着错误：如实报「麦克风异常」。
+    // 采集是自己结束的（rx 关闭）且带着错误：把「麦克风异常」记成失败原因。
     // 不能含糊地说「没有识别到内容」—— 那会让主人以为是自己没说话，
-    // 其实是设备出了问题（被独占、被拔掉……）。
+    // 其实是设备出了问题（被独占、被拔掉……）。这里**不 return**：主人刚说的
+    // 那句话很可能还在服务端那头等着被取回来（见 `failure` 的说明）。
     if mic_ended {
         if let Some(msg) = capture.error() {
-            drop(capture);
-            // 麦克风挂了，但主人刚说的话可能已经识别出一部分 —— 别丢
-            keep_partial_on_failure(shared, &cfg, &mut client);
-            shared.fail(format!("麦克风异常：{msg}"));
-            return;
+            failure.get_or_insert_with(|| format!("麦克风异常：{msg}"));
         }
     }
 
     // 收干残留音频：上限 20 帧（约 2 秒）。残留再多也只是缓冲里陈旧的音频，
     // 没必要全发；给上限是为了杜绝「理论上一直有残留」时卡死。
     // 每一步同样加超时，网络不通时不能把会话挂死在这里。
-    for _ in 0..20 {
-        let Ok(frame) = capture.rx.try_recv() else {
-            break;
-        };
-        match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&frame)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log::log(format!("收尾发送残留音频失败：{e:#}"));
+    //
+    // 链路已经坏掉时整段跳过：再往服务端灌只会白等一个 5 秒超时，而主人已经在等了。
+    if !link_broken {
+        for _ in 0..20 {
+            let Ok(frame) = capture.rx.try_recv() else {
                 break;
-            }
-            Err(_) => {
-                log::log("收尾发送残留音频超时（网络不通）");
-                break;
+            };
+            match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::log(format!("收尾发送残留音频失败：{e:#}"));
+                    break;
+                }
+                Err(_) => {
+                    log::log("收尾发送残留音频超时（网络不通）");
+                    break;
+                }
             }
         }
     }
@@ -425,11 +461,16 @@ async fn run_session(
         s.hint = "正在识别…".into();
     });
 
-    if let Err(e) = client.finish().await {
-        log::log(format!("发送结束指令失败：{e:#}"));
+    // 给服务端发结束指令 —— 失败时这一步**更要发**：服务端手里那句往往已经定稿，
+    // 发了它才会把最终结果吐出来。只有推流那一步明确失败（链路不可信）时才跳过，
+    // 免得白等一个 5 秒超时。
+    if !link_broken {
+        if let Err(e) = client.finish().await {
+            log::log(format!("发送结束指令失败：{e:#}"));
+        }
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + final_wait(link_broken);
     while !client.state.done {
         tokio::select! {
             // 收尾期间主人又按了快捷键。麦克风在同一时刻就已经释放了，这次的
@@ -445,6 +486,7 @@ async fn run_session(
                     // 什么都不发生比报错更让人困惑
                     shared.report("上一次识别还没结束，请稍后再点「测试识别」");
                 }
+                Some(Cmd::StartupFailure(msg)) => shared.report(msg),
                 None => {}
             },
             msg = tokio::time::timeout_at(deadline, client.recv()) => match msg {
@@ -478,9 +520,22 @@ async fn run_session(
     shared.update(|s| {
         s.recording = false;
         s.hint.clear();
+        // 中途失败时这一步格外要紧：以前失败直接 return，「最近识别」永远停在
+        // 上一次的内容上，主人以为这次白说了
         s.last_result = text.clone();
         s.text = text.clone();
     });
+
+    if let Some(e) = &asr_error {
+        log::log(format!("识别过程中收到服务端错误：{e}"));
+    }
+
+    if let Some(reason) = failure {
+        // 会话中途失败：**结果照样交付**（能打进光标处就打，打不了就进剪贴板），
+        // 并把"为什么失败 + 结果在哪"合成一句话报出来
+        deliver_after_failure(shared, &cfg, &mut typer, test, &text, &reason).await;
+        return;
+    }
 
     if text.is_empty() {
         // 服务端有明确错误就显示它，否则提示没识别到内容
@@ -489,9 +544,6 @@ async fn run_session(
             None => shared.fail("没有识别到内容，请靠近麦克风再说一次"),
         }
         return;
-    }
-    if let Some(e) = asr_error {
-        log::log(format!("识别过程中收到服务端错误：{e}"));
     }
     log::log(format!("识别完成（{} 字）", text.chars().count()));
 
@@ -502,57 +554,30 @@ async fn run_session(
         return;
     }
 
-    ensure_target_focus(shared).await;
-    // 收尾：把最终文本同步到光标处。实时输入开着时通常只差最后几个字，
-    // 关掉实时输入时则在这里一次性打出全文。
+    // 收尾：把最终文本交付出去（能打进光标处就打，打不了就进剪贴板）。
     //
-    // 当前窗口是必填参数：`finish` 会拿它再核对一次 —— 主人可能在上一条结果
-    // 之后、这段收尾之前又切走了窗口（等最终结果时尤其容易），漏掉校验
-    // 就会把补打和退格送进别的程序。
-    //
-    // `finish` 返回三态，调用方必须分开处理（这正是为了堵住"结果被静默丢弃"）：
-    //   Ok(true)  = 文本已交付到目标程序（或本来就无需输入），继续往下走；
-    //   Ok(false) = 本次**放弃输入**（主人切走了窗口），结果必须改走剪贴板；
-    //   Err(_)    = 注入失败（管理员窗口、被拦……），同样改走剪贴板并把原因报出来。
-    match typer.finish(&text, foreground_window()) {
-        Ok(true) => {}
-        Ok(false) => {
-            // `sent` 里记的是打在**原窗口**里的字：此刻做收尾对账，退格会删掉主人
-            // 现在这个窗口里的内容；把整段重打到这儿同样是打错地方。所以一个字都不输入。
-            //
-            // 但结果不能就这么算了 —— 把它放到剪贴板，主人至少还能 Ctrl+V 粘回去。
-            // 这正是"切走窗口"这个场景下唯一安全的交付方式：不动别人的窗口，
-            // 又把文字交到主人手上（他此刻的焦点就是他要粘的地方）。
-            //
-            // 另外**绝不弹窗**：主人此刻就在别的程序里干活，把设置窗顶到最前面既打断
-            // 他、又会被当成"软件自己乱跳"（他报的就是这个）。提示走托盘与日志，
-            // 窗口里那句话也留着 —— 他愿意看的时候再看。
-            log::log("主人此刻不在原窗口，已放弃自动输入（结果放进剪贴板）");
-            shared.notice(hand_off_message(shared, &text));
-            return;
-        }
-        Err(e) => {
-            // 注入失败：错误照报，但结果同时放进剪贴板 —— 否则主人只能去设置窗里
-            // 手动选中复制。这里同样**不弹窗**（理由同上），靠托盘图标与悬浮文字提示；
-            // 主人打开设置窗时会看到这句话。
-            shared.fail(format!("{e}{}", hand_off_suffix(shared, &text)));
-            return;
-        }
-    }
-
-    // 「识别结果留一份到剪贴板」（默认开，见 `config::Options`）。
-    //
-    // 这是唯一能覆盖"注入报了成功、字却被目标程序悄悄丢掉"那一档的手段：那种
-    // 情况我们在客户端**根本观测不到** —— `SendInput` 只报告事件已入队，目标
-    // 收下再丢掉我们看不见；而且实测（Chrome/Electron 这类目标）连插入符都不给，
-    // 没有任何可核实的痕迹。所以只能保证主人手里始终有一份：随时 Ctrl+V 都还在。
-    if cfg.options.keep_on_clipboard {
-        match put_on_clipboard(shared, &text) {
-            None => log::log("识别结果已留在剪贴板（随时可 Ctrl+V）"),
-            Some(reason) => shared.notice(format!(
+    // 交付判断与**失败收尾共用同一份实现**（`deliver_result`）：实时输入开着时
+    // 通常只差最后几个字，关掉实时输入时则在这里一次性打出全文 —— 两种收尾
+    // 在这件事上的规则必须一致，只有"怎么把结果说给主人听"不同。
+    match deliver_result(shared, &cfg, &mut typer, &text).await {
+        Delivery::Typed { clipboard } => match clipboard {
+            // 没开「留一份」设置：不用多说
+            None => {}
+            Some(Ok(())) => log::log("识别结果已留在剪贴板（随时可 Ctrl+V）"),
+            // 留不住要说一声（但不弹窗）：主人以为剪贴板里有、去粘却粘不出来最气人
+            Some(Err(reason)) => shared.notice(format!(
                 "本次结果没能留在剪贴板（{reason}）：文字在设置窗的「最近识别」里，可手动复制"
             )),
+        },
+        // 一个字都没输入（主人切走了窗口）：此刻把设置窗顶到最前面既打断他、
+        // 又会被当成"软件自己乱跳"（他报的就是这个）。所以**绝不弹窗**，
+        // 提示走托盘、日志与窗口里那行字 —— 他愿意看的时候再看。
+        Delivery::HandedOff(notice) => {
+            log::log("主人此刻不在原窗口，已放弃自动输入（结果放进剪贴板）");
+            shared.notice(notice);
         }
+        // 注入失败：错误照报，但结果已经放进剪贴板了（理由同上）
+        Delivery::Failed(message) => shared.fail(message),
     }
 }
 
@@ -599,25 +624,148 @@ fn put_on_clipboard(shared: &Shared, text: &str) -> Option<String> {
     }
 }
 
-/// 会话中途失败（网络超时、麦克风异常）时，把**已经识别到的部分**也留一份到剪贴板。
+/// 读线程结束时该怎么定性（纯函数，便于单测）。
 ///
-/// 为什么：主人真正在意的是"字没打进去时手里得有一份"。会话半路结束时，实时输入
-/// 可能已经把半句打出去了、也可能一个字都没出去 —— 这时候什么都不留，等于把主人
-/// 刚说的话直接丢掉。只有在设置里关掉"留一份"时才什么都不做。
-fn keep_partial_on_failure(shared: &Shared, cfg: &Config, client: &mut AsrClient) {
-    if !cfg.options.keep_on_clipboard {
+/// `done`（服务端已经明确结束）或 `last_error`（服务端报了错）都是有交代的收场；
+/// 两者都没有却读到连接结束，那就是**被中断了** —— 必须按失败处理，
+/// 否则收尾会对着一条死链路干等，最后还可能报一句误导的"没有识别到内容"。
+enum Ending {
+    Normal,
+    LinkBroken(&'static str),
+}
+
+fn ending_after_reader_closed(done: bool, has_error: bool) -> Ending {
+    if done || has_error {
+        Ending::Normal
+    } else {
+        Ending::LinkBroken("连接被服务端中断")
+    }
+}
+
+/// 松手后等"最终结果"的窗口（正常路径）
+const FINAL_WAIT: Duration = Duration::from_secs(8);
+
+/// 推流那一步已经失败时等最终结果的窗口（链路不可信，不陪着一起干等）
+const BROKEN_LINK_FINAL_WAIT: Duration = Duration::from_secs(2);
+
+/// 收尾等最终结果要等多久。
+///
+/// 正常 8 秒：足够服务端把最后一句定稿吐回来。
+/// 推流已经失败时收短到 2 秒：链路多半已经断了，让主人对着"正在识别…"干等满
+/// 8 秒毫无意义；而**麦克风故障时网络是好的**，照常等满 8 秒 ——
+/// 服务端正要把那句定稿送出来（报告第 1 条：等最终结果这一步绝不能跳过）。
+fn final_wait(link_broken: bool) -> Duration {
+    if link_broken {
+        BROKEN_LINK_FINAL_WAIT
+    } else {
+        FINAL_WAIT
+    }
+}
+
+/// 一次收尾交付的结果（正常收尾与失败收尾都靠它把话说给主人听）
+enum Delivery {
+    /// 文本已经打进目标程序（光标处），或本来就无需输入。
+    /// `clipboard` 说的是"要不要/有没有在剪贴板再留一份"：
+    /// `None` = 主人没开这个设置；`Some(Ok(()))` = 留住了；`Some(Err(原因))` = 没留住。
+    Typed {
+        clipboard: Option<Result<(), String>>,
+    },
+    /// 本次**放弃输入**（主人切走了窗口）：一个字都没打，整段放进剪贴板。
+    /// 里面那句话已经把"到底复制成功没有"说清楚了（见 `hand_off_message`）。
+    HandedOff(String),
+    /// 注入失败（管理员窗口、被拦……）：错误原因 + "结果在哪"，同样已经放进剪贴板。
+    Failed(String),
+}
+
+/// 把最终文本交付出去：能打进光标处就打，打不进去就进剪贴板。
+///
+/// **正常收尾和失败收尾共用这一份**（口径只写一处，两边的说法才不会走偏）。
+/// `finish` 返回三态，这里逐态处理 —— 这正是为了堵住"结果被静默丢弃"：
+///   `Ok(true)`  文本已交付（或本来就无需输入）；
+///   `Ok(false)` 本次放弃输入（主人切走了窗口）；
+///   `Err(_)`    注入失败（管理员窗口、被拦……）。
+///
+/// 当前窗口是必填参数：`finish` 会拿它再核对一次 —— 主人可能在上一条结果之后、
+/// 这段收尾之前又切走了窗口（等最终结果时尤其容易），漏掉校验就会把补打和退格
+/// 送进别的程序。
+async fn deliver_result(
+    shared: &Shared,
+    cfg: &Config,
+    typer: &mut typer::LiveTyper,
+    text: &str,
+) -> Delivery {
+    ensure_target_focus(shared).await;
+    match typer.finish(text, foreground_window()) {
+        Ok(true) => {
+            // 「识别结果留一份到剪贴板」（默认开，见 `config::Options`）。
+            //
+            // 这是唯一能覆盖"注入报了成功、字却被目标程序悄悄丢掉"那一档的手段：
+            // 那种情况客户端**根本观测不到** —— `SendInput` 只报告事件已入队，
+            // 目标收下再丢掉我们看不见。所以只能保证主人手里始终有一份。
+            let clipboard = cfg.options.keep_on_clipboard.then(|| {
+                match put_on_clipboard(shared, text) {
+                    None => Ok(()),
+                    Some(why) => Err(why),
+                }
+            });
+            Delivery::Typed { clipboard }
+        }
+        // `sent` 里记的是打在**原窗口**里的字：此刻做收尾对账，退格会删掉主人现在
+        // 这个窗口里的内容；把整段重打到这儿同样是打错地方。所以一个字都不输入，
+        // 改成"整段放进剪贴板"—— 这是此刻唯一安全的交付方式（不动别人的窗口，
+        // 又把文字交到主人手上，他此刻的焦点就是他要粘的地方）。
+        Ok(false) => Delivery::HandedOff(hand_off_message(shared, text)),
+        // 注入失败：错误照报，但结果同时放进剪贴板 —— 否则主人只能去设置窗里手动选中复制。
+        Err(e) => Delivery::Failed(format!("{e}{}", hand_off_suffix(shared, text))),
+    }
+}
+
+/// 会话中途失败时的收尾：**已经识别到的内容一个字都不能丢**，并且把
+/// "为什么失败"和"结果放在哪"合成一句话告诉主人。
+///
+/// 旧实现在三条失败路径（麦克风异常 / 推流失败 / 推流超时）上直接 `return`：
+/// 既没去取服务端已经定稿的那句，也没把结果交付出去 ——「最近识别」停在上一次，
+/// 主人手里只剩半句中间结果（报告第 1 条）。交付动作与正常收尾共用
+/// [`deliver_result`]，这里只额外负责"把失败原因说清楚"。
+async fn deliver_after_failure(
+    shared: &Shared,
+    cfg: &Config,
+    typer: &mut typer::LiveTyper,
+    test: bool,
+    text: &str,
+    reason: &str,
+) {
+    if text.trim().is_empty() {
+        // 什么都没识别到：如实报失败原因（比含糊的"没有识别到内容"有用得多）
+        shared.fail(reason.to_string());
         return;
     }
-    let partial = client.take_result();
-    if partial.trim().is_empty() {
+    let count = text.chars().count();
+    if test {
+        // 测试模式：结果只回显在设置窗里，一个字都不许往外打
+        shared.fail(format!(
+            "{reason}（已识别到的 {count} 字在窗口的「最近识别」里）"
+        ));
         return;
     }
-    match put_on_clipboard(shared, &partial) {
-        None => log::log(format!(
-            "会话中途结束，已把已识别到的 {} 字留在剪贴板",
-            partial.chars().count()
-        )),
-        Some(reason) => log::log(format!("会话中途结束，留下的内容没能进剪贴板：{reason}")),
+    match deliver_result(shared, cfg, typer, text).await {
+        Delivery::Typed { clipboard } => {
+            let extra = match clipboard {
+                None => String::new(),
+                Some(Ok(())) => "，并留了一份到剪贴板".to_string(),
+                Some(Err(why)) => format!("（没能留进剪贴板：{why}）"),
+            };
+            log::log(format!("会话中途失败，已把识别到的 {count} 字输入到光标处"));
+            shared.fail(format!("{reason}；识别到的 {count} 字已输入到光标处{extra}"));
+        }
+        Delivery::HandedOff(notice) => {
+            log::log("会话中途失败，且主人不在原窗口：结果改走剪贴板");
+            shared.fail(format!("{reason}；{notice}"));
+        }
+        Delivery::Failed(message) => {
+            log::log(format!("会话中途失败，且注入被拒：{message}"));
+            shared.fail(format!("{reason}；{message}"));
+        }
     }
 }
 
@@ -768,5 +916,153 @@ mod tests {
         );
         assert!(snap.error.is_none());
         assert!(snap.started.is_none(), "计时要从麦克风与服务都就绪后才开始");
+    }
+
+    /// 失败收尾：**已经识别到的内容一个字都不能丢**。
+    ///
+    /// 回归（报告第 1 条）：旧实现在会话中途失败（麦克风异常 / 推流失败 / 推流超时）
+    /// 时直接 `return` —— 跳过了取回服务端最终结果这一步，「最近识别」永远停在上
+    /// 一次的内容上，主人手里只剩半句中间结果。现在失败也要把结果交付出去，
+    /// 并把"识别到了多少字"说清楚。
+    ///
+    /// 用 `test = true` 跑：这条路不会注入、不会碰剪贴板（测试模式对主人的承诺
+    /// 就是"一个字都不往外打"），所以可以放心在单测里走。
+    #[tokio::test]
+    async fn a_failed_session_still_reports_what_was_recognized() {
+        let shared = Shared::new(egui::Context::default());
+        let mut cfg = Config::default();
+        cfg.options.keep_on_clipboard = false; // 别让测试去动真实剪贴板
+        let mut t = typer::LiveTyper::muted();
+        deliver_after_failure(
+            &shared,
+            &cfg,
+            &mut t,
+            true,
+            "你好世界",
+            "麦克风异常：设备被独占",
+        )
+        .await;
+        let snap = shared.snapshot();
+        let msg = snap.error.expect("失败原因必须报出来");
+        assert!(msg.contains("麦克风异常"), "原因要原样带上：{msg}");
+        assert!(msg.contains("4 字"), "要告诉主人这次识别到了多少字：{msg}");
+        assert!(!snap.recording, "失败之后不能还显示成'录音中'");
+    }
+
+    /// 失败收尾：什么都没识别到时，报的就是失败原因本身 ——
+    /// 不能含糊地说"没有识别到内容"，那会让主人以为是自己没说话
+    /// （其实是设备/网络出了问题）
+    #[tokio::test]
+    async fn a_failed_session_without_text_reports_the_reason_itself() {
+        let shared = Shared::new(egui::Context::default());
+        let cfg = Config::default();
+        let mut t = typer::LiveTyper::muted();
+        deliver_after_failure(
+            &shared,
+            &cfg,
+            &mut t,
+            true,
+            "   ",
+            "发送音频超时（网络不通），已结束本次录音",
+        )
+        .await;
+        assert_eq!(
+            shared.snapshot().error.as_deref(),
+            Some("发送音频超时（网络不通），已结束本次录音")
+        );
+    }
+
+    /// 等最终结果的窗口：链路坏掉时收短，但**绝不能是 0** ——
+    /// 服务端可能已经把最后一句定稿了，这个窗口是我们唯一能把它取回来的机会
+    #[test]
+    fn final_wait_shrinks_but_never_vanishes_when_the_link_is_broken() {
+        assert_eq!(final_wait(false), FINAL_WAIT);
+        assert_eq!(final_wait(true), BROKEN_LINK_FINAL_WAIT);
+        assert!(!final_wait(true).is_zero(), "窗口再短也得留出取结果的机会");
+        assert!(
+            final_wait(true) < final_wait(false),
+            "链路已经坏掉时不该陪它干等满 8 秒"
+        );
+    }
+
+    /// 交付判断只有一份实现：安静打字器（测试模式）+ 关掉"留一份"时，
+    /// 结果应报成"已交付"，而且**不碰剪贴板**（单测绝不许动主人真实的剪贴板）。
+    #[tokio::test]
+    async fn deliver_result_reports_typed_without_touching_the_clipboard() {
+        let shared = Shared::new(egui::Context::default());
+        let mut cfg = Config::default();
+        cfg.options.keep_on_clipboard = false; // 别让测试去动真实剪贴板
+        let mut t = typer::LiveTyper::muted();
+        let delivery = deliver_result(&shared, &cfg, &mut t, "你好世界").await;
+        match delivery {
+            Delivery::Typed { clipboard } => {
+                assert!(clipboard.is_none(), "没开「留一份」时不该去写剪贴板");
+            }
+            _ => panic!("测试模式的收尾必须是「已交付」，不能是放弃输入或失败"),
+        }
+        assert!(shared.snapshot().error.is_none(), "交付成功不该报错");
+    }
+
+    /// 读线程结束时怎么定性（回归，评审发现）：连接被中断以前被当成正常收场 ——
+    /// 收尾会对着一条死链路干等，最后还可能报一句误导的"没有识别到内容，
+    /// 请靠近麦克风再说一次"（其实是连接没了）。
+    #[test]
+    fn a_silent_connection_drop_counts_as_a_failure() {
+        assert!(
+            matches!(ending_after_reader_closed(true, false), Ending::Normal),
+            "服务端明确结束 = 有交代的收场"
+        );
+        assert!(
+            matches!(ending_after_reader_closed(false, true), Ending::Normal),
+            "服务端报过错 = 也有交代"
+        );
+        match ending_after_reader_closed(false, false) {
+            Ending::LinkBroken(reason) => {
+                assert!(reason.contains("中断"), "要说清是连接断了：{reason}");
+            }
+            Ending::Normal => panic!("什么都没交代就断线，绝不能当成正常收场"),
+        }
+    }
+
+    /// 后台识别线程（或它内部的运行时）起不来时，**界面必须看得见**。
+    ///
+    /// 回归（报告第 2 条）：这条链断了之后，按快捷键、点测试、托盘命令全都
+    /// 石沉大海，而窗口一切正常 —— 主人只会觉得"软件坏了，按了没反应"。
+    ///
+    /// 线程创建失败没法在单测里人为制造，所以这里钉的是"上报"这一步：
+    /// 只要走进这条上报，快照里就必须有一条能看懂、能指导下一步的错误。
+    #[test]
+    fn a_dead_session_thread_is_reported_to_the_ui() {
+        let shared = Shared::new(egui::Context::default());
+        report_session_start_failure(&shared, "操作系统拒绝创建线程");
+        let snap = shared.snapshot();
+        let msg = snap.error.expect("启动失败必须写进界面状态（不能只写日志）");
+        assert!(msg.contains("操作系统拒绝创建线程"), "原因要带上：{msg}");
+        assert!(msg.contains("快捷键"), "要说清楚后果（按键会没反应）：{msg}");
+        assert!(msg.contains("重启"), "要给主人一条能走的路：{msg}");
+        assert!(!snap.recording, "启动失败不能谎称在录音");
+    }
+
+    /// 全局键盘钩子没装上时，会话线程要把它写进界面状态。
+    ///
+    /// 回归（报告第 8 条）：钩子安装失败以前只写日志、程序"一切正常"，实际一个键
+    /// 都没接管 —— 主人只会觉得"按快捷键没反应"。这条用例走的是真正的会话线程
+    /// （端到端），只喂一条 `Cmd::StartupFailure`，不碰麦克风与网络。
+    #[tokio::test]
+    async fn a_hook_install_failure_reaches_the_ui_through_the_worker() {
+        let shared = Arc::new(Shared::new(egui::Context::default()));
+        let cfg = Arc::new(Mutex::new(Config::default()));
+        let (tx, rx) = unbounded_channel();
+        tx.send(Cmd::StartupFailure(
+            "全局快捷键没能装上（SetWindowsHookExW 失败）：按快捷键不会有任何反应".into(),
+        ))
+        .unwrap();
+        drop(tx); // 队列排空后 worker 自己退出
+        worker(cfg, shared.clone(), rx).await;
+        let msg = shared
+            .snapshot()
+            .error
+            .expect("钩子装不上必须写进界面状态");
+        assert!(msg.contains("没能装上"), "原因要原样带到界面上：{msg}");
     }
 }

@@ -475,10 +475,20 @@ impl eframe::App for App {
             }
         }
 
-        // 关闭按钮 = 隐藏到托盘，不退出进程
+        // 关闭按钮 = 隐藏到托盘，不退出进程。但改过配置还没保存时，先问一句 ——
+        // 旧实现是直接隐藏，改了半天 API Key / 快捷键点一下 ✕ 就没了，一声不吭。
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.settings.cancel_capture();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.settings.has_unsaved_changes() {
+                self.settings.ask_before_close();
+            } else {
+                self.settings.cancel_capture();
+                self.hide_window(ctx);
+            }
+        }
+        // 关窗确认里选了「保存并关闭 / 不保存」：窗口显隐统一由这里执行
+        if self.settings.take_hide_request() {
+            self.settings.cancel_capture();
             self.hide_window(ctx);
         }
 
