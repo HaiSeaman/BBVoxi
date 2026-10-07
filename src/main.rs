@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([win_w, win_h])
-            .with_min_inner_size([460.0, 560.0])
+            .with_min_inner_size([520.0, 560.0])
             .with_position(if start_visible { win_pos } else { HIDDEN_POS })
             // 光靠这一句**不够**：eframe 在首帧渲染完之后会无条件
             // `window.set_visible(true)`（见 epi_integration::post_rendering），
@@ -64,6 +64,8 @@ fn main() -> Result<()> {
         Box::new(move |cc| {
             setup_cjk_font(&cc.egui_ctx);
             ui::setup_style(&cc.egui_ctx);
+            // 启动就恢复主人选的主题（老配置没有该字段时默认跟随系统）
+            ui::apply_theme(&cc.egui_ctx, cfg.theme);
             Ok(Box::new(App::new(
                 cc,
                 cfg,
@@ -163,7 +165,9 @@ fn window_geometry() -> (f32, f32, [f32; 2]) {
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
         let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
         if sw > 0 && sh > 0 {
-            let w = 500.0f32;
+            // 580：设置行改成「左标题+说明、右开关」的行卡片后需要更多横向空间，
+            // 500 宽时说明只剩十几个字的宽度；580 在 1024 宽的最小屏幕上也放得下
+            let w = 580.0f32;
             // 预留标题栏与任务栏的空间
             let h = ((sh as f32) - 160.0).clamp(560.0, 900.0);
             let x = ((sw as f32) - w) / 2.0;
@@ -171,7 +175,7 @@ fn window_geometry() -> (f32, f32, [f32; 2]) {
             return (w, h, [x, y]);
         }
     }
-    (500.0, 780.0, [120.0, 80.0])
+    (580.0, 780.0, [120.0, 80.0])
 }
 
 /// 单实例保护：命名互斥量已存在说明已有实例在运行。/// ponytail: 只做互斥，不做进程间唤醒（需要再加 WM_COPYDATA）
@@ -545,6 +549,12 @@ fn window_icon() -> egui::IconData {
     }
 }
 
+// 图标资源由 scripts/make_icons.py 从源图去背后导出（去掉了棋盘格背景，保留透明通道）
+static ICON_IDLE: &[u8] = include_bytes!("../assets/rgba32_idle.bin");
+static ICON_REC: &[u8] = include_bytes!("../assets/rgba32_rec.bin");
+static ICON_ERR: &[u8] = include_bytes!("../assets/rgba32_err.bin");
+static ICON_WINDOW: &[u8] = include_bytes!("../assets/rgba128_window.bin");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,9 +572,3 @@ mod tests {
         assert!(!first.poll(), "自动复位：一次唤醒只应弹出一次设置窗");
     }
 }
-
-// 图标资源由 scripts/make_icons.py 从源图去背后导出（去掉了棋盘格背景，保留透明通道）
-static ICON_IDLE: &[u8] = include_bytes!("../assets/rgba32_idle.bin");
-static ICON_REC: &[u8] = include_bytes!("../assets/rgba32_rec.bin");
-static ICON_ERR: &[u8] = include_bytes!("../assets/rgba32_err.bin");
-static ICON_WINDOW: &[u8] = include_bytes!("../assets/rgba128_window.bin");

@@ -6,7 +6,11 @@ use std::path::PathBuf;
 
 // —— 写死的官方接口地址（2026-09-10 核实自各家官方文档）——
 pub const QWEN_URL: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
-pub const QWEN_MODEL: &str = "qwen-audio-3.0-asr-flash-streaming";
+/// 千问当前默认模型（3.1：官方最新流式识别模型，新增方言保留、近场 VAD 等能力）。
+pub const QWEN_MODEL: &str = "qwen-audio-3.1-asr-flash-streaming";
+/// 旧默认模型（3.0）。只用于配置迁移：老配置里存的还是它时自动升级到 3.1；
+/// 主人自己改过的其他模型名（如 fun-asr-realtime）原样保留。
+const QWEN_MODEL_LEGACY: &str = "qwen-audio-3.0-asr-flash-streaming";
 pub const DOUBAO_URL_STREAM: &str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async";
 pub const DOUBAO_URL_NOSTREAM: &str =
     "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream";
@@ -14,19 +18,46 @@ pub const DOUBAO_RESOURCE: &str = "volc.seedasr.sauc.duration";
 pub const TENCENT_URL: &str = "wss://asr.cloud.tencent.com/asr/v2";
 pub const TENCENT_ENGINES: [&str; 2] = ["Hy-ASR-3.0-preview", "16k_zh_en"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// 识别语言选项（内部代码 → 界面显示名），`Options.language` 存代码。
+/// 三家落实方式不同：豆包映射官方 language 参数（并切整句端点）、
+/// 腾讯映射语言引擎、千问模型自身自动检测（无需参数）。
+pub const LANGUAGES: [(&str, &str); 10] = [
+    ("auto", "自动"),
+    ("zh", "中文"),
+    ("en", "英语"),
+    ("yue", "粤语"),
+    ("ja", "日语"),
+    ("ko", "韩语"),
+    ("fr", "法语"),
+    ("de", "德语"),
+    ("ru", "俄语"),
+    ("es", "西班牙语"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    #[default]
     #[serde(alias = "aliyun")]
     Qwen,
     Doubao,
     Tencent,
 }
 
-impl Default for Provider {
-    fn default() -> Self {
-        Provider::Qwen
-    }
+/// 界面主题：跟随系统的深浅色，或固定其中一种。
+///
+/// 序列化成小写字符串（"system" / "light" / "dark"），配置文件里一眼能看懂。
+/// `Config` 整体带 `#[serde(default)]`，所以老配置文件里没有这个字段时
+/// 自动落回「跟随系统」—— 不需要版本迁移，主人升级后行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThemeMode {
+    #[default]
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "light")]
+    Light,
+    #[serde(rename = "dark")]
+    Dark,
 }
 
 impl Provider {
@@ -118,6 +149,13 @@ pub struct Options {
     pub clipboard_fallback: bool,
     /// 识别结果总留一份到剪贴板（成功输入也留）
     pub keep_on_clipboard: bool,
+    /// 个人词典（热词），一行一个词：人名、品牌名、术语等会被优先识别。
+    /// 千问走即时热词 + 上下文增强；豆包走请求级热词；腾讯云暂不支持。
+    pub hotwords: String,
+    /// 识别语言（"auto" = 跟随各家默认的中英自动检测）。
+    /// 非自动时：豆包传官方 language 参数（自动切整句端点）、腾讯切对应引擎、
+    /// 千问模型自身多语种自动检测（无需参数）。
+    pub language: String,
 }
 
 impl Default for Options {
@@ -138,6 +176,10 @@ impl Default for Options {
             // 代价是主人原来复制的内容会被顶掉（这正是它的说明里写的），
             // 不想要这个代价的可以显式关掉。
             keep_on_clipboard: true,
+            // 个人词典默认空（不传热词，行为与升级前完全一致）
+            hotwords: String::new(),
+            // 语言默认"自动"：不传 language 参数，行为与升级前完全一致
+            language: "auto".into(),
         }
     }
 }
@@ -152,6 +194,7 @@ pub struct Config {
     pub doubao: DoubaoConfig,
     pub tencent: TencentConfig,
     pub options: Options,
+    pub theme: ThemeMode,
 }
 
 impl Default for Config {
@@ -167,6 +210,7 @@ impl Default for Config {
             doubao: DoubaoConfig::default(),
             tencent: TencentConfig::default(),
             options: Options::default(),
+            theme: ThemeMode::default(),
         }
     }
 }
@@ -204,7 +248,7 @@ fn migrate_legacy_default_hotkey(cfg: &mut Config) -> bool {
 }
 
 /// 当前配置版本。引入"必须改老配置"的行为变更时就 +1，并在 [`migrate`] 里补一步。
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// 把读到的配置升级到当前版本，返回是否改动了配置（改了就要写回）。
 ///
@@ -216,6 +260,9 @@ const CURRENT_VERSION: u32 = 2;
 /// 这一档 —— 那一档**无法核实**（`SendInput` 只报告事件入队成功，目标程序收下
 /// 再丢掉我们完全看不见；Chrome/Electron 这类目标连插入符都不给，实测过），
 /// 所以唯一可靠的兜底就是"永远留一份"。改为默认开。
+///
+/// 2 → 3：千问默认模型 3.0 → 3.1（3.1 支持近场 VAD、去语气词等新参数）。
+/// 只升"从没动过"的旧默认值，主人自己填的模型名原样保留（同快捷键迁移的套路）。
 fn migrate(cfg: &mut Config) -> bool {
     if cfg.version >= CURRENT_VERSION {
         return false;
@@ -237,6 +284,12 @@ fn migrate(cfg: &mut Config) -> bool {
     if !cfg.options.keep_on_clipboard {
         cfg.options.keep_on_clipboard = true;
         crate::log::log("配置升级：识别结果改为默认留一份到剪贴板（可在设置里关掉）");
+    }
+    // 2 → 3：千问旧默认模型 3.0 → 3.1。字符串精确匹配旧默认值：
+    // 主人自己改过的模型（哪怕只差一个字符）都不动。
+    if cfg.qwen.model == QWEN_MODEL_LEGACY {
+        cfg.qwen.model = QWEN_MODEL.into();
+        crate::log::log("配置升级：千问默认模型已从 3.0 升级到 3.1");
     }
     cfg.version = CURRENT_VERSION;
     // 版本号本身就是要落盘的改动，所以这里一律返回 true（幂等靠上面那句早退保证）
@@ -355,6 +408,22 @@ mod tests {
         assert_eq!(cfg.tencent.engine_model_type, "Hy-ASR-3.0-preview");
     }
 
+    /// 主题字段对老配置文件必须是纯增量：文件里没有这一项就落回「跟随系统」，
+    /// 主人升级后界面行为一个字都不变（不需要版本迁移）。
+    #[test]
+    fn theme_defaults_to_system_and_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&ThemeMode::System).unwrap(), "\"system\"");
+        assert_eq!(serde_json::to_string(&ThemeMode::Light).unwrap(), "\"light\"");
+        assert_eq!(serde_json::to_string(&ThemeMode::Dark).unwrap(), "\"dark\"");
+        // 老配置文件：没有任何 theme 字段
+        let old: Config = serde_json::from_str(
+            "{\"version\":2,\"provider\":\"qwen\",\"hotkey\":\"ctrl+win\",\
+             \"qwen\":{},\"doubao\":{},\"tencent\":{},\"options\":{}}",
+        )
+        .expect("老配置文件必须能读进来");
+        assert_eq!(old.theme, ThemeMode::System, "缺字段时默认跟随系统");
+    }
+
     /// 默认快捷键必须是「Ctrl + Win」，而且必须真的能解析出来 ——
     /// 默认值写错一个词，首次启动就会在日志里报"快捷键无法解析"并悄悄回退。
     #[test]
@@ -448,6 +517,59 @@ mod tests {
         assert_eq!(back.hotkey, "ctrl+win");
         let hk = crate::hotkey::parse(&back.hotkey).unwrap();
         assert!(hk.ctrl && hk.win && hk.is_pure_modifiers());
+    }
+
+    /// 回归（千问 3.1 升级）：老配置里存的旧默认模型（3.0）必须自动升到 3.1。
+    /// 与快捷键迁移同套路：只认"从没动过"的精确旧默认值。
+    #[test]
+    fn migrates_legacy_default_qwen_model_to_31() {
+        let mut cfg = Config {
+            version: 2,
+            qwen: QwenConfig {
+                model: QWEN_MODEL_LEGACY.into(),
+                ..QwenConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(migrate(&mut cfg), "2 → 3 必须报告配置已改动");
+        assert_eq!(cfg.qwen.model, QWEN_MODEL, "旧默认模型必须升到 3.1");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+        // 已是当前版本：再跑一遍什么都不能动（幂等）
+        assert!(!migrate(&mut cfg));
+    }
+
+    /// 主人自己填的模型名（如 fun-asr-realtime），哪怕只差一个字符，都不许动。
+    #[test]
+    fn migration_leaves_custom_qwen_models_alone() {
+        let mut cfg = Config {
+            version: 2,
+            qwen: QwenConfig {
+                model: "fun-asr-realtime".into(),
+                ..QwenConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(migrate(&mut cfg), "版本号本身要写回（2 → 3）");
+        assert_eq!(
+            cfg.qwen.model, "fun-asr-realtime",
+            "主人自己改过的模型必须原样保留"
+        );
+    }
+
+    /// 新增的 hotwords / language 字段对老配置是纯增量：
+    /// 文件里没有就落回默认（空词表 / auto），行为与升级前完全一致。
+    #[test]
+    fn new_option_fields_default_for_old_configs() {
+        let old: Config = serde_json::from_str(
+            "{\"version\":2,\"provider\":\"qwen\",\"hotkey\":\"ctrl+win\",\
+             \"qwen\":{},\"doubao\":{},\"tencent\":{},\"options\":{},\"theme\":\"system\"}",
+        )
+        .expect("老配置文件必须能读进来");
+        assert_eq!(old.options.hotwords, "");
+        assert_eq!(old.options.language, "auto");
+        // 默认值本身
+        assert_eq!(Options::default().hotwords, "");
+        assert_eq!(Options::default().language, "auto");
     }
 
     #[test]

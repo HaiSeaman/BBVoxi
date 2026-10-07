@@ -1,11 +1,13 @@
 //! 设置窗口。
 //!
 //! 设计基调取自应用图标本身（靛蓝→青绿的渐变），克制使用一个强调色：
-//! 顶部品牌栏 + 卡片分区 + 底部固定操作条；所有颜色来自 `Palette`，
-//! 跟随系统深浅色自动切换。
+//! 顶部品牌栏 + 三页签分区 + 卡片行布局 + 底部固定操作条；所有颜色来自
+//! `Palette`，支持「跟随系统 / 浅色 / 深色」三选一（见 `ThemeMode`）。
 
 use crate::autostart;
-use crate::config::{Config, Provider, TENCENT_ENGINES, TENCENT_URL};
+use crate::config::{
+    Config, Provider, ThemeMode, LANGUAGES, TENCENT_ENGINES, TENCENT_URL,
+};
 use crate::hotkey::{self, Hotkey};
 use crate::session::{Cmd, Shared, Snapshot};
 use eframe::egui;
@@ -249,6 +251,45 @@ fn pill_state(
     }
 }
 
+/// 设置窗口的三个页签。
+///
+/// 为什么是三个、为什么用顶部页签而不是侧边栏：设置的分组只有 3 个，
+/// 窄窗口（580px）里侧边栏要吃掉三分之一宽度；顶部页签让每个分组
+/// 独占一屏，改一个开关不用再从一堆 API Key 里翻山越岭。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Tab {
+    /// 服务商与凭据（一次性配置，配好就不动）
+    Service,
+    /// 识别行为开关（日常最常调的一页）
+    Options,
+    /// 快捷键 / 开机自启 / 界面主题
+    General,
+}
+
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Service, Tab::Options, Tab::General];
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Service => "语音服务",
+            Tab::Options => "识别选项",
+            Tab::General => "通用",
+        }
+    }
+}
+
+/// 把配置里的主题选择灌进 egui（跟随系统 / 浅色 / 深色）。
+///
+/// `Palette` 每帧按 `visuals().dark_mode` 取色，所以这一句生效后
+/// 下一帧整套配色（含对比度校验过的所有文字色）自动跟上。
+pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    let pref = match mode {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Light => egui::ThemePreference::Light,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+    };
+    ctx.set_theme(pref);
+}
+
 pub struct SettingsApp {
     edit: Config,
     /// 上一次保存（或刚加载）时的那份配置，见 `has_unsaved_changes`
@@ -267,6 +308,8 @@ pub struct SettingsApp {
     applied_autostart: bool,
     capturing: bool,
     hotkey_error: Option<String>,
+    /// 当前停在哪个页签（默认语音服务：首次运行最要紧的事就是填凭据）
+    tab: Tab,
     /// 捕捉过程中记下的「当前凑齐的修饰键」。
     ///
     /// 为什么需要它：像 Ctrl+Win 这种**纯修饰键组合**没有主键可听，而 egui 只为
@@ -304,6 +347,7 @@ impl SettingsApp {
             applied_autostart: autostart,
             capturing: false,
             hotkey_error: None,
+            tab: Tab::Service,
             pending_mods: None,
             painted_at: Instant::now(),
         }
@@ -381,16 +425,6 @@ impl SettingsApp {
         // 关窗确认画在最上层（有没保存的改动时才会出现）
         self.close_confirm(ui.ctx(), &p);
 
-        // 先放底部固定操作条，中央区域再吃掉剩下的空间（egui 的面板顺序要求）
-        egui::Panel::bottom("bbvoxi_actions")
-            .frame(
-                egui::Frame::new()
-                    .fill(p.card)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .inner_margin(Margin::symmetric(16, 10)),
-            )
-            .show(ui, |ui| self.actions_bar(ui, &p));
-
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -398,24 +432,53 @@ impl SettingsApp {
                     .inner_margin(Margin::symmetric(16, 12)),
             )
             .show(ui, |ui| {
+                ui.add_space(2.0);
+                self.header(ui, &p);
+                ui.add_space(8.0);
+                // 页签常驻滚动区外：切页永远一步可达
+                self.tabs_bar(ui, &p);
+                ui.add_space(8.0);
+                // 滚动区限高：可用高度减去页脚，页脚（反馈条 + 按钮行）才能
+                // 顺排其后、钉在窗口底。`auto_shrink(false)` 只会让滚动区吃满
+                // "给定"的空间，若不限高它会把页脚整块挤到面板外裁掉。
+                // FOOTER_H 必须 ≥ 页脚真实高度（分隔线区 + 反馈条 + 按钮行），
+                // 现在按钮行不再有动态的状态行，高度是恒定的。
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .max_height(ui.available_height() - FOOTER_H)
                     // 滚动条平时不占位置（滚轮照样能滚）：界面更干净，
                     // 而且省下的一条竖向空间正好给内容用
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.add_space(2.0);
-                        self.header(ui, &p);
-                        ui.add_space(10.0);
-                        // 反馈区紧跟品牌栏：测试录音时不用滚动就能看到实时文字。
-                        // 旧版把它排在三张配置卡之后，768 高的笔记本上整块看不见 ——
-                        // 恰恰是最需要它的机器上失效（报告第 1 条）。
-                        self.result_card(ui, &p);
-                        ui.add_space(8.0);
-                        // 配置合成一张卡：说明文字收进悬停气泡，5 张卡变 2 张
-                        self.settings_card(ui, &p);
+                        // 控件 id 按页隔离：切页时各页输入框的焦点/光标状态互不串
+                        ui.push_id(self.tab, |ui| match self.tab {
+                            Tab::Service => self.service_page(ui, &p),
+                            Tab::Options => self.options_page(ui, &p),
+                            Tab::General => self.general_page(ui, &p),
+                        });
                         ui.add_space(6.0);
                     });
+                // —— 页脚：「最近识别」反馈条 + 按钮行，钉在窗口底 ——
+                //
+                // 不用 `egui::Panel::bottom`：egui 0.35 的 Panel 第一帧用
+                // "interact_size + 边距"当猜测高度来布局，内容比它高时溢出部分
+                // 直接被裁掉（实测按钮整行画到窗口外，保存/测试按钮全看不见，
+                // 要等第二帧面板记忆了真实高度才恢复）。ScrollArea 竖向
+                // auto_shrink=false 会吃掉上方全部剩余空间，页脚顺排其后，
+                // 天然贴底，而且单帧布局就是对的。
+                ui.add_space(4.0);
+                // 分隔线跨满窗口宽：普通控件画不到面板边距外，借 clip_rect 撑
+                let clip = ui.clip_rect();
+                ui.painter().hline(
+                    clip.left()..=clip.right(),
+                    ui.cursor().top() + 2.0,
+                    Stroke::new(1.0, p.border),
+                );
+                ui.add_space(8.0);
+                self.result_strip(ui, &p);
+                ui.add_space(6.0);
+                self.actions_bar(ui, &p);
             });
     }
 
@@ -455,8 +518,15 @@ impl SettingsApp {
         let credentials_ready = self.edit.credentials_ready();
         let (color, text) = pill_state(&snap, self.capturing, credentials_ready, p);
 
-        // 自己算宽度推到行尾（见 `push_to_end`：egui 的右对齐布局会画到容器外）
-        let pill_w = text_width(ui, text, egui::TextStyle::Small) + 7.0 + 2.0 + 20.0 + 4.0;
+        // 自己算宽度推到行尾（见 `push_to_end`：egui 的右对齐布局会画到容器外）。
+        // 胶囊实际宽 = 内边距 20 + 圆点 7 + 圆点与文字的间距（add_space 2 +
+        // item_spacing 8）+ 文字宽 —— 间距必须按真实值算，算小了胶囊会把
+        // 整个面板的 max_rect 撑宽（实测过）。
+        let pill_w = text_width(ui, text, egui::TextStyle::Small)
+            + 7.0
+            + 2.0
+            + ui.style().spacing.item_spacing.x
+            + 20.0;
         push_to_end(ui, pill_w);
         egui::Frame::new()
             .fill(tint_over(p.bg, color))
@@ -473,14 +543,21 @@ impl SettingsApp {
             });
     }
 
-    // —— 设置卡（服务商 / 凭据 / 快捷键 / 识别选项 / 通用 合成一张）——
+    // —— 页签栏 ——
 
-    /// 一张卡装下所有设置：标签左、字段右，说明全部收进悬停气泡。
-    ///
-    /// 为什么合并：旧版把同样的内容摊成 3 张卡 + 大量说明小字，内容总高 1274px，
-    /// 768 高的笔记本要滚 1.4 屏；而真正该看的「最近识别」被挤到屏幕外。
-    /// 合并后按 900 高的窗口算，一屏就能看全（见 `layout` 模块的实测用例）。
-    fn settings_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// 三个页签（选中样式与分段选择器一致：accent 胶囊底 + accent 字）
+    fn tabs_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let mut tab = self.tab;
+        segmented(ui, p, p.bg, &mut tab, &Tab::ALL, Tab::label, true);
+        self.tab = tab;
+    }
+
+    // —— 三个页签的内容 ——
+
+    /// 语音服务页：服务商选择 + 凭据 + 个人词典（一次性配置，配好就不动）。
+    /// 词典放这页而不是「识别选项」：它是"教当前服务商认词"——千问/豆包生效、
+    /// 腾讯要控制台预建，本来就跟着服务商走。
+    fn service_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         card(p, ui, |ui, p| {
             labeled_row(ui, "服务商", p, |ui| {
                 provider_selector(ui, p, &mut self.edit.provider);
@@ -491,68 +568,195 @@ impl SettingsApp {
             ui.push_id(self.edit.provider.label(), |ui| self.credentials(ui, p));
 
             sep(ui, p);
-            self.hotkey_group(ui, p);
-            sep(ui, p);
-
-            // 识别选项（说明收进气泡）
-            option_row(ui, p, TIP_LIVE_TYPING, |ui| {
-                ui.checkbox(
-                    &mut self.edit.options.live_typing,
-                    body("边说话边打字（实时输入）"),
-                );
-            });
-            option_row(ui, p, TIP_CLIPBOARD_FALLBACK, |ui| {
-                ui.checkbox(
-                    &mut self.edit.options.clipboard_fallback,
-                    body("输入被拒时用剪贴板粘贴兜底"),
-                );
-            });
-            option_row(ui, p, TIP_KEEP_ON_CLIPBOARD, |ui| {
-                ui.checkbox(
-                    &mut self.edit.options.keep_on_clipboard,
-                    body("识别结果总留一份到剪贴板（推荐）"),
-                );
-            });
-
-            // 标点 / 顺滑只有部分服务商支持：不支持时禁用并说明 ——
-            // 不能给主人一个看起来能拨、实际不接线的开关
-            let (punc_ok, smooth_ok) = match self.edit.provider {
-                Provider::Qwen => (true, false),
-                Provider::Doubao => (true, true),
-                Provider::Tencent => (false, true),
-            };
-            option_row(
-                ui,
-                p,
-                if punc_ok { TIP_PUNCTUATION } else { TIP_PUNCTUATION_OFF },
-                |ui| {
-                    ui.add_enabled(
-                        punc_ok,
-                        egui::Checkbox::new(
-                            &mut self.edit.options.auto_punctuation,
-                            body("自动添加标点"),
-                        ),
-                    );
-                },
-            );
-            option_row(
-                ui,
-                p,
-                if smooth_ok { TIP_SMOOTH } else { TIP_SMOOTH_OFF },
-                |ui| {
-                    ui.add_enabled(
-                        smooth_ok,
-                        egui::Checkbox::new(
-                            &mut self.edit.options.smooth,
-                            body("口语顺滑（去除重复与语气词）"),
-                        ),
-                    );
-                },
-            );
-
-            sep(ui, p);
-            option_row(ui, p, TIP_AUTOSTART, |ui| self.autostart_checkbox(ui));
+            self.hotwords_section(ui, p);
         });
+    }
+
+    /// 识别选项页：全部开关，一行一条，说明直接写在行里（不用悬停气泡）
+    fn options_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(p, ui, |ui, p| {
+            setting_row(
+                ui,
+                p,
+                "实时输入",
+                "边说话边打字，识别被修正时自动回退重打；关闭则只在松手后一次性输入",
+                &mut self.edit.options.live_typing,
+                true,
+            );
+            sep(ui, p);
+            setting_row(
+                ui,
+                p,
+                "剪贴板粘贴兜底",
+                "管理员窗口等拦下模拟按键时，改走 Ctrl+V 再试一次",
+                &mut self.edit.options.clipboard_fallback,
+                true,
+            );
+            sep(ui, p);
+            setting_row(
+                ui,
+                p,
+                "结果总留一份到剪贴板",
+                "随时可 Ctrl+V 粘贴；代价是原来复制的内容会被顶掉（推荐开启）",
+                &mut self.edit.options.keep_on_clipboard,
+                true,
+            );
+            sep(ui, p);
+
+            // 标点：腾讯引擎由服务端决定，不支持时禁用并把原因写进说明 ——
+            // 不能给主人一个看起来能拨、实际不接线的开关。
+            // （口语顺滑三家都已接通：千问 3.1 disfluency_removal_enabled、
+            // 豆包 enable_ddc、腾讯 filter_modal。）
+            let punc_ok = !matches!(self.edit.provider, Provider::Tencent);
+            setting_row(
+                ui,
+                p,
+                "自动添加标点",
+                if punc_ok {
+                    "识别结果自动补全逗号、句号等标点"
+                } else {
+                    "腾讯云引擎由服务端决定，暂不支持此选项"
+                },
+                &mut self.edit.options.auto_punctuation,
+                punc_ok,
+            );
+            sep(ui, p);
+            setting_row(
+                ui,
+                p,
+                "口语顺滑",
+                "过滤「嗯、啊」等语气词与重复表述",
+                &mut self.edit.options.smooth,
+                true,
+            );
+            sep(ui, p);
+            self.language_row(ui, p);
+
+            // 高精度是豆包专属：只在该服务商下出现，别的主人不需要看见它
+            if self.edit.provider == Provider::Doubao {
+                sep(ui, p);
+                setting_row(
+                    ui,
+                    p,
+                    "高精度模式",
+                    "整句二次识别，更准一点，但会晚一两秒出结果",
+                    &mut self.edit.doubao.high_accuracy,
+                    true,
+                );
+            }
+        });
+    }
+
+    /// 识别语言：单行（标签 + 下拉 + 说明气泡，与凭据区同款模式）。
+    /// 三家落实方式不同，详细说明进气泡；选「自动」时行为与从前完全一致。
+    fn language_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let tip = match self.edit.provider {
+            // 千问模型自身多语种自动检测，选语言不产生任何参数
+            Provider::Qwen => "千问模型自动检测语种（含中英混说），保持「自动」即可",
+            Provider::Doubao => "选定后豆包按该语言识别。官方语言参数仅在整句模式下\
+生效，选定后会自动切换（出字稍晚一两秒）",
+            Provider::Tencent => "选定后腾讯使用对应语言引擎。法语 / 德语 / 俄语 / \
+西班牙语没有实时引擎，识别时会提示换服务商或改回「自动」",
+        };
+        labeled_row(ui, "识别语言", p, |ui| {
+            let selected = LANGUAGES
+                .iter()
+                .find(|(code, _)| *code == self.edit.options.language)
+                .map(|(_, label)| *label)
+                .unwrap_or("自动");
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(body(selected))
+                .width((ui.available_width() - INFO_W - 8.0).max(80.0))
+                .show_ui(ui, |ui| {
+                    for (code, label) in LANGUAGES {
+                        ui.selectable_value(
+                            &mut self.edit.options.language,
+                            code.to_string(),
+                            label,
+                        );
+                    }
+                });
+            info(ui, p, tip);
+        });
+    }
+
+    /// 个人词典（热词）：一行一个词。千问走即时热词 + 上下文增强、
+    /// 豆包走请求级热词；腾讯需控制台预建词表，这里如实说明。
+    fn hotwords_section(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let desc = if self.edit.provider == Provider::Tencent {
+            "腾讯云需在控制台预建词表，此处填写暂不生效"
+        } else {
+            "一行一个词（人名、品牌、术语），识别时优先命中"
+        };
+        ui.vertical(|ui| {
+            ui.label(body("个人词典").strong().color(p.text));
+            ui.label(small(desc).color(p.muted));
+        });
+        ui.add_space(4.0);
+        ui.push_id("hotwords_editor", |ui| {
+            ui.add_sized(
+                [ui.available_width(), 72.0],
+                egui::TextEdit::multiline(&mut self.edit.options.hotwords)
+                    .hint_text("一行一个词，如：宝可梦、张三丰、BBVoxi"),
+            );
+        });
+    }
+
+    /// 通用页：快捷键 / 开机自启 / 界面主题
+    fn general_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(p, ui, |ui, p| {
+            self.hotkey_row(ui, p);
+            sep(ui, p);
+            self.autostart_row(ui, p);
+            sep(ui, p);
+            self.theme_row(ui, p);
+        });
+    }
+
+    /// 界面主题：三选一，点了立即生效并落盘（改颜色不该还要点「保存」）
+    fn theme_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            let avail = ui.available_width();
+            ui.vertical(|ui| {
+                ui.set_min_width((avail - THEME_CTRL_W).max(110.0));
+                ui.label(body("界面主题").strong().color(p.text));
+                ui.label(small("跟随系统的深浅色，或固定一种").color(p.muted));
+            });
+            let picked = segmented(
+                ui,
+                p,
+                p.card,
+                &mut self.edit.theme,
+                &THEME_MODES,
+                theme_label,
+                false,
+            );
+            if let Some(mode) = picked {
+                self.apply_theme_now(ui.ctx().clone(), mode);
+            }
+        });
+    }
+
+    /// 主题切换的即时落盘逻辑（`theme_row` 只负责画）。
+    ///
+    /// 关键取舍：写进文件的是「上一次保存的配置 + 新主题」，**不是**编辑中的
+    /// 整份 `edit` —— 否则主人填了一半还没保存的 API Key 会被顺手带进文件，
+    /// 快捷键没校验过也会被存进去。主题是独立的小改动，值得单独走一趟。
+    fn apply_theme_now(&mut self, ctx: egui::Context, mode: ThemeMode) {
+        apply_theme(&ctx, mode);
+        self.edit.theme = mode;
+        let disk = theme_disk_copy(&self.saved, mode);
+        match disk.save() {
+            Ok(()) => {
+                self.saved = disk;
+                self.set_status(true, "主题已切换并保存");
+            }
+            Err(e) => {
+                // 界面已经切了（主人看得见），只是没写进文件：如实报告，
+                // 下次启动会回到旧主题 —— 但别的一句话也不说
+                self.set_status(false, format!("主题已切换，但写配置文件失败：{e:#}"));
+            }
+        }
     }
 
     /// 凭据区：字段与标签同排（也取消了「高级折叠」—— 接口地址就是普通一行）
@@ -566,12 +770,7 @@ impl SettingsApp {
             Provider::Doubao => {
                 self.secret_row(ui, p, "API Key", "doubao_key", TIP_API_KEY);
                 self.text_row(ui, p, "资源 ID", "doubao_res", TIP_RES_DOUBAO);
-                option_row(ui, p, TIP_HIGH_ACCURACY, |ui| {
-                    ui.checkbox(
-                        &mut self.edit.doubao.high_accuracy,
-                        body("高精度模式（整句二次识别，延迟略高）"),
-                    );
-                });
+                // 高精度开关在「识别选项」页：它是识别行为，不是凭据
             }
             Provider::Tencent => {
                 self.text_row(ui, p, "App ID", "tc_app", TIP_APP_ID);
@@ -602,33 +801,49 @@ impl SettingsApp {
         }
     }
 
-    /// 快捷键：键帽 + 「重新录制」+ 悬停说明（那两段长解释不再占页面高度）
-    fn hotkey_group(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        labeled_row(ui, "快捷键", p, |ui| {
+    /// 快捷键行：左边标题+一句话说明，右边键帽 + 「重新录制」。
+    /// 完整的按键规则很长，留在悬停气泡里（`TIP_HOTKEY`）。
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            // 右侧固定留出：键帽 140 + 间距 + 按钮 + 说明气泡
+            let avail = ui.available_width();
+            ui.vertical(|ui| {
+                ui.set_min_width((avail - HOTKEY_CTRL_W).max(120.0));
+                ui.label(body("快捷键").strong().color(p.text));
+                ui.label(small("按住说话，松开自动输入").color(p.muted));
+            });
             if self.capturing {
-                ui.label(body("请按下新的组合键（松开后生效）").color(p.warn));
+                ui.label(body("按下新组合").color(p.warn).strong());
                 if ghost_button(ui, p, "取消").clicked() {
                     self.end_capture();
                 }
-                small_at_end(ui, p, "Esc 也可取消");
+                ui.label(small("Esc 也可取消").color(p.muted));
                 return;
             }
             let display = hotkey::parse(&self.edit.hotkey)
                 .map(|h| h.display())
                 .unwrap_or_else(|_| self.edit.hotkey.clone());
+            // 键帽：固定宽 + 截断，超长组合（四个修饰键 + 主键）不会把按钮挤出窗口；
+            // 完整内容悬停可见
             egui::Frame::new()
                 .fill(p.field)
                 .stroke(Stroke::new(1.0, p.border))
                 .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(12, 4))
+                .inner_margin(Margin::symmetric(10, 4))
                 .show(ui, |ui| {
                     // 等宽字体当键帽，反引号之类的符号更好认
-                    ui.label(RichText::new(display).monospace().strong().color(p.text));
+                    ui.add_sized(
+                        [140.0, 22.0],
+                        egui::Label::new(
+                            RichText::new(&display).monospace().strong().color(p.text),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&display);
                 });
             if ghost_button(ui, p, "重新录制").clicked() {
                 self.begin_capture(ui.ctx());
             }
-            push_to_end(ui, INFO_W);
             info(ui, p, TIP_HOTKEY);
         });
         if let Some(err) = self.hotkey_error.clone() {
@@ -708,10 +923,17 @@ impl SettingsApp {
         }
     }
 
-    /// 开机自启：勾选立即写注册表（失败会回滚勾选）
-    fn autostart_checkbox(&mut self, ui: &mut egui::Ui) {
+    /// 开机自启行：勾选立即写注册表（失败会回滚开关）
+    fn autostart_row(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let before = self.autostart;
-        ui.checkbox(&mut self.autostart, body("开机自启"));
+        setting_row(
+            ui,
+            p,
+            "开机自启",
+            "登录 Windows 后自动在后台待命，不弹窗口",
+            &mut self.autostart,
+            true,
+        );
         if self.autostart != before && self.autostart != self.applied_autostart {
             match autostart::set(self.autostart) {
                 Ok(()) => {
@@ -733,93 +955,91 @@ impl SettingsApp {
         }
     }
 
-    /// 最近识别：标题一行 + 正文一行（测试模式的承诺留在明面上，其余进气泡）
-    fn result_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// 「最近识别」紧凑反馈条（钉在底部操作条上方，任何页签都看得见）。
+    ///
+    /// 为什么做成单行：它是个"顺手瞄一眼"的地方，不是阅读区；测试识别的按钮
+    /// 就在正下方，结果贴着按钮放，视线不用跳。完整内容本来就在剪贴板
+    /// （识别成功的场合），截断不丢信息。测试结果不会外打是主人最需要
+    /// 确认的一件事，所以这一条写在标签后面、不进气泡。
+    fn result_strip(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let snap = self.shared.snapshot();
         let hotkey_text = hotkey::parse(&self.edit.hotkey)
             .map(|h| h.display())
             .unwrap_or_else(|_| self.edit.hotkey.clone());
-        card(p, ui, |ui, p| {
-            ui.horizontal(|ui| {
-                ui.label(body("最近识别").strong().color(p.text));
-                // 这句必须留在明面上（不能只塞进气泡）：测试结果不会外打是主人
-                // 最需要确认的一件事，藏起来他反而不敢按
-                small_at_end(ui, p, "只显示在这里，不会打字出去");
-            });
-            ui.add_space(6.0);
-            if snap.recording {
-                // 录音中的呼吸点：整窗唯一的动效，一眼看出"正在听"
-                let t = ui.ctx().input(|i| i.time);
-                let pulse = (0.55 + 0.45 * (t * 4.0).sin()) as f32;
+        egui::Frame::new()
+            .fill(p.field)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        4.0,
-                        p.danger.gamma_multiply(0.35 + 0.65 * pulse),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        body(format!("录音中 {}", clock(snap.elapsed())))
-                            .strong()
-                            .color(p.danger),
-                    );
-                });
-                let shown = if !snap.text.is_empty() {
-                    snap.text.clone()
-                } else if !snap.hint.is_empty() {
-                    snap.hint.clone()
-                } else {
-                    "请说话…".to_string()
-                };
-                ui.label(body(shown).color(p.text));
-            } else if let Some(err) = &snap.error {
-                ui.label(body(err).color(p.danger));
-            } else if let Some(notice) = &snap.notice {
-                // 结果已放进剪贴板（通常是录音途中切了窗口）。用提醒色而不是危险色：
-                // 这不是故障，但主人得知道"这次的字没自动打出去，去 Ctrl+V 粘"。
-                ui.label(body(notice).color(p.warn));
-                if !snap.last_result.is_empty() {
+                    ui.label(small("最近识别").strong().color(p.muted));
                     ui.add_space(4.0);
-                    ui.label(body(&snap.last_result).color(p.text));
-                }
-            } else if !snap.last_result.is_empty() {
-                ui.label(body(&snap.last_result).color(p.text));
-            } else {
-                ui.label(
-                    body(format!(
-                        "还没有识别记录。按住 {hotkey_text} 说句话，或点下面「测试识别」。"
-                    ))
-                    .color(p.muted),
-                );
-            }
-            // 「结果在剪贴板」这句话只说给"找不到时想找"的主人听，而且**只在真的
-            // 留住了**（写完又回读核对过）的时候才说 —— 以前这里只看"开关开着 +
-            // 有结果"，于是复制失败的那一次也照样写着"留在了剪贴板"，主人照着去
-            // Ctrl+V 却什么也粘不出来（正是他报的那个坑，只是从弹窗搬进了窗口）。
-            if snap.kept_on_clipboard && !snap.recording && !snap.last_result.is_empty() {
-                ui.add_space(3.0);
-                ui.label(small("这份结果也留在了剪贴板，随时可以 Ctrl+V").color(p.muted));
-            }
-        });
+                    // 状态优先展示：录音中 > 出错 > 提示 > 正文
+                    if snap.recording {
+                        // 录音中的呼吸点：整窗唯一的动效，一眼看出"正在听"
+                        let t = ui.ctx().input(|i| i.time);
+                        let pulse = (0.55 + 0.45 * (t * 4.0).sin()) as f32;
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            4.0,
+                            p.danger.gamma_multiply(0.35 + 0.65 * pulse),
+                        );
+                        ui.label(
+                            body(format!("录音中 {}", clock(snap.elapsed())))
+                                .strong()
+                                .color(p.danger),
+                        );
+                    }
+                    let (text, color) = if snap.recording {
+                        let live = if !snap.text.is_empty() {
+                            snap.text.clone()
+                        } else if !snap.hint.is_empty() {
+                            snap.hint.clone()
+                        } else {
+                            "请说话…".to_string()
+                        };
+                        (live, p.text)
+                    } else if let Some(err) = &snap.error {
+                        (err.clone(), p.danger)
+                    } else if let Some(status) = &self.status {
+                        // 界面操作的反馈（已保存 / 保存失败 / 已开始测试…）也走这条：
+                        // 它就是底部固定的反馈位。放在识别错误之后 —— 识别失败更要紧。
+                        (status.text.clone(), if status.ok { p.ok } else { p.danger })
+                    } else if let Some(notice) = &snap.notice {
+                        // 结果已放进剪贴板（通常是录音途中切了窗口）。用提醒色而不是
+                        // 危险色：这不是故障，但主人得知道"这次的字没自动打出去，去
+                        // Ctrl+V 粘"。
+                        (notice.clone(), p.warn)
+                    } else if !snap.last_result.is_empty() {
+                        let mut s = snap.last_result.clone();
+                        // 「已留剪贴板」只在真的留住了（写完回读核对过）才说：
+                        // 复制失败的那一次也写，主人去 Ctrl+V 却什么也粘不出来
+                        if snap.kept_on_clipboard {
+                            s.push_str("（已留剪贴板）");
+                        }
+                        (s, p.text)
+                    } else {
+                        (
+                            format!("还没有记录。按住 {hotkey_text} 说句话，或点「测试识别」"),
+                            p.muted,
+                        )
+                    };
+                    // 单行截断：长文本不换行、不撑高操作条
+                    ui.add(egui::Label::new(body(text).color(color)).truncate())
+                        .on_hover_text("只显示在这里，不会打字出去");
+                });
+            });
     }
 
     // —— 底部操作条 ——
 
     fn actions_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // 状态条独占一行：和按钮挤在水平布局里会被长错误消息挤压甚至截断。
-        // 而且 10 秒后它自己就退场了（见 `Status`），不会永远占着这一行。
-        if let Some(status) = self.status.clone() {
-            let color = if status.ok { p.ok } else { p.danger };
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 3.0, color);
-                ui.add_space(2.0);
-                ui.add(egui::Label::new(body(status.text).color(color).strong()).truncate());
-            });
-            ui.add_space(6.0);
-        }
+        // 状态消息显示在上方反馈条里（见 `result_strip` 的优先级链），
+        // 按钮行高度因此恒定 —— 页脚总高也随之恒定，滚动区才能安全地
+        // 用"可用高度减页脚"来限高（见 `ui` 里的 `FOOTER_H`）。
         let recording = self.shared.snapshot().recording;
         ui.horizontal(|ui| {
             if ui
@@ -841,15 +1061,20 @@ impl SettingsApp {
                     self.set_status(true, "已开始 5 秒测试");
                 }
             }
-            if ui
-                .add(
-                    egui::Button::new(button_text("保存").strong().color(p.on_accent))
-                        .fill(p.accent)
-                        .corner_radius(CornerRadius::same(8))
-                        .min_size(egui::vec2(104.0, 34.0)),
-                )
-                .clicked()
-            {
+            // 有没保存的改动时，按钮右上角点一个小圆点：不用等关窗提醒，
+            // 一眼就知道"这里攒着东西没落盘"
+            let save_btn = ui.add(
+                egui::Button::new(button_text("保存").strong().color(p.on_accent))
+                    .fill(p.accent)
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(egui::vec2(104.0, 34.0)),
+            );
+            if self.has_unsaved_changes() {
+                let r = save_btn.rect;
+                ui.painter()
+                    .circle_filled(egui::pos2(r.right() - 5.0, r.top() + 5.0), 3.5, p.on_accent);
+            }
+            if save_btn.clicked() {
                 self.save();
             }
             if ui
@@ -1069,6 +1294,24 @@ fn card<R>(p: &Palette, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui, &Pale
 const LABEL_W: f32 = 56.0;
 /// 说明气泡图标的宽度
 const INFO_W: f32 = 18.0;
+/// 开关（`toggle_glyph`）的宽度
+const TOGGLE_W: f32 = 40.0;
+/// 主题行右侧给三段选择器预留的宽度（跟随系统 / 浅色 / 深色）。
+/// 行内模式每段 80、段间 gap 6 + item_spacing 8 → 实际 3×80+2×14=268，
+/// 再加左列与选择器之间的一格 item_spacing，预算 280 才够 —— 预算偏小时
+/// 左列不收缩、行总宽超卡片，会把整张卡撑出窗口（实测过）。
+const THEME_CTRL_W: f32 = 280.0;
+/// 快捷键行右侧给「键帽 + 重新录制 + 说明气泡」预留的宽度。
+/// 键帽框 162 + 间距 8 + 按钮 96 + 间距 8 + 气泡 18 ≈ 292，加上左列与
+/// 右侧之间一格 item_spacing，留 320 —— 宁可左侧说明列窄一点，也不能
+/// 让行总宽超过卡片。
+const HOTKEY_CTRL_W: f32 = 320.0;
+/// 页脚（分隔线 + 「最近识别」反馈条 + 按钮行）占的高度。
+/// 滚动区用它限高（`ui` 里 `available_height() - FOOTER_H`），页脚才能钉在
+/// 窗口底。这个值必须 ≥ 页脚真实高度，宁可略大（大一点只是页脚上方多点留白，
+/// 小了按钮行会被窗口底裁掉一截）。按钮行没有动态的状态行，高度恒定；
+/// 实测构成：分隔线区 14 + 反馈条 44 + 间距 6 + 按钮行 34 = 106，取 108。
+const FOOTER_H: f32 = 108.0;
 /// 说明气泡里那个 "i" 的字号。
 ///
 /// 图标不是正文：它要配出一个 13px 的小圆，所以**故意**不跟字号档位走
@@ -1113,9 +1356,6 @@ const TIP_ENDPOINT_QWEN: &str = "接口地址，一般不用改：默认是阿�
 
 const TIP_RES_DOUBAO: &str = "火山引擎的资源 ID（控制台里创建实例时给的那串），不确定就保持默认。";
 
-const TIP_HIGH_ACCURACY: &str = "开启后先用实时模型听着、松手再做一次整句识别：\
-更准一点，但会晚一两秒出结果。";
-
 const TIP_APP_ID: &str = "腾讯云语音识别的 App ID（控制台里的数字 ID）。";
 
 const TIP_TENCENT_ENGINE: &str = "腾讯云的识别引擎。Hy-ASR-3.0-preview 只支持 60 秒以内的语音\
@@ -1127,23 +1367,8 @@ Ctrl 再按 Win，全部松开后生效）。按下时会拦截该组合键。\n
 只有单独一个普通键（如 a）和单独一个修饰键（如 Ctrl）不能当快捷键：\
 前者会在所有程序里吞掉这个键，后者的「按住说话」和 Ctrl+C 分不开。";
 
-const TIP_LIVE_TYPING: &str = "识别被修正时自动回退重打；关闭则只在松手后一次性输入。";
-
-const TIP_CLIPBOARD_FALLBACK: &str = "系统真的拦下模拟按键时（如管理员权限窗口），\
-改走 Ctrl+V 再试一次。";
-
-const TIP_KEEP_ON_CLIPBOARD: &str = "字到底有没有打进目标程序无法核实，所以每次识别都留一份，\
-随时可 Ctrl+V；代价是你原来复制的内容会被顶掉。";
-
-const TIP_PUNCTUATION: &str = "识别结果自动补全逗号、句号等标点。";
-
-const TIP_PUNCTUATION_OFF: &str = "腾讯云引擎由服务端决定，暂不支持此选项。";
-
-const TIP_SMOOTH: &str = "过滤「嗯、啊」等语气词与重复表述。";
-
-const TIP_SMOOTH_OFF: &str = "千问暂不支持此选项。";
-
-const TIP_AUTOSTART: &str = "登录 Windows 后自动在后台待命，不弹窗口。";
+// 说明文字现在直接写在每行设置卡上（见 `setting_row`）；「识别选项」「通用」
+// 两页不再需要悬停气泡，上面的常量只剩凭据与快捷键在用。
 
 /// 设置卡里的一行：左边标签、右边控件。
 ///
@@ -1180,8 +1405,14 @@ fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
 /// `layout::no_text_overflows_the_window`）它们在"横向行里再套一层"时会
 /// **把控件画到容器外**，右对齐的说明文字因此被窗口边缘切掉。自己量宽度、
 /// 自己补空白，位置完全可控。
+///
+/// 为什么要扣一格 item_spacing：`add_space(pad)` 之后 egui 还会在下一个
+/// widget 之前自动加 `item_spacing.x`（默认 8px）。不扣的话"推到行尾"的
+/// 控件实际右沿会超出 max_rect —— 状态胶囊就因此把整个面板的 max_rect
+/// 撑宽了 4px，后面每一层（页签、卡片、版本号）全都跟着右移出窗。
 fn push_to_end(ui: &mut egui::Ui, width: f32) {
-    let pad = (ui.available_width() - width).max(0.0);
+    let item = ui.style().spacing.item_spacing.x;
+    let pad = (ui.available_width() - width - item).max(0.0);
     ui.add_space(pad);
 }
 
@@ -1192,13 +1423,89 @@ fn small_at_end(ui: &mut egui::Ui, p: &Palette, text: &str) {
     ui.label(small(text).color(p.muted));
 }
 
-/// 一个开关行：开关靠左，右侧留一个说明气泡
-fn option_row(ui: &mut egui::Ui, p: &Palette, tip: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        add(ui);
-        push_to_end(ui, INFO_W);
-        info(ui, p, tip);
+/// 一行设置（行卡片）：左边标题 + 说明两行字，右边一个开关，**整行可点**。
+///
+/// 为什么说明要摆到明面上：旧版把说明全收进悬停气泡，不把鼠标停在小圆圈上
+/// 就不知道开关是干嘛的；说明跟着标题走，「直观」就从这里来。
+/// 禁用时说明换成"为什么不支持"，而不是给一个拨了没反应的开关。
+fn setting_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    desc: &str,
+    value: &mut bool,
+    enabled: bool,
+) -> bool {
+    let mut toggled = false;
+    ui.push_id(title, |ui| {
+        // 行整体可点（含开关区域）：开关只是行内的一个"显示件"，
+        // 点击统一在这一层处理，不会出现"点了开关切换两次"。
+        // egui 0.35 的 Frame 没有 sense()，所以先画再对整个区域 interact。
+        let inner = egui::Frame::new()
+            .corner_radius(CornerRadius::same(8))
+            // 上下 5：行距预算紧（Options 页 5+ 行开关 + 语言行），每行省 2px
+            .inner_margin(Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let avail = ui.available_width();
+                    ui.vertical(|ui| {
+                        ui.set_min_width((avail - TOGGLE_W - 12.0).max(120.0));
+                        ui.label(body(title).strong().color(p.text));
+                        ui.label(small(desc).color(p.muted));
+                    });
+                    toggle_glyph(ui, p, *value, enabled);
+                });
+            });
+        let resp = ui.interact(
+            inner.response.rect,
+            ui.id().with("row"),
+            egui::Sense::click(),
+        );
+        if enabled {
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                *value = !*value;
+                toggled = true;
+            }
+        }
     });
+    toggled
+}
+
+/// 开关的显示件（iOS 风格轨道 + 圆点，滑动有 0.12s 过渡）。
+///
+/// 只画、不响应点击（点击由所在行统一处理，见 `setting_row`）。
+/// egui 自带的 Checkbox 在这里不合适：方框 + 文字的宽度不受控，
+/// 右对齐会被挤歪，而且视觉上更像"打勾的清单"而不是"拨的开关"。
+fn toggle_glyph(ui: &mut egui::Ui, p: &Palette, on: bool, enabled: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(TOGGLE_W, 22.0), egui::Sense::hover());
+    // 动画值 0..1：egui 自带的插值，同一个 id 下每帧自动推进
+    let v = ui
+        .ctx()
+        .animate_bool_with_time(ui.id().with("knob"), on, 0.12);
+    let track = if enabled && on { p.accent } else { p.field };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), track);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(11),
+        Stroke::new(1.0, if enabled && on { p.accent } else { p.border }),
+        egui::StrokeKind::Middle,
+    );
+    let d = 16.0;
+    let pad = 3.0;
+    let x0 = rect.left() + pad + d / 2.0;
+    let x1 = rect.right() - pad - d / 2.0;
+    let cx = egui::lerp(x0..=x1, v);
+    let dot = if !enabled {
+        p.muted.gamma_multiply(0.6)
+    } else if on {
+        p.on_accent
+    } else {
+        p.muted
+    };
+    ui.painter()
+        .circle_filled(egui::pos2(cx, rect.center().y), d / 2.0, dot);
 }
 
 /// 说明气泡：一个不起眼的小圆圈，鼠标停上去才展开一句话
@@ -1379,43 +1686,107 @@ fn open_project_page() -> Result<(), String> {
     Err("仅支持 Windows".into())
 }
 
-/// 服务商分段选择器：三家一眼看全，比下拉少一次点击
-fn provider_selector(ui: &mut egui::Ui, p: &Palette, current: &mut Provider) {
+/// 主题三选一的选项表（顺序即显示顺序）
+const THEME_MODES: [ThemeMode; 3] = [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark];
+
+fn theme_label(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::System => "跟随系统",
+        ThemeMode::Light => "浅色",
+        ThemeMode::Dark => "深色",
+    }
+}
+
+/// 主题即时落盘用的配置副本：**上一次保存的配置 + 新主题**。
+///
+/// 抽成纯函数是为了把"落盘的东西不带编辑中的半成品"这件事钉进单测：
+/// 主人改了一半的 API Key、没校验过的快捷键，都不该跟着主题一起写进文件。
+fn theme_disk_copy(saved: &Config, mode: ThemeMode) -> Config {
+    let mut disk = saved.clone();
+    disk.theme = mode;
+    disk
+}
+
+/// 分段选择器：几个互斥的选项排一排，选中项 = accent 胶囊底 + accent 字。
+///
+/// 页签（`tabs_bar`）、服务商（`provider_selector`）、主题（`theme_row`）
+/// 共用这一个控件，视觉语言全窗口统一。返回本次点中的选项（没点返回 None），
+/// "点了之后做什么"（立即生效 or 只改内存）由调用方决定。
+///
+/// `base` 是控件所在底色：选中底 = accent × `PILL_ALPHA` 叠在它上面，
+/// 传错底色会让对比度校验（`palette_contrast_meets_wcag`）量不到真实值。
+fn segmented<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    base: Color32,
+    current: &mut T,
+    items: &[T],
+    label_of: impl Fn(T) -> &'static str,
+    fill_width: bool,
+) -> Option<T> {
+    let mut picked = None;
     ui.horizontal(|ui| {
-        let count = Provider::ALL.len() as f32;
-        let width = (ui.available_width() - (count - 1.0) * 6.0) / count;
-        for (i, provider) in Provider::ALL.into_iter().enumerate() {
+        let count = items.len() as f32;
+        let gap = 6.0;
+        // egui 在水平布局里给相邻 widget 自动加 item_spacing.x，加上显式
+        // add_space(gap)，每两段之间实际隔 gap + item_spacing.x —— 等分公式
+        // 里两笔都要扣，否则三段总宽比可用宽多出 2×item_spacing（实测
+        // 选择器被撑出卡片、页签右沿画出窗口）。
+        let seg_gap = gap + ui.style().spacing.item_spacing.x;
+        // 等宽模式（页签、服务商）：铺满整行；行内模式（主题）：按固定宽
+        let w = if fill_width {
+            (ui.available_width() - (count - 1.0) * seg_gap) / count
+        } else {
+            80.0
+        };
+        for (i, item) in items.iter().enumerate() {
             if i > 0 {
-                ui.add_space(6.0);
+                ui.add_space(gap);
             }
-            let selected = *current == provider;
+            let selected = *current == *item;
             let (fill, text_color, stroke) = if selected {
                 (
                     // 用 `tint_over` 而不是就地写一个透明度：那个常量是被
                     // `palette_contrast_meets_wcag` 逐个校验过的；就地写死一个
                     // 数字，会让"真校验"漏掉真正画出来的那一对（评审抓到过一次）。
-                    tint_over(p.card, p.accent),
+                    tint_over(base, p.accent),
                     p.accent,
                     Stroke::new(1.5, p.accent),
                 )
             } else {
                 (p.field, p.muted, Stroke::new(1.0, p.border))
             };
-            let label = button_text(short_label(provider)).strong().color(text_color);
-            if ui
-                .add(
-                    egui::Button::new(label)
-                        .fill(fill)
-                        .stroke(stroke)
-                        .corner_radius(CornerRadius::same(8))
-                        .min_size(egui::vec2(width, 32.0)),
-                )
-                .clicked()
-            {
-                *current = provider;
+            let label = button_text(label_of(*item)).strong().color(text_color);
+            // 用 `add_sized` 钉死每段恰好占 w 宽：直接 `ui.add(Button…min_size)`
+            // 会把 Button 自带边距也加到段宽上（实测三段总宽比可用宽多 2×8px，
+            // 页签行右沿直接画出窗口），等分就失准了。
+            let response = ui.add_sized(
+                [w, 32.0],
+                egui::Button::new(label)
+                    .fill(fill)
+                    .stroke(stroke)
+                    .corner_radius(CornerRadius::same(8)),
+            );
+            if response.clicked() {
+                *current = *item;
+                picked = Some(*item);
             }
         }
     });
+    picked
+}
+
+/// 服务商分段选择器：三家一眼看全，比下拉少一次点击
+fn provider_selector(ui: &mut egui::Ui, p: &Palette, current: &mut Provider) {
+    segmented(
+        ui,
+        p,
+        p.card,
+        current,
+        &Provider::ALL,
+        short_label,
+        true,
+    );
 }
 
 fn short_label(provider: Provider) -> &'static str {
@@ -1873,9 +2244,11 @@ mod tests {
     #[test]
     fn a_routine_clipboard_copy_does_not_turn_the_pill_into_a_warning() {
         let p = Palette::of(false);
-        let mut snap = Snapshot::default();
-        snap.kept_on_clipboard = true; // 常态：结果照例留了一份
-        snap.last_result = "你好".into();
+        let mut snap = Snapshot {
+            kept_on_clipboard: true, // 常态：结果照例留了一份
+            last_result: "你好".into(),
+            ..Snapshot::default()
+        };
         assert_eq!(
             pill_state(&snap, false, true, &p),
             (p.ok, "就绪"),
@@ -1923,6 +2296,46 @@ mod tests {
             "深色主题里正文必须比次要文字更清楚（以前这里是反的）"
         );
     }
+
+    /// 主题即时落盘的副本：**只带主题，不带编辑中的半成品**。
+    ///
+    /// 主人改了一半的 API Key、没校验过的快捷键都不该跟着主题一起写进文件
+    /// （否则快捷键格式错了也会被悄悄存进去）。落盘失败的场景不在这里测
+    /// ——写文件本身由 `config` 模块的原子写测试兜底。
+    #[test]
+    fn theme_disk_copy_carries_only_the_theme() {
+        let mut saved = Config::default();
+        saved.qwen.api_key = "sk-saved".into();
+        let mut editing = saved.clone();
+        editing.qwen.api_key = "sk-half-typed".into(); // 还没保存的半成品
+        let disk = theme_disk_copy(&saved, ThemeMode::Dark);
+        assert_eq!(disk.theme, ThemeMode::Dark, "新主题要写进文件");
+        assert_eq!(
+            disk.qwen.api_key, "sk-saved",
+            "落盘的是上次保存的值，不是编辑中的半成品"
+        );
+        assert_ne!(
+            disk, editing,
+            "编辑中的改动不能被主题切换顺手带走（edit 与 disk 必须不同）"
+        );
+    }
+
+    /// 主题切换后 `has_unsaved_changes` 的判定不受影响：主题即时落盘时
+    /// `saved` 也同步更新，其他字段的"改了没保存"照常被发现。
+    #[test]
+    fn theme_switch_does_not_swallow_other_unsaved_changes() {
+        let mut app = test_util::app(Config::default(), |_| {});
+        app.edit.qwen.api_key = "sk-new".into(); // 改了没保存
+        assert!(app.has_unsaved_changes());
+        // 模拟 apply_theme_now 的内存部分（不写文件）
+        let disk = theme_disk_copy(&app.saved, ThemeMode::Dark);
+        app.edit.theme = ThemeMode::Dark;
+        app.saved = disk;
+        assert!(
+            app.has_unsaved_changes(),
+            "主题即时保存了，但 API Key 的改动必须仍然算「没保存」"
+        );
+    }
 }
 
 /// 无窗口布局实测。
@@ -1943,20 +2356,15 @@ mod layout {
         pub y: f32,
         pub w: f32,
         pub h: f32,
-        pub color: [u8; 4],
     }
 
-    /// 一帧里画出来的一个矩形
+    /// 一帧里画出来的一个矩形（只留布局测试用得到的几何与填充色）
     #[derive(Debug, Clone)]
     pub struct RectI {
-        pub x: f32,
         pub y: f32,
         pub w: f32,
         pub h: f32,
         pub fill: [u8; 4],
-        pub stroke: [u8; 4],
-        pub sw: f32,
-        pub cr: f32,
     }
 
     pub struct Snapshot {
@@ -1966,10 +2374,13 @@ mod layout {
         pub rects: Vec<RectI>,
     }
 
-    /// 面板底色是整屏宽的大矩形，不是"内容"，量内容时要把它排除
-    const PANEL_MIN_W: f32 = 490.0;
-    /// 底部操作条占窗口最底下这一块，量"内容总高"时整块排除
-    const BOTTOM_RESERVED: f32 = 90.0;
+    /// 面板底色是整屏宽的大矩形，不是"内容"，量内容时要把它排除。
+    /// 窗口 580 宽（见 `main.rs::window_geometry`）→ 面板底色矩形 580、
+    /// 中央卡片 548：取 560 正好把两者分开。
+    const PANEL_MIN_W: f32 = 560.0;
+    /// 底部区域（「最近识别」反馈条 + 状态行 + 按钮行）占窗口最底下这一块，
+    /// 量"内容总高"时整块排除
+    const BOTTOM_RESERVED: f32 = 140.0;
 
     impl Snapshot {
         fn sizes(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
@@ -2013,14 +2424,10 @@ mod layout {
         match shape {
             egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, snap)),
             egui::Shape::Rect(r) => snap.rects.push(RectI {
-                x: r.rect.min.x,
                 y: r.rect.min.y,
                 w: r.rect.width(),
                 h: r.rect.height(),
                 fill: r.fill.to_array(),
-                stroke: r.stroke.color.to_array(),
-                sw: r.stroke.width,
-                cr: r.corner_radius.nw as f32,
             }),
             egui::Shape::Text(t) => {
                 let size = t.galley.size();
@@ -2030,7 +2437,6 @@ mod layout {
                     y: t.pos.y,
                     w: size.x,
                     h: size.y,
-                    color: t.fallback_color.to_array(),
                 });
             }
             _ => {}
@@ -2055,12 +2461,24 @@ mod layout {
     ///
     /// 视口故意给得很高（1500）：滚动区一旦被截断，量到的"总高"就只是可视高度。
     pub fn probe(cfg: Config, w: f32, h: f32, prepare: impl FnOnce(&Shared)) -> Snapshot {
+        probe_tab(cfg, w, h, prepare, Tab::Service)
+    }
+
+    /// 同 `probe`，但可以指定停在哪个页签（页签内容不同，各自都要量）。
+    pub fn probe_tab(
+        cfg: Config,
+        w: f32,
+        h: f32,
+        prepare: impl FnOnce(&Shared),
+        tab: Tab,
+    ) -> Snapshot {
         require_cjk_font();
         let ctx = egui::Context::default();
         crate::setup_cjk_font(&ctx);
         setup_style(&ctx);
         ctx.set_theme(egui::ThemePreference::Light);
         let mut app = super::test_util::app(cfg, prepare);
+        app.tab = tab;
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))),
             ..Default::default()
@@ -2085,75 +2503,89 @@ mod layout {
         cfg
     }
 
-    /// 方案 C 的验收线 1：**「最近识别」必须在首屏**。
+    /// 验收线 1：**「最近识别」反馈条钉在底部**。
     ///
-    /// 窗口高 = 屏幕高 − 160（上限 900，见 `main.rs::window_geometry`）：
-    /// 768 高的笔记本上可滚动区只有约 530px。旧版这一区起点在 599px ——
-    /// 恰好是"最需要看实时文字"的机器上完全看不到（报告第 1 条问题）。
+    /// 它现在是底部固定区（反馈条 + 按钮行）的一部分，不随页签切换、不参与
+    /// 滚动：无论停在哪一页、无论内容多长，测试识别的结果一定看得见。
+    /// 旧版它排在配置卡后面，768 高的笔记本上整块被挤出屏幕外（报告第 1 条）。
     #[test]
-    fn result_card_is_on_the_first_screen() {
-        let snap = probe(Config::default(), 500.0, 1500.0, |_| {});
+    fn result_strip_is_pinned_to_the_bottom() {
+        let snap = probe(Config::default(), 580.0, 1500.0, |_| {});
         let top = snap
             .text_y("最近识别")
             .expect("界面上必须有「最近识别」这一区");
         assert!(
-            top < 530.0,
-            "「最近识别」起点 {top}px，768 高的笔记本（可见区约 530px）看不到它"
+            top >= snap.h - BOTTOM_RESERVED,
+            "「最近识别」起点 {top}px，应在底部固定区（窗口高 1500，底部区从 {} 起）",
+            snap.h - BOTTOM_RESERVED
         );
         assert!(
-            top < 220.0,
-            "「最近识别」起点 {top}px —— 还能更靠前：它就该在品牌栏正下方"
+            top <= snap.h - 40.0,
+            "「最近识别」起点 {top}px —— 贴得太低会被窗口下沿切掉"
         );
     }
 
-    /// 方案 C 的验收线 2：内容总高压到 700px 以内、卡片从 5 张减到 2 张。
+    /// 验收线 2：每个页签一屏放得下（560 高的最小窗口不滚也能看到大部分内容），
+    /// 卡片每页一张（识别选项页行数最多，是最紧的一页）。
     #[test]
     fn content_is_compact() {
-        let snap = probe(Config::default(), 500.0, 1500.0, |_| {});
-        let h = snap.content_height();
-        assert!(
-            h <= 700.0,
-            "内容总高 {h}px，没压到 700px 以内（报告实测旧版 1274px）"
-        );
-        assert_eq!(
-            snap.card_count([255, 255, 255, 255]),
-            2,
-            "卡片数应为 2 张（最近识别 + 设置），旧的 5 张卡方案太占地方"
-        );
+        for tab in Tab::ALL {
+            let snap = probe_tab(Config::default(), 580.0, 1500.0, |_| {}, tab);
+            let h = snap.content_height();
+            assert!(
+                h <= 600.0,
+                "{:?} 页内容总高 {h}px，超了（页签化后每页都该一屏放得下）",
+                tab
+            );
+            assert_eq!(
+                snap.card_count([255, 255, 255, 255]),
+                1,
+                "{:?} 页应有且仅有一张内容卡",
+                tab
+            );
+        }
     }
 
-    /// 任何一段文字都不许超出窗口（回归：右对齐的说明文字被画到窗外、被切掉一半）。
+    /// 任何一页、任何一段文字都不许超出窗口（回归：右对齐的说明文字被画到
+    /// 窗外、被切掉一半）。
     ///
     /// egui 0.35 的右到左布局（`Layout::right_to_left`、连 `egui::Sides` 也一样）
     /// 在"横向行里再套一个布局"时会**把控件画到容器外**：实测一个 150px 宽的右对齐
     /// 说明文字被放在 x=467（窗口只有 500 宽），右半截直接看不见。所以界面上的右对齐
     /// 一律自己算宽度（见 `push_to_end`），这条用例就是那把尺子。
+    /// 最小窗口（520，见 `main.rs` 的 min_inner_size）也要量一遍：说明文字的
+    /// 宽度预算在窄窗口下最紧。
     #[test]
     fn no_text_overflows_the_window() {
-        let snap = probe(Config::default(), 500.0, 1500.0, |_| {});
         let mut bad = Vec::new();
-        for t in &snap.texts {
-            if t.y > snap.h - BOTTOM_RESERVED {
-                continue; // 底部操作条里的文字另算（它本来就贴底）
-            }
-            if t.x + t.w > snap.w - 4.0 {
-                bad.push(format!(
-                    "x={:.1} w={:.1} right={:.1}（窗口宽 {:.0}）：{:?}",
-                    t.x,
-                    t.w,
-                    t.x + t.w,
-                    snap.w,
-                    t.s
-                ));
+        for (w, h) in [(580.0, 1500.0), (520.0, 560.0)] {
+            for tab in Tab::ALL {
+                let snap = probe_tab(Config::default(), w, h, |_| {}, tab);
+                for t in &snap.texts {
+                    if t.y > snap.h - BOTTOM_RESERVED {
+                        continue; // 底部操作条里的文字另算（它本来就贴底）
+                    }
+                    if t.x + t.w > snap.w - 4.0 {
+                        bad.push(format!(
+                            "页签 {:?}（{w}×{h}）：x={:.1} w={:.1} right={:.1}：{:?}",
+                            tab,
+                            t.x,
+                            t.w,
+                            t.x + t.w,
+                            t.s
+                        ));
+                    }
+                }
             }
         }
         assert!(bad.is_empty(), "有文字超出窗口：\n{}", bad.join("\n"));
     }
 
-    /// 底部操作条里的文字也不许超出窗口（版本号以前就画出去了一截）
+    /// 底部区域（反馈条 + 按钮行）里的文字也不许超出窗口
+    /// （版本号以前就画出去了一截）
     #[test]
     fn no_bottom_bar_text_overflows() {
-        let snap = probe(Config::default(), 500.0, 1500.0, |_| {});
+        let snap = probe(Config::default(), 580.0, 1500.0, |_| {});
         let mut bad = Vec::new();
         for t in &snap.texts {
             if t.y <= snap.h - BOTTOM_RESERVED {
@@ -2169,21 +2601,20 @@ mod layout {
                 ));
             }
         }
-        assert!(bad.is_empty(), "底部操作条有文字超出窗口：\n{}", bad.join("\n"));
+        assert!(bad.is_empty(), "底部区域有文字超出窗口：\n{}", bad.join("\n"));
     }
 
-    /// 快捷键设得很长时，品牌栏也不能出问题：副标题**截断**（不换行、不撑高品牌栏），
+    /// 快捷键设得很长时，品牌栏和通用页都不能出问题：副标题**截断**（不换行、
+    /// 不撑高品牌栏）、键帽**截断**（超长组合不会把「重新录制」挤出窗口），
     /// 所有文字都留在窗口内。
-    ///
-    /// 说明：评审怀疑"四个人修饰键 + 主键的长快捷键会把状态胶囊挤出窗口"。
-    /// 女仆实测**不会**（副标题的截断宽度由布局自己兜住，胶囊稳在 478/500），
-    /// 所以没有为它加"预留宽度"那种没必要的代码；这条用例留着，是为了兜住
-    /// 以后再动品牌栏时的回归（比如把 truncate 去掉、让副标题换行把品牌栏撑高）。
     #[test]
     fn a_long_hotkey_keeps_the_header_in_shape() {
-        let mut cfg = Config::default();
-        cfg.hotkey = "ctrl+alt+shift+win+pagedown".into();
-        let snap = probe(cfg, 500.0, 1500.0, |_| {});
+        let cfg = Config {
+            hotkey: "ctrl+alt+shift+win+pagedown".into(),
+            ..Config::default()
+        };
+        // 通用页才有键帽行；语音服务页只出副标题，两页都量
+        let snap = probe_tab(cfg, 580.0, 1500.0, |_| {}, Tab::General);
         let mut bad = Vec::new();
         for t in &snap.texts {
             if t.x + t.w > snap.w - 4.0 {
@@ -2203,47 +2634,33 @@ mod layout {
         );
     }
 
-    /// 有内容和提示时也不能撑破（结果卡会多一行字、状态胶囊会换成提醒色）
+    /// 有内容和提示时反馈条照常工作：结果显示在底部、不撑破窗口
     #[test]
-    fn content_stays_compact_with_a_result_shown() {
-        let snap = probe(full_cfg(), 500.0, 1500.0, |shared| {
+    fn result_strip_shows_results_and_stays_in_shape() {
+        let snap = probe(full_cfg(), 580.0, 1500.0, |shared| {
             shared.update(|s| {
                 s.last_result = "今天天气不错，出去走走吧。".into();
                 s.text = s.last_result.clone();
                 s.kept_on_clipboard = true;
             });
         });
-        let h = snap.content_height();
-        assert!(h <= 760.0, "带结果和提示时内容总高 {h}px，超了");
+        // 结果本体要在底部区显示出来（不必完整，截断合法）
+        let strip_y = snap
+            .text_y("最近识别")
+            .expect("底部必须有「最近识别」反馈条");
         assert!(
-            snap.text_y("最近识别").is_some_and(|y| y < 530.0),
-            "有结果时「最近识别」也必须留在首屏"
+            strip_y >= snap.h - BOTTOM_RESERVED,
+            "有结果时反馈条也必须钉在底部"
         );
-    }
-
-    /// 导出这一帧的绘制指令（JSON），给 `docs/_draw_layout.py` 画验收图用。
-    ///
-    /// 标 `#[ignore]`：它只产出验收素材，不进常规测试集。
-    /// 手动跑：`cargo test --release dump_layout_for_review -- --ignored --nocapture`
-    #[test]
-    #[ignore = "产出验收图用的 JSON，手动跑：cargo test dump_layout_for_review -- --ignored"]
-    fn dump_layout_for_review() {
-        let snap = probe(Config::default(), 500.0, 1500.0, |_| {});
-        let doc = serde_json::json!({
-            "win_w": snap.w,
-            "win_h": snap.h,
-            "rects": snap.rects.iter().map(|r| serde_json::json!({
-                "x": r.x, "y": r.y, "w": r.w, "h": r.h,
-                "fill": r.fill, "stroke": r.stroke, "sw": r.sw, "cr": r.cr,
-            })).collect::<Vec<_>>(),
-            "texts": snap.texts.iter().map(|t| serde_json::json!({
-                "s": t.s, "x": t.x, "y": t.y, "w": t.w, "h": t.h, "color": t.color,
-            })).collect::<Vec<_>>(),
-        });
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("layout_now.json");
-        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-        println!("已导出：{}", path.display());
+        let mut bad = Vec::new();
+        for t in &snap.texts {
+            if t.y <= snap.h - BOTTOM_RESERVED {
+                continue;
+            }
+            if t.x + t.w > snap.w - 4.0 {
+                bad.push(format!("x={:.1} w={:.1} right={:.1}：{:?}", t.x, t.w, t.x + t.w, t.s));
+            }
+        }
+        assert!(bad.is_empty(), "反馈条有文字超出窗口：\n{}", bad.join("\n"));
     }
 }

@@ -71,7 +71,7 @@ impl Hotkey {
     }
 
     /// 序列化成配置里的字符串，如 "ctrl+shift+f9"
-    pub fn to_config(&self) -> String {
+    pub fn to_config(self) -> String {
         let mut parts = Vec::new();
         if self.ctrl {
             parts.push("ctrl".to_string());

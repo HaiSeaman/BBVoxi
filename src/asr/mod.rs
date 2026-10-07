@@ -465,10 +465,21 @@ async fn forward_frames(mut stream: SplitStream<Ws>, tx: Sender<Message>) {
 
 fn build_backend(cfg: &Config) -> Backend {
     match cfg.provider {
-        Provider::Qwen => Backend::Qwen(qwen::Qwen::new(&cfg.qwen, cfg.options.auto_punctuation)),
+        Provider::Qwen => Backend::Qwen(qwen::Qwen::new(&cfg.qwen, &cfg.options)),
         Provider::Doubao => Backend::Doubao(doubao::Doubao::new(&cfg.doubao, &cfg.options)),
         Provider::Tencent => Backend::Tencent(tencent::Tencent::new()),
     }
+}
+
+/// 个人词典解析：一行一个词，去首尾空格、去空行。
+/// 千问（vocabulary + context）和豆包（request.context 热词）共用这一份解析，
+/// 保证两家看到的词表永远一致。
+pub fn hotword_list(s: &str) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// 各家接口地址与鉴权请求头（地址写死在 config.rs）
@@ -482,7 +493,14 @@ pub fn request_spec(cfg: &Config) -> Result<(String, Vec<(String, String)>)> {
             )],
         )),
         Provider::Doubao => Ok((
-            cfg.doubao.endpoint().to_string(),
+            // language 参数仅整句（nostream）端点支持：选了语言就强制走整句端点，
+            // 与 `Doubao::new` 里 stream_mode 的判定保持同一条件
+            if cfg.options.language != "auto" {
+                crate::config::DOUBAO_URL_NOSTREAM
+            } else {
+                cfg.doubao.endpoint()
+            }
+            .to_string(),
             vec![
                 (
                     "X-Api-Key".to_string(),
@@ -499,7 +517,7 @@ pub fn request_spec(cfg: &Config) -> Result<(String, Vec<(String, String)>)> {
             ],
         )),
         Provider::Tencent => Ok((
-            tencent::signed_url(&cfg.tencent, cfg.options.smooth)?,
+            tencent::signed_url(&cfg.tencent, cfg.options.smooth, &cfg.options.language)?,
             Vec::new(),
         )),
     }

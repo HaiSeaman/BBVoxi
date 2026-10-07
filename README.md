@@ -5,20 +5,23 @@
 
 
 
-> **最新版本**：v1.3.3（2026-09-30，Stable）
-> 详细发布说明见 [docs/RELEASE_v1.3.3.md](./docs/RELEASE_v1.3.3.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
+> **最新版本**：v1.4.0（2026-10-07，Stable）
+> 详细发布说明见 [docs/RELEASE_v1.4.0.md](./docs/RELEASE_v1.4.0.md)，所有历史版本见 [docs/版本历史.md](./docs/版本历史.md)。
 
 按住一个全局快捷键说话，松开后识别结果**自动打到光标所在的位置**——就像输入法正常打字一样，没有多余窗口。
 
-- **单文件**：`BBVoxi-1.3.3.exe`，无需安装，双击即用
-- **界面一屏看全**（1.3.3 起）：品牌栏 + 「最近识别」+ 一张设置卡；说明文字收进悬停气泡（鼠标停在小 `i` 上才展开），实时文字永远在第一屏
+- **单文件**：`BBVoxi-1.4.0.exe`，无需安装，双击即用
+- **设置界面页签化**（1.4.0 起）：顶部三页签「语音服务 / 识别选项 / 通用」，每行「标题 + 说明 + 右侧控件」，窗口加宽到 580；说明文字直接写在行里（一眼看懂）
+- **三种主题**（1.4.0 起）：跟随系统 / 浅色 / 深色，点一下**立即生效并落盘**（改颜色不用再点保存）
+- **个人词典（热词）**（1.4.0 起）：一行一个词，人名、品牌名、术语优先命中（千问 / 豆包生效，腾讯需控制台预建）
+- **识别语言可选**（1.4.0 起）：自动 / 中文 / 英语 / 粤语 / 日语 / 韩语 / 法语 / 德语 / 俄语 / 西班牙语；豆包与腾讯自动切换对应参数与引擎
 - **边说话边打字**：识别结果实时写入光标处，识别被修正时自动回退重打（成熟输入法的做法）；双击 exe 可唤醒后台实例
 - **按多久说多久**：不限制单次录音时长
 - **打不进去也不丢字**：识别结果**每次都留一份到剪贴板**（默认开）——有些程序不认逐字注入（远程桌面、部分 Electron/Java），而"字到底有没有打进目标程序"客户端**无法核实**，所以留一份最稳；随时 `Ctrl+V` 取回
 - **中途失败也不丢字**（1.3.3 起）：网络超时、麦克风异常时会照常把服务端已定稿的那句取回来并交付，并说清原因
 - **不打扰**：结果改走剪贴板时**不弹窗**，只在托盘悬浮文字与设置窗里说明
 - **关窗有分寸**（1.3.3 起）：改过配置还没保存时，点 ✕ 会先问一句（保存并关闭 / 不保存 / 取消）
-- **三家服务商可切换**：阿里云百炼（千问）、火山引擎（豆包）、腾讯云 ASR
+- **三家服务商可切换**：阿里云百炼（千问，默认模型已升级到 **3.1**）、火山引擎（豆包）、腾讯云 ASR
 
 ---
 
@@ -26,24 +29,25 @@
 
 ### 直接用（推荐）
 
-从 Releases 下载 `BBVoxi-1.3.3.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
+从 Releases 下载 `BBVoxi-1.4.0.exe` → 双击运行 → 托盘出现图标 → 首次运行会弹出设置窗；已在运行时再次双击即弹出设置窗。
 
 ### 从源码构建
 
 ```bash
 cargo build --release     # 产物：target/release/bbvoxi.exe（约 8 MB）
-cargo test                # 单元测试（当前 190 条全绿，另有 5 条手动/需真实剪贴板的用例标了 ignore）
+cargo test                # 单元测试（当前 197 条全绿，另有 4 条手动/需真机环境的用例标了 ignore）
 ```
 
 构建要求：Rust 1.80+（MSVC 工具链，Windows）。
 exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**没装 SDK 也能编译成功**，只是 exe 退回系统默认图标。
 
-### 首次使用 4 步
+### 首次使用 5 步
 
-1. 设置窗里选服务商，填 API Key（腾讯云填三元组）
+1. 「语音服务」页选服务商，填 API Key（腾讯云填三元组）
 2. 点「测试识别（5 秒）」，说一句话确认能出字（结果只显示在窗口里，不会往外打字）
-3. 点「保存」，之后**关闭窗口 = 最小化到托盘**
-4. 在任意程序的光标处**按住快捷键说话，松开即输入**
+3. 「识别选项」页按需勾选（标点 / 口语顺滑 / 识别语言 / 个人词典），「通用」页可改快捷键、开机自启与界面主题
+4. 点「保存」，之后**关闭窗口 = 最小化到托盘**
+5. 在任意程序的光标处**按住快捷键说话，松开即输入**
 
 ---
 
@@ -112,8 +116,8 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 | `clipboard.rs` | 剪贴板纯文本读写（兜底粘贴 / 结果留底用），Win32 `GlobalAlloc` + 写完回读核对（写进去就留着，不还原） |
 | `typer.rs` | 实时输入：已发送文本 vs 期望文本求差分，增量补打 + 纠正回退；注入失败时切换兜底通道 |
 | `session.rs` | 会话编排：采集→推流→收结果→打字→收尾对账 |
-| `ui.rs` | egui 设置窗（方案 C）：品牌栏 + 「最近识别」+ 单张设置卡；调色板与真 WCAG 对比度校验、悬停说明气泡、状态消息 10 秒自动退场、关窗未保存确认；深浅双主题 |
-| `config.rs` | 配置模型 + 写死的官方接口地址 + `%APPDATA%` 持久化 |
+| `ui.rs` | egui 设置窗：顶部三页签（语音服务 / 识别选项 / 通用）+ 行卡片布局；调色板与真 WCAG 对比度校验、说明提示气泡、状态消息 10 秒自动退场、关窗未保存确认；三种主题（跟随系统 / 浅色 / 深色）即时切换 |
+| `config.rs` | 配置模型 + 写死的官方接口地址 + `%APPDATA%` 持久化 + 版本迁移（旧默认值一次性自动升级） |
 | `autostart.rs` | 开机自启（注册表 Run 项，值里带 `--autostart` 以便开机静默启动；按路径判定是否真的指向本程序） |
 | `log.rs` | 滚动日志（单份上限 2MB，另留 2 份旧日志；多实例串行化） |
 
@@ -195,11 +199,11 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 
 | | 千问 | 豆包 | 腾讯云 |
 |---|---|---|---|
-| 接口 | `wss://dashscope.aliyuncs.com/api-ws/v1/inference` | `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` | `wss://asr.cloud.tencent.com/asr/v2/<AppId>?签名` |
+| 接口 | `wss://dashscope.aliyuncs.com/api-ws/v1/inference` | `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`（实时）/ `bigmodel_nostream`（整句） | `wss://asr.cloud.tencent.com/asr/v2/<AppId>?签名` |
 | 鉴权 | `Authorization: Bearer <key>` | `X-Api-Key` / `X-Api-Resource-Id` / `X-Api-Connect-Id` | URL 参数签名（HMAC-SHA1 + Base64） |
 | 中间结果 | `sentence_end = false` | `definite = false` | `slice_type = 1` |
 | 定稿 | `sentence_end = true` | `definite = true`（二遍优化后） | `slice_type = 2` |
-| 特性 | 心跳 `heartbeat:true` 防静音断连 | 二次识别（更准，Final 可能改写中间结果） | 引擎 60 秒上限 |
+| 特性 | 心跳 `heartbeat:true` 防静音断连；**3.1** 支持近场 VAD 与去语气词 | 二次识别（更准，Final 可能改写中间结果）；热词走请求级 `context` | 引擎 60 秒上限；热词需控制台预建 |
 
 接口地址写死在 `config.rs`，用户不用手填。
 
@@ -208,7 +212,12 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 | 设置 | 千问 | 豆包 | 腾讯云 |
 |---|---|---|---|
 | 自动添加标点 | `semantic_punctuation_enabled` | `enable_punc` | 服务端决定（界面禁用） |
-| 口语顺滑 | 暂不支持（界面禁用） | `enable_ddc` | `filter_modal`（语气词过滤） |
+| 口语顺滑 | `disfluency_removal_enabled`（**3.1 起接通**，此前是摆设） | `enable_ddc` | `filter_modal`（语气词过滤） |
+| 个人词典（热词） | `vocabulary`（即时热词，词→权重 4）+ `input.context` 上下文增强 | `request.context`（`{"hotwords":[{"word":"…"}]}` 的**序列化字符串**） | 需控制台预建词表（界面注明此处不生效） |
+| 识别语言 | 模型自身多语种自动检测（无需参数） | `language`（BCP-47，**仅整句端点生效** → 选语言自动切 `bigmodel_nostream` + `StreamMode=1`） | 映射语言引擎 `16k_zh` / `16k_yue` / `16k_en` / `16k_ja` / `16k_ko`（法德俄西无实时引擎，明确报错） |
+
+千问 3.1 固定参数：`vad_model = near_meeting_16k`（**近场**听写，对麦克风说话；官方默认是远场会议）、
+`intermediate_result_enabled = true`（官方默认关，不开就没有"边说边出字"）。
 
 ### 6. 容错
 
@@ -226,8 +235,12 @@ exe 图标由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译进二进制；**
 | 日志 | `%APPDATA%\BBVoxi\logs\bbvoxi.log` |
 
 配置包含：服务商、各服务商凭据、快捷键、识别选项（边说话边打字 / 输入被拒时用剪贴板粘贴兜底 /
-识别结果总留一份到剪贴板 / 自动标点 / 口语顺滑）。
+识别结果总留一份到剪贴板 / 自动标点 / 口语顺滑 / 个人词典 / 识别语言）、界面主题。
 旧版本配置文件里已经废弃和新增的字段都会被自动忽略或补默认值，不会报错。
+
+配置带**版本号**（当前 `3`），启动时按版本做**一次性迁移**：1.4.0 起会把老配置里"从没动过"的
+**千问旧默认模型 3.0** 升级为 3.1（主人自己填过的模型名原样保留，与快捷键迁移同套路）；
+迁移结果会写回文件并记一条日志。
 
 ---
 
@@ -239,7 +252,7 @@ assets/       图标资源（icon.ico + 128/32 RGBA）+ bbvoxi.rc
 scripts/      make_icons.py（源图去背 → 透明图标一键生成）
 docs/         设计与修复报告 + 界面截图
 build.rs      用 Windows SDK rc.exe 把图标编译进 exe
-dist/         打包产物（BBVoxi-1.3.3.exe，不入库）
+dist/         打包产物（BBVoxi-1.4.0.exe，不入库）
 ```
 
 ---
@@ -248,12 +261,12 @@ dist/         打包产物（BBVoxi-1.3.3.exe，不入库）
 
 ```bash
 cargo build --release
-copy target\release\bbvoxi.exe dist\BBVoxi-1.3.3.exe
+copy target\release\bbvoxi.exe dist\BBVoxi-1.4.0.exe
 ```
 
-然后在 GitHub 新建 Release：Tag `v1.3.3`，标题 `BBVoxi 1.3.3`，上传 `dist\BBVoxi-1.3.3.exe`。
-（版本号三处一致：exe 文件名 / 界面显示 / GitHub Tag 都是 `1.3.3`，`Cargo.toml` 里同样写 `1.3.3`。）
-可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.3.3.md](./docs/GITHUB发布文案-v1.3.3.md)。
+然后在 GitHub 新建 Release：Tag `v1.4.0`，标题 `BBVoxi 1.4.0`，上传 `dist\BBVoxi-1.4.0.exe`。
+（版本号三处一致：exe 文件名 / 界面显示 / GitHub Tag 都是 `1.4.0`，`Cargo.toml` 里同样写 `1.4.0`。）
+可直接复制粘贴的 Release 标题与正文见 [docs/GITHUB发布文案-v1.4.0.md](./docs/GITHUB发布文案-v1.4.0.md)。
 
 > `dist/`、`*.exe`、构建产物与 `.workbuddy/` 已在 `.gitignore` 中忽略，不会进仓库。
 
@@ -290,13 +303,16 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.3.exe
 - 首次运行需在 Windows 隐私设置里允许桌面应用访问麦克风
 - 内存占用约 114 MB（窗口隐藏常驻）/ 170 MB（设置窗可见），主要是 egui + 中文字体的基线开销
 - 实时输入依赖"已经打进目标程序的文本"记账：若目标程序对输入做了自动改写（如代码编辑器自动补全），差分可能与之不同步
+- **腾讯云没有法语 / 德语 / 俄语 / 西班牙语的实时识别引擎**：选这些语言时会明确提示"换服务商或改回「自动」"，不会拿中文引擎瞎认
+- **个人词典对腾讯云不生效**：腾讯的热词要在控制台预建词表拿 ID，本程序未接（界面已注明）；千问与豆包填写即生效
+- **豆包选语言会切到整句模式**：官方的 `language` 参数只在整句端点上生效，所以选定语言后出字会比「自动」晚一两秒
 - 蓝牙耳机的「免提/通话」模式通常是 8 kHz，本程序会自动插值升采样到 16 kHz（日志可见），但音质客观上不如立体声麦克风，识别率会略低
 
 ---
 
 ## 十、版本与发布
 
-**当前**：v1.3.3（Stable，2026-09-30）
+**当前**：v1.4.0（Stable，2026-10-07）
 
 发布说明分两层组织：
 
@@ -305,11 +321,10 @@ copy target\release\bbvoxi.exe dist\BBVoxi-1.3.3.exe
 
 | 文档 | 说明 |
 |---|---|
-| [docs/RELEASE_v1.3.3.md](./docs/RELEASE_v1.3.3.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 |
-| [docs/UI界面审查与重构建议报告.md](./docs/UI界面审查与重构建议报告.md) | 本版的诊断依据：界面实测（内容总高 1274px、768 屏看不到实时文字）+ 真 WCAG 对比度实测（10 处不达标）+ 11 条严重功能硬伤（含源码位置） |
-| [docs/GITHUB发布文案-v1.3.3.md](./docs/GITHUB发布文案-v1.3.3.md) | GitHub Release 标题与正文（复制粘贴用）+ 发布前 30 秒自检清单 |
-| [docs/RELEASE_v1.3.2.md](./docs/RELEASE_v1.3.2.md) ｜ [docs/全量审查与修复报告.md](./docs/全量审查与修复报告.md) ｜ [docs/GITHUB发布文案-v1.3.2.md](./docs/GITHUB发布文案-v1.3.2.md) | 上一版（1.3.2）：发布说明 ｜ 审查报告 ｜ 发布文案 |
-| [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md) ｜ [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) ｜ [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 更早版本 ｜ 所有版本索引、写作模板、手动发布流程 |
-| [docs/_ui_compare_real.png](./docs/_ui_compare_real.png) | 本版界面改版前后的**真实布局对比图**（由真实 egui 布局代码导出绘制指令后绘制，非示意） |
+| [docs/RELEASE_v1.4.0.md](./docs/RELEASE_v1.4.0.md) | **当前版本**：包信息（SHA-256/大小/构建时间） · 功能清单 · 技术要点 · 15 模块 · 已知限制 · 升级指南 · 安全声明 |
+| [docs/全量审查与修复报告-v1.4.md](./docs/全量审查与修复报告-v1.4.md) | 本版代码审查与清理：死代码 / 重复设计 / 无用依赖与文件排查 + clippy 15 项修复清单 |
+| [docs/GITHUB发布文案-v1.4.0.md](./docs/GITHUB发布文案-v1.4.0.md) | GitHub Release 标题与正文（复制粘贴用）+ 发布前 30 秒自检清单 |
+| [docs/RELEASE_v1.3.3.md](./docs/RELEASE_v1.3.3.md) ｜ [docs/UI界面审查与重构建议报告.md](./docs/UI界面审查与重构建议报告.md) | 上一版（1.3.3）：发布说明 ｜ 界面与代码审查报告 |
+| [docs/RELEASE_v1.3.2.md](./docs/RELEASE_v1.3.2.md) ｜ [docs/RELEASE_v1.3.1.md](./docs/RELEASE_v1.3.1.md) ｜ [docs/RELEASE_v1.3.md](./docs/RELEASE_v1.3.md) ｜ [docs/RELEASE_v1.2.md](./docs/RELEASE_v1.2.md) ｜ [docs/版本历史.md](./docs/版本历史.md) | 更早版本 ｜ 所有版本索引、写作模板、手动发布流程 |
 
 > 后续每个版本都会新增一份 `docs/RELEASE_v<版本号>.md`，并在「版本历史」追加索引行。发布流程见 `docs/版本历史.md` §4。

@@ -785,7 +785,7 @@ fn sync_live(typer: &mut typer::LiveTyper, shared: &Shared, text: &str) {
 fn foreground_window() -> Option<isize> {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let hwnd = unsafe { GetForegroundWindow() };
-    (!hwnd.is_invalid()).then(|| hwnd.0 as isize)
+    (!hwnd.is_invalid()).then_some(hwnd.0 as isize)
 }
 
 #[cfg(not(windows))]

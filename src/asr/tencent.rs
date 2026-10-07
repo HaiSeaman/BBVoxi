@@ -113,22 +113,53 @@ fn tencent_hint(code: i64) -> &'static str {
     }
 }
 
-/// 生成带签名的 WebSocket 地址（`smooth` 控制 filter_modal，对应「口语顺滑」开关）
-pub fn signed_url(cfg: &TencentConfig, smooth: bool) -> Result<String> {
-    signed_url_at(cfg, now_secs(), smooth)
+/// 语言 → 腾讯实时识别引擎映射。
+///
+/// 腾讯的实时引擎按语言分型号（16k_zh / 16k_yue / 16k_en / 16k_ja / 16k_ko）；
+/// 法语/德语/俄语/西班牙语只有录音文件识别支持、没有实时引擎，
+/// 明确报错（让主人换服务商或改回「自动」），绝不悄悄用错引擎瞎识别。
+fn engine_for_language(lang: &str) -> Result<Option<&'static str>> {
+    match lang {
+        // 跟随用户在「语音服务」页自选的引擎
+        "auto" => Ok(None),
+        "zh" => Ok(Some("16k_zh")),
+        "yue" => Ok(Some("16k_yue")),
+        "en" => Ok(Some("16k_en")),
+        "ja" => Ok(Some("16k_ja")),
+        "ko" => Ok(Some("16k_ko")),
+        // 这四种语言腾讯只有录音文件识别、没有实时引擎：明确报错
+        // （让主人换服务商或改回「自动」），绝不悄悄用中文引擎瞎识别
+        "fr" | "de" | "ru" | "es" => bail!("腾讯云暂不支持该语言的实时识别，请换服务商或改回「自动」"),
+        // 配置文件手改坏了等极端情况：当「自动」处理，别拦着主人用
+        _ => Ok(None),
+    }
 }
 
-fn signed_url_at(cfg: &TencentConfig, now: u64, smooth: bool) -> Result<String> {
+/// 生成带签名的 WebSocket 地址（`smooth` 控制 filter_modal，对应「口语顺滑」开关；
+/// `language` 非 auto 时覆盖为对应语言的引擎）
+pub fn signed_url(cfg: &TencentConfig, smooth: bool, language: &str) -> Result<String> {
+    signed_url_at(cfg, now_secs(), smooth, language)
+}
+
+fn signed_url_at(cfg: &TencentConfig, now: u64, smooth: bool, language: &str) -> Result<String> {
     let app_id = cfg.app_id.trim();
     let secret_id = cfg.secret_id.trim();
     let secret_key = cfg.secret_key.trim();
     if app_id.is_empty() || secret_id.is_empty() || secret_key.is_empty() {
         bail!("腾讯云需要填写 App ID、Secret ID、Secret Key");
     }
-    let engine = cfg.engine_model_type.trim();
-    if engine.is_empty() {
-        bail!("腾讯云需要选择引擎模型");
-    }
+    // 选了识别语言（非 auto）就用对应语言引擎，覆盖用户自选的引擎；
+    // auto 才用用户在「语音服务」页选的引擎
+    let engine = match engine_for_language(language)? {
+        Some(e) => e,
+        None => {
+            let e = cfg.engine_model_type.trim();
+            if e.is_empty() {
+                bail!("腾讯云需要选择引擎模型");
+            }
+            e
+        }
+    };
 
     let voice_id = uuid::Uuid::new_v4().to_string();
     // BTreeMap 天然按 key 字典序排列，签名原文要求字典序
@@ -201,7 +232,7 @@ mod tests {
 
     #[test]
     fn url_contains_required_params_and_signature() {
-        let url = signed_url_at(&cfg(), 1_743_000_000, true).unwrap();
+        let url = signed_url_at(&cfg(), 1_743_000_000, true, "auto").unwrap();
         assert!(url.starts_with("wss://asr.cloud.tencent.com/asr/v2/1259223000?"));
         for key in [
             "engine_model_type=Hy-ASR-3.0-preview",
@@ -234,17 +265,35 @@ mod tests {
     /// 「口语顺滑」开关必须真的落到 filter_modal 参数里
     #[test]
     fn smooth_toggle_reaches_filter_modal() {
-        let on = signed_url_at(&cfg(), 1_743_000_000, true).unwrap();
+        let on = signed_url_at(&cfg(), 1_743_000_000, true, "auto").unwrap();
         assert!(on.contains("filter_modal=1"));
-        let off = signed_url_at(&cfg(), 1_743_000_000, false).unwrap();
+        let off = signed_url_at(&cfg(), 1_743_000_000, false, "auto").unwrap();
         assert!(off.contains("filter_modal=0"));
+    }
+
+    /// 识别语言 → 腾讯引擎映射：非 auto 时覆盖用户自选引擎；
+    /// auto 时用用户自选引擎；不支持的语言（腾讯无实时引擎）明确报错。
+    #[test]
+    fn language_overrides_engine_and_unsupported_errors() {
+        // 选了英语 → 引擎必须换成 16k_en（而不是用户自选的 Hy-ASR-3.0-preview）
+        let en = signed_url_at(&cfg(), 1_743_000_000, true, "en").unwrap();
+        assert!(en.contains("engine_model_type=16k_en"), "选英语应切 16k_en：{en}");
+        let yue = signed_url_at(&cfg(), 1_743_000_000, true, "yue").unwrap();
+        assert!(yue.contains("engine_model_type=16k_yue"));
+        // auto → 用户自选引擎
+        let auto = signed_url_at(&cfg(), 1_743_000_000, true, "auto").unwrap();
+        assert!(auto.contains("engine_model_type=Hy-ASR-3.0-preview"));
+        // 法语：腾讯没有实时引擎，必须报错而不是拿中文引擎瞎识别
+        let fr = signed_url_at(&cfg(), 1_743_000_000, true, "fr");
+        assert!(fr.is_err(), "无实时引擎的语言必须报错");
+        assert!(fr.unwrap_err().to_string().contains("暂不支持"));
     }
 
     #[test]
     fn missing_credentials_is_rejected() {
         let mut c = cfg();
         c.secret_key = "  ".into();
-        assert!(signed_url_at(&c, 0, true).is_err());
+        assert!(signed_url_at(&c, 0, true, "auto").is_err());
     }
 
     /// 回归（腾讯最后一包永不结束会话 → 主人松手后白等 8 秒超时）：

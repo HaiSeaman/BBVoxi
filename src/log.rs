@@ -154,7 +154,7 @@ fn now_ms() -> u64 {
     #[cfg(windows)]
     {
         use windows::Win32::System::SystemInformation::GetTickCount64;
-        return unsafe { GetTickCount64() };
+        unsafe { GetTickCount64() }
     }
     #[cfg(not(windows))]
     {
@@ -171,10 +171,10 @@ fn local_timestamp() -> String {
     {
         use windows::Win32::System::SystemInformation::GetLocalTime;
         let st = unsafe { GetLocalTime() };
-        return format!(
+        format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-        );
+        )
     }
     // 非 Windows 兜底：unix 秒
     #[cfg(not(windows))]

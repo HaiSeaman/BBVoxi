@@ -4,7 +4,7 @@
 //! 二进制协议：4 字节头 + 4 字节 payload 长度(大端) + payload；JSON 体 gzip 压缩。
 //! 2.0 资源（volc.seedasr.sauc.duration）的 StreamMode 只能是 1 或 2。
 
-use super::{pcm_bytes, Kind, Parsed};
+use super::{hotword_list, pcm_bytes, Kind, Parsed};
 use crate::config::{DoubaoConfig, Options};
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -60,11 +60,38 @@ pub struct Doubao {
     finished: bool,
 }
 
+/// 豆包官方 language 参数取值（BCP-47 格式）。
+///
+/// 官方限制：language **只在整句（bigmodel_nostream）端点上生效**，
+/// 所以选了语言就必须同时切整句端点 + StreamMode=1（见 `Doubao::new`
+/// 与 `request_spec` 里同一个判定条件）。
+pub fn language_code(lang: &str) -> Option<&'static str> {
+    match lang {
+        "auto" => None,
+        "zh" => Some("zh-CN"),
+        "en" => Some("en-US"),
+        "yue" => Some("yue-CN"),
+        "ja" => Some("ja-JP"),
+        "ko" => Some("ko-KR"),
+        "fr" => Some("fr-FR"),
+        "de" => Some("de-DE"),
+        "ru" => Some("ru-RU"),
+        "es" => Some("es-MX"),
+        _ => None,
+    }
+}
+
 impl Doubao {
     pub fn new(cfg: &DoubaoConfig, options: &Options) -> Self {
         Self {
-            // 2.0 资源只接受 1（整句）或 2（双向流式 + 二次识别）；高精度模式用 nostream 端点配 1
-            stream_mode: if cfg.high_accuracy { 1 } else { 2 },
+            // 2.0 资源只接受 1（整句）或 2（双向流式 + 二次识别）；高精度模式用
+            // nostream 端点配 1。选了识别语言（非 auto）也强制 1：官方的 language
+            // 参数只在整句端点上生效（见 `language_code` 的说明）。
+            stream_mode: if cfg.high_accuracy || options.language != "auto" {
+                1
+            } else {
+                2
+            },
             options: options.clone(),
             buffered: None,
             reported: String::new(),
@@ -75,7 +102,7 @@ impl Doubao {
 
     /// 启动指令（返回 Result：压缩失败要往上抛，见 `gzip`）
     pub fn start_messages(&self) -> Result<Vec<Message>> {
-        let body = json!({
+        let mut body = json!({
             "audio": { "format": "pcm", "codec": "raw", "rate": 16_000, "bits": 16, "channel": 1 },
             "request": {
                 "model_name": "bigmodel",
@@ -89,6 +116,17 @@ impl Doubao {
                 "end_window_size": 800
             }
         });
+        // 识别语言（官方参数，仅整句端点生效——stream_mode/端点选择已在上面联动）
+        if let Some(code) = language_code(&self.options.language) {
+            body["request"]["language"] = json!(code);
+        }
+        // 个人词典（热词）。注意官方格式：request.context 是**序列化后的 JSON 字符串**，
+        // 不是嵌套对象（文档原例：{"hotwords":[{"word":"..."}]} 要整体当字符串传）。
+        let hotwords = hotword_list(&self.options.hotwords);
+        if !hotwords.is_empty() {
+            let ctx = json!({ "hotwords": hotwords.iter().map(|w| json!({ "word": w })).collect::<Vec<_>>() });
+            body["request"]["context"] = json!(ctx.to_string());
+        }
         let payload = gzip(body.to_string().as_bytes())?;
         Ok(vec![frame(
             MSG_FULL_CLIENT_REQUEST,
@@ -363,12 +401,12 @@ fn close_hint(code: CloseCode) -> &'static str {
 /// 官方错误码的中文解释，便于用户自查
 fn error_hint(code: i32) -> Option<&'static str> {
     match code {
-        4_500_000_1 => Some("请求参数无效"),
-        4_500_000_2 => Some("空音频"),
-        4_500_008_1 => Some("等包超时"),
-        4_500_015_1 => Some("音频格式不正确"),
-        5_500_003_1 => Some("服务器繁忙"),
-        _ if (5_500_0000..5_600_0000).contains(&code) => Some("服务内部错误"),
+        45_000_001 => Some("请求参数无效"),
+        45_000_002 => Some("空音频"),
+        45_000_081 => Some("等包超时"),
+        45_000_151 => Some("音频格式不正确"),
+        55_000_031 => Some("服务器繁忙"),
+        _ if (55_000_000..56_000_000).contains(&code) => Some("服务内部错误"),
         _ => None,
     }
 }
@@ -428,6 +466,74 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(body["request"]["StreamMode"], 1);
         assert_eq!(body["request"]["enable_nonstream"], false);
+    }
+
+    /// 识别语言联动：选了语言（非 auto）→ StreamMode 强制 1（整句）+ 传官方
+    /// language 参数；「自动」则一个都不带，行为与升级前完全一致。
+    /// （官方限制：language 仅整句端点生效，端点切换在 request_spec 里联动。）
+    #[test]
+    fn language_selection_forces_nostream_and_sends_language() {
+        let o = Options {
+            language: "ja".into(),
+            ..Options::default()
+        };
+        let d = Doubao::new(&cfg(), &o);
+        let start = d.start_messages().expect("启动帧压缩不应失败");
+        let Message::Binary(bytes) = &start[0] else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        GzDecoder::new(&bytes[8..]).read_to_end(&mut out).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(body["request"]["StreamMode"], 1, "选语言必须强制整句模式");
+        assert_eq!(body["request"]["language"], "ja-JP");
+        assert_eq!(body["request"]["enable_nonstream"], false);
+
+        // 自动：不传 language
+        let auto = Doubao::new(&cfg(), &Options::default());
+        let start = auto.start_messages().expect("启动帧压缩不应失败");
+        let Message::Binary(bytes) = &start[0] else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        GzDecoder::new(&bytes[8..]).read_to_end(&mut out).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(body["request"]["language"].is_null(), "自动模式不带 language");
+    }
+
+    /// 个人词典（热词）：豆包的 request.context 必须是**序列化后的 JSON 字符串**
+    /// （官方文档格式），不是嵌套对象；没填词时字段完全不出现。
+    #[test]
+    fn hotwords_go_into_context_as_serialized_string() {
+        let o = Options {
+            hotwords: " 宝可梦 \n张三丰\n\n".into(),
+            ..Options::default()
+        };
+        let d = Doubao::new(&cfg(), &o);
+        let start = d.start_messages().expect("启动帧压缩不应失败");
+        let Message::Binary(bytes) = &start[0] else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        GzDecoder::new(&bytes[8..]).read_to_end(&mut out).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // 关键断言：context 是字符串，值解析回来恰好是两个词（空行/空格被去掉）
+        let ctx = body["request"]["context"].as_str().expect("context 必须是字符串");
+        let parsed: serde_json::Value = serde_json::from_str(ctx).unwrap();
+        assert_eq!(parsed["hotwords"][0]["word"], "宝可梦");
+        assert_eq!(parsed["hotwords"][1]["word"], "张三丰");
+        assert_eq!(parsed["hotwords"].as_array().map(|a| a.len()), Some(2));
+
+        // 没填词：不带 context
+        let d = Doubao::new(&cfg(), &Options::default());
+        let start = d.start_messages().expect("启动帧压缩不应失败");
+        let Message::Binary(bytes) = &start[0] else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        GzDecoder::new(&bytes[8..]).read_to_end(&mut out).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(body["request"]["context"].is_null(), "没填词不带 context");
     }
 
     #[test]

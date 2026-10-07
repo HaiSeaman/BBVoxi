@@ -1,32 +1,30 @@
 //! 千问（阿里云百炼）实时语音识别：run-task → 二进制音频流 → result-generated → finish-task。
 //! 地址已核实：wss://dashscope.aliyuncs.com/api-ws/v1/inference（鉴权走 Authorization: Bearer）。
 
-use super::{pcm_bytes, Kind, Parsed};
-use crate::config::QwenConfig;
+use super::{hotword_list, pcm_bytes, Kind, Parsed};
+use crate::config::{Options, QwenConfig};
 use serde_json::json;
 use tokio_tungstenite::tungstenite::Message;
 
 pub struct Qwen {
     task_id: String,
     model: String,
-    /// 语义标点（跟随「自动添加标点」开关）：true 由 LLM 加标点更准但首字更慢，
-    /// false 用 VAD 断句、出字更快
-    semantic_punctuation: bool,
+    options: Options,
     pub ready: bool,
 }
 
 impl Qwen {
-    pub fn new(cfg: &QwenConfig, auto_punctuation: bool) -> Self {
+    pub fn new(cfg: &QwenConfig, options: &Options) -> Self {
         Self {
             task_id: uuid::Uuid::new_v4().to_string(),
             model: cfg.model.trim().to_string(),
-            semantic_punctuation: auto_punctuation,
+            options: options.clone(),
             ready: false,
         }
     }
 
     pub fn start_messages(&self) -> Vec<Message> {
-        let body = json!({
+        let mut body = json!({
             "header": { "action": "run-task", "task_id": self.task_id, "streaming": "duplex" },
             "payload": {
                 "task_group": "audio",
@@ -36,13 +34,37 @@ impl Qwen {
                 "parameters": {
                     "format": "pcm",
                     "sample_rate": 16_000,
-                    "semantic_punctuation_enabled": self.semantic_punctuation,
+                    // 语义标点（跟随「自动添加标点」开关）：true 由 LLM 加标点更准但首字更慢，
+                    // false 用 VAD 断句、出字更快
+                    "semantic_punctuation_enabled": self.options.auto_punctuation,
+                    // 去语气词（跟随「口语顺滑」开关）：之前从未传过，开关对千问是摆设
+                    "disfluency_removal_enabled": self.options.smooth,
+                    // 中间结果：官方默认关，显式打开才能「边说边出字」
+                    "intermediate_result_enabled": true,
+                    // 近场听写 VAD。官方默认 far_field_meeting_16k 是「远场会议」场景
+                    // （会议室麦克风收全场声音），对麦克风说话的输入法场景用近场更准
+                    "vad_model": "near_meeting_16k",
                     // 静音时保持连接，否则长时间不说话会被服务端断开
                     "heartbeat": true
                 },
                 "input": {}
             }
         });
+        // 个人词典（热词）：即时热词词表 + 上下文增强，两条都上，
+        // 专有名词（人名/品牌/术语）的命中率才明显。
+        let hotwords = hotword_list(&self.options.hotwords);
+        if !hotwords.is_empty() {
+            // 词 → 权重（官方范围 1~5，4 = 高优先但不过分抢占正常识别）
+            let vocab: serde_json::Map<String, serde_json::Value> = hotwords
+                .iter()
+                .map(|w| (w.clone(), json!(4)))
+                .collect();
+            body["payload"]["parameters"]["vocabulary"] = json!(vocab);
+            body["payload"]["input"]["context"] = json!([{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": hotwords.join(" ") }]
+            }]);
+        }
         vec![Message::text(body.to_string())]
     }
 
@@ -116,20 +138,83 @@ fn parse_json(text: &str, ready: &mut bool) -> Parsed {
 mod tests {
     use super::*;
 
+    fn start_json(cfg: &QwenConfig, options: &Options) -> serde_json::Value {
+        match &Qwen::new(cfg, options).start_messages()[0] {
+            Message::Text(t) => serde_json::from_str(t).expect("启动帧应为合法 JSON"),
+            _ => panic!("应为文本帧"),
+        }
+    }
+
+    fn options_with(f: impl FnOnce(&mut Options)) -> Options {
+        let mut o = Options::default();
+        f(&mut o);
+        o
+    }
+
     /// 「自动添加标点」开关必须真的落到请求参数里（之前不传，开关是摆设）
     #[test]
     fn punctuation_toggle_reaches_request() {
         let cfg = QwenConfig::default();
-        let on = match &Qwen::new(&cfg, true).start_messages()[0] {
-            Message::Text(t) => t.to_string(),
-            _ => panic!("应为文本帧"),
-        };
-        assert!(on.contains(r#""semantic_punctuation_enabled":true"#));
-        let off = match &Qwen::new(&cfg, false).start_messages()[0] {
-            Message::Text(t) => t.to_string(),
-            _ => panic!("应为文本帧"),
-        };
-        assert!(off.contains(r#""semantic_punctuation_enabled":false"#));
+        let on = start_json(&cfg, &options_with(|o| o.auto_punctuation = true));
+        assert_eq!(on["payload"]["parameters"]["semantic_punctuation_enabled"], true);
+        let off = start_json(&cfg, &options_with(|o| o.auto_punctuation = false));
+        assert_eq!(
+            off["payload"]["parameters"]["semantic_punctuation_enabled"],
+            false
+        );
+    }
+
+    /// 回归（千问 3.1）：「口语顺滑」开关必须落到 disfluency_removal_enabled。
+    /// 之前千问的启动帧从不带这个参数，开关对千问是摆设、界面还显示"暂不支持"。
+    #[test]
+    fn smooth_toggle_reaches_disfluency_removal() {
+        let cfg = QwenConfig::default();
+        let on = start_json(&cfg, &options_with(|o| o.smooth = true));
+        assert_eq!(on["payload"]["parameters"]["disfluency_removal_enabled"], true);
+        let off = start_json(&cfg, &options_with(|o| o.smooth = false));
+        assert_eq!(
+            off["payload"]["parameters"]["disfluency_removal_enabled"],
+            false
+        );
+    }
+
+    /// 千问 3.1 固定参数：近场 VAD + 显式开启中间结果。
+    /// 官方默认远场（far_field_meeting_16k）与中间结果默认关，
+    /// 两项不显式传，输入法场景出字又慢又少。
+    #[test]
+    fn near_field_vad_and_intermediate_results() {
+        let body = start_json(&QwenConfig::default(), &Options::default());
+        assert_eq!(body["payload"]["parameters"]["vad_model"], "near_meeting_16k");
+        assert_eq!(
+            body["payload"]["parameters"]["intermediate_result_enabled"],
+            true
+        );
+    }
+
+    /// 个人词典（热词）：千问走「即时热词词表 + 上下文增强」两条通道，
+    /// 没填词时一个字段都不能多（行为与升级前完全一致）。
+    #[test]
+    fn hotwords_reach_vocabulary_and_context() {
+        let cfg = QwenConfig::default();
+        // 没填词：不带 vocabulary / context
+        let empty = start_json(&cfg, &Options::default());
+        assert!(empty["payload"]["parameters"]["vocabulary"].is_null());
+        assert!(empty["payload"]["input"]["context"].is_null());
+
+        let o = options_with(|o| {
+            o.hotwords = "  宝可梦 \n\n张三丰\n  \nBBVoxi\n".into();
+        });
+        let body = start_json(&cfg, &o);
+        // 去空行、去首尾空格后恰好 3 个词
+        assert_eq!(body["payload"]["parameters"]["vocabulary"]["宝可梦"], 4);
+        assert_eq!(body["payload"]["parameters"]["vocabulary"]["张三丰"], 4);
+        assert_eq!(body["payload"]["parameters"]["vocabulary"]["BBVoxi"], 4);
+        assert_eq!(body["payload"]["parameters"]["vocabulary"].as_object().map(|m| m.len()), Some(3));
+        assert_eq!(
+            body["payload"]["input"]["context"][0]["content"][0]["text"],
+            "宝可梦 张三丰 BBVoxi"
+        );
+        assert_eq!(body["payload"]["input"]["context"][0]["role"], "user");
     }
 
     fn feed(raw: &str) -> Parsed {
