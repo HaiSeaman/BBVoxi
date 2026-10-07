@@ -14,7 +14,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_LCONTROL, VK_RETURN, VK_TAB, VK_V,
 };
 
-/// 一次 SendInput 提交的字符数（每个字符 2 个事件）
+/// 一次 SendInput 提交的 **UTF-16 编码单元**数（每个单元 2 个事件：按下 + 抬起）。
+/// 注意是编码单元不是"字符"：一个 emoji 占两个单元，一个换行占一个。
 const BATCH_CHARS: usize = 16;
 const ERROR_ACCESS_DENIED: u32 = 5;
 
@@ -178,7 +179,15 @@ pub fn paste() -> Result<()> {
     paste_events(&mut buf);
     // 粘贴是一串有先后的按键（Ctrl↓ V↓ V↑ Ctrl↑），只进去一半会留下卡住的 Ctrl，
     // 所以这里要求整批都必须成功，不能用"部分成功也算过"的宽松口径。
-    flush_all(&mut buf)
+    // 真失败时必须补救：丢掉的很可能正是末尾那次 Ctrl 抬起
+    // （见 `best_effort_release_modifiers`）。
+    match flush_all(&mut buf) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            best_effort_release_modifiers();
+            Err(e)
+        }
+    }
 }
 
 /// 组装一次粘贴的按键序列（与 `paste` 分开，便于单测校验顺序与扫描码）
@@ -232,7 +241,32 @@ fn push_key_stroke(buf: &mut Vec<INPUT>, vk: VIRTUAL_KEY) {
 pub fn press_win(win: u32) -> Result<()> {
     let mut buf: Vec<INPUT> = Vec::with_capacity(2);
     win_press_events(&mut buf, win);
-    flush_all(&mut buf)
+    // 只进去一半 = 只补了 Win 按下、没补到抬起，外壳会以为 Win 一直按着
+    // （之后随便敲个字母就弹开始菜单/资源管理器）：失败时补救一次
+    match flush_all(&mut buf) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            best_effort_release_modifiers();
+            Err(e)
+        }
+    }
+}
+
+/// 整批提交失败后的补救：**尽力**把所有修饰键再抬一次。
+///
+/// 为什么必须有它：`paste` / `press_win` 的事件序列把"抬起修饰键"放在**末尾**，
+/// 而 `SendInput` 是可能只吃下一部分就返回的（被 UIPI 拦、桌面正在切换、输入队列
+/// 满）。丢掉的正好是末尾那几次抬起时，系统里就留下一个一直按着的 Ctrl / Win ——
+/// 之后主人敲的每个键都变成 `Ctrl+键`，Win 卡住更糟。重复释放是幂等的
+/// （见 `push_modifier_reset` 的说明），所以这里只求"尽力"：失败也不再往上抛，
+/// 反正已经有一个失败要报给主人了。
+///
+/// 逐字注入那条路不需要它：它的修饰键重置在**开头**（见 `type_text_with`），
+/// 部分失败丢的是尾巴上的字符，不是抬起。
+fn best_effort_release_modifiers() {
+    let mut buf: Vec<INPUT> = Vec::with_capacity(crate::hotkey::MODIFIERS.len());
+    push_modifier_reset(&mut buf);
+    let _ = flush(&mut buf);
 }
 
 /// 组装「补一次完整 Win 按键」的事件序列（与 `press_win` 分开，便于单测校验：

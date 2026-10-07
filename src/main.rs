@@ -11,6 +11,7 @@ mod log;
 mod session;
 mod typer;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use eframe::egui;
@@ -25,7 +26,26 @@ use session::{Cmd, Shared};
 
 fn main() -> Result<()> {
     install_panic_hook();
-    if !single_instance_lock() {
+    // `--updated`：这是"更新完之后由老版本亲手拉起来"的新实例。
+    // 它**必须跳过单实例检查** —— 老进程此刻还在退出路上，锁还没释放，
+    // 不跳过的话新实例会以为"已经有人在跑"，发个唤醒消息就把自己关掉，
+    // 主人看到的现象是"点了重启，什么都没发生"。
+    let updated_restart = std::env::args().any(|a| a == "--updated");
+    if updated_restart {
+        // 接班实例：等老进程松手再拿锁（见 `single_instance_lock_waiting` 的说明）。
+        // 等不到就**退出**，绝不"没锁也接着跑"：
+        // 老进程还活着（它握着锁），说明它没有正常退场；我们要是就这么跑起来，
+        // 主人之后再双击一次 exe，那个进程会发现自己"是第一个实例"——又拉起一套，
+        // 于是两个托盘图标、两个键盘钩子一起抢键，正是这条注释要防的事。
+        // 退出前给老实例发个唤醒消息，让主人至少看到窗口弹出来（知道自己还有程序在跑）。
+        if !single_instance_lock_waiting(Duration::from_secs(10)) {
+            log::log(
+                "更新接班失败：10 秒内没等到老进程放开单实例锁，本次不启动（老实例仍在运行）",
+            );
+            WakeEvent::signal_running_instance();
+            return Ok(());
+        }
+    } else if !single_instance_lock() {
         // 已有实例在运行：windows_subsystem=windows 下没有控制台，打印没人看得见；
         // 用户双击 exe 想看到的正是设置窗，所以直接通知那个实例弹出来
         WakeEvent::signal_running_instance();
@@ -179,24 +199,64 @@ fn window_geometry() -> (f32, f32, [f32; 2]) {
 }
 
 /// 单实例保护：命名互斥量已存在说明已有实例在运行。/// ponytail: 只做互斥，不做进程间唤醒（需要再加 WM_COPYDATA）
-fn single_instance_lock() -> bool {
+/// 试一次创建单实例互斥量：返回 `(是否首个实例, 句柄)`。
+///
+/// 抽出来是为了让"等锁"那条路能反复试**而不漏句柄**（见下面的说明）。
+fn try_create_mutex() -> Option<(bool, windows::Win32::Foundation::HANDLE)> {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
     unsafe {
         match CreateMutexW(None, false, windows::core::w!("BBVoxi_SingleInstance")) {
-            Ok(h) if !h.is_invalid() => {
-                let already = GetLastError() == ERROR_ALREADY_EXISTS;
-                Box::leak(Box::new(h)); // 进程存活期间保持持有
-                !already
+            Ok(h) if !h.is_invalid() => Some((GetLastError() != ERROR_ALREADY_EXISTS, h)),
+            _ => None,
+        }
+    }
+}
+
+fn single_instance_lock() -> bool {
+    match try_create_mutex() {
+        Some((first, h)) => {
+            Box::leak(Box::new(h)); // 进程存活期间保持持有
+            first
+        }
+        None => {
+            // CreateMutexW 失败（极少见）时按"首个实例"继续跑：不能因为一次失败就
+            // 不让主人用程序。但这意味着可能真跑出两个实例（双托盘、双键盘钩子），
+            // 必须在日志里留下明确记录，否则这种怪现象根本无从排查。
+            log::log("创建单实例互斥量失败，按首个实例继续启动（可能与其它实例共存）");
+            true
+        }
+    }
+}
+
+/// 「更新完接班」专用：等老进程把单实例锁放开，拿到之后再往下走。
+///
+/// 为什么必须拿到：`--updated` 的实例是老版本亲手拉起来的，那一刻老进程还在退出
+/// 路上、锁还攥着。如果新实例干脆**不要锁**就启动，那么在老进程退出之后，
+/// 主人再双击一次 exe —— 那个进程会发现自己"是第一个实例"，于是又跑起一套
+/// （两个托盘图标、两个键盘钩子）。所以这里循环重试，拿到为止。
+/// 每次重试失败都顺手把句柄关掉（`Box::leak` 只用在成功那一次），免得漏句柄。
+fn single_instance_lock_waiting(timeout: Duration) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match try_create_mutex() {
+            Some((true, h)) => {
+                Box::leak(Box::new(h));
+                return true;
             }
-            _ => {
-                // CreateMutexW 失败（极少见）时按"首个实例"继续跑：不能因为一次失败就
-                // 不让主人用程序。但这意味着可能真跑出两个实例（双托盘、双键盘钩子），
-                // 必须在日志里留下明确记录，否则这种怪现象根本无从排查。
+            Some((false, h)) => unsafe {
+                let _ = CloseHandle(h);
+            },
+            None => {
                 log::log("创建单实例互斥量失败，按首个实例继续启动（可能与其它实例共存）");
-                true
+                return true;
             }
         }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -352,6 +412,11 @@ impl App {
         }
         self.ever_shown = true;
         self.shown = true;
+        // 每次露脸都重新列一遍麦克风：程序是常驻的（还可能开机就自启），主人新插的
+        // 设备、拔掉的设备都得在打开设置窗这一刻反映出来 —— 否则"选中的那台不在线"
+        // 那行提醒在最需要它的时候不亮，而录音已经悄悄退回系统默认设备了。
+        // （`SettingsApp::new` 里也列过一次：正常双击启动时窗口直接可见、不走这里。）
+        self.settings.refresh_mics();
         // 显示之前先解除最小化：窗口处于最小化状态时 winit 会跳过抢焦点，
         // 主人把设置窗最小化后，从托盘"打开设置"或双击 exe 都恢复不回来。
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -380,12 +445,17 @@ impl App {
             TrayState::Idle
         };
         if self.tray_state != state {
+            // 记账必须在 `if let Some(tray)` **里面**：托盘还没建好时（开机太早、
+            // 外壳没起来，见 `logic` 里 30 秒一次的重试）如果照样把它记成"已经是新
+            // 状态了"，等托盘真的建出来，`tray_state == state` 就成立、`set_icon`
+            // 被跳过 —— 新托盘一直挂着 `build_tray` 给的就绪图标与默认悬浮文字，
+            // 直到下一次状态翻转。界面在骗人。
             if let Some(tray) = &self.tray {
                 if let Err(e) = tray.set_icon(Some(icon_for(state))) {
                     log::log(format!("更新托盘图标失败：{e}"));
                 }
+                self.tray_state = state;
             }
-            self.tray_state = state;
         }
         // 菜单文案只在状态翻转时改一次，避免每帧都去动原生菜单
         if self.tray_recording != Some(snap.recording) {
@@ -408,10 +478,11 @@ impl App {
             "BBVoxi 语音输入法".to_string()
         };
         if self.tray_tooltip.as_deref() != Some(tooltip.as_str()) {
+            // 同上：托盘不在时不许记账，否则托盘建好之后这句提示永远不会被写上
             if let Some(tray) = &self.tray {
                 let _ = tray.set_tooltip(Some(&tooltip));
+                self.tray_tooltip = Some(tooltip);
             }
-            self.tray_tooltip = Some(tooltip);
         }
     }
 }
@@ -494,6 +565,14 @@ impl eframe::App for App {
         if self.settings.take_hide_request() {
             self.settings.cancel_capture();
             self.hide_window(ctx);
+        }
+        // 更新装好后主人点了「立刻重启」：新进程已经拉起来了（见 ui 里那个方法），
+        // 这里只负责**收尾退出** —— 托盘图标必须先析构，否则它会残留在托盘里
+        // （`process::exit` 不跑 Drop），和托盘菜单里的「退出」是同一套规矩。
+        if self.settings.take_restart_request() {
+            log::log("更新完成，退出本进程交给新版本");
+            self.tray = None;
+            std::process::exit(0);
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {

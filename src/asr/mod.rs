@@ -14,6 +14,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -45,6 +47,47 @@ fn ensure_crypto_provider() {
 }
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// WebSocket 关闭帧该怎么定性（三家共用一份，别各写各的）。
+///
+/// 只有 `Close(Normal)`（或者压根没给码）才算"服务端正常收尾"；其余关闭码都是
+/// **异常**：过载、鉴权掉线、腾讯 60 秒引擎上限踢人……全都会以非常规码关连接。
+/// 以前千问和腾讯把任何关闭帧都当成"识别正常结束"，关闭码和原因一起丢掉，
+/// 于是主人看到的是「没有识别到内容，请靠近麦克风再说一次」—— 把服务端的问题
+/// 说成了主人自己的问题，排障方向被彻底带偏。豆包那边早就按这个规矩处理了。
+///
+/// `who` 是服务商名，只用于拼错误文本。
+pub(crate) fn parse_close(who: &str, frame: Option<CloseFrame>) -> Parsed {
+    match frame {
+        Some(f) if f.code != CloseCode::Normal => {
+            let reason = if f.reason.is_empty() {
+                "无附加信息"
+            } else {
+                f.reason.as_str()
+            };
+            Parsed::Error(format!("{who}提前关闭连接（{}）：{reason}", close_hint(f.code)))
+        }
+        _ => Parsed::Finished,
+    }
+}
+
+/// WebSocket 关闭码的中文解释（给主人看的，不是给日志看的）
+fn close_hint(code: CloseCode) -> &'static str {
+    match code {
+        CloseCode::Away => "服务端临时离开",
+        CloseCode::Policy => "策略拒绝（多为鉴权或额度问题）",
+        CloseCode::Size => "消息过大",
+        CloseCode::Protocol => "协议错误",
+        CloseCode::Unsupported => "不支持的数据类型",
+        CloseCode::Abnormal => "连接异常中断",
+        CloseCode::Invalid => "数据无效",
+        CloseCode::Extension => "扩展协商失败",
+        CloseCode::Error => "服务端内部错误",
+        CloseCode::Restart => "服务端重启",
+        CloseCode::Again => "服务端要求重试",
+        _ => "连接被关闭",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -434,25 +477,31 @@ async fn forward_frames(mut stream: SplitStream<Ws>, tx: Sender<Message>) {
     while let Some(item) = stream.next().await {
         match item {
             Ok(msg) => {
-                let closing = matches!(msg, Message::Close(_));
-                // 用 try_send（不阻塞）：满了就丢这一帧，读取任务永远向前走
-                if let Err(e) = tx.try_send(msg) {
-                    match e {
-                        TrySendError::Full(_) => {
-                            dropped += 1;
-                            // 限流记日志：第一条 + 之后每 64 条记一次，
-                            // 既能看到"在丢帧"，又不会每帧刷一条把日志冲爆
-                            if dropped == 1 || dropped % 64 == 0 {
-                                crate::log::log(format!(
-                                    "ASR 帧处理不过来，已丢弃 {dropped} 帧（通道容量 {MSG_CHANNEL_CAPACITY}）"
-                                ));
-                            }
-                        }
-                        TrySendError::Closed(_) => break,
-                    }
-                }
-                if closing {
+                if matches!(msg, Message::Close(_)) {
+                    // **关闭帧是唯一的例外**：它带的是服务端为什么收场（正常收尾还是
+                    // 过载/鉴权掉线）。之前它也走 try_send，通道一满就被丢掉 ——
+                    // 会话只看到"读线程结束"，把一次正常收尾报成"连接被服务端中断"，
+                    // 关闭码和原因也全丢。
+                    // 反正连接马上就要结束，这里 await 一下是安全的
+                    // （"绝不能 await"那条规矩针对的是还在跑的正常帧）。
+                    let _ = tx.send(msg).await;
                     break;
+                }
+                // 其余帧用 try_send（不阻塞）：满了就丢这一帧，读取任务永远向前走
+                match tx.try_send(msg) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        dropped += 1;
+                        // 限流记日志：第一条 + 之后每 64 条记一次，
+                        // 既能看到"在丢帧"，又不会每帧刷一条把日志冲爆
+                        if dropped == 1 || dropped % 64 == 0 {
+                            crate::log::log(format!(
+                                "ASR 帧处理不过来，已丢弃 {dropped} 帧（通道容量 {MSG_CHANNEL_CAPACITY}）"
+                            ));
+                        }
+                    }
+                    // 接收端已退出：读取任务收工
+                    Err(TrySendError::Closed(_)) => break,
                 }
             }
             Err(e) => {

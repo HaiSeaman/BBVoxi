@@ -1,8 +1,9 @@
 [package]
 name = "bbvoxi"
-# Cargo 要求 version 为 SemVer 三段式（1.4.0）；界面上以 v1.4.0 原样显示，
-# 主人靠它分辨"我测的到底是不是新版"
-version = "1.4.0"
+# Cargo 要求 version 为 SemVer 三段式（1.4.1）；界面上以 v1.4.1 原样显示，
+# 主人靠它分辨"我测的到底是不是新版"，**自动更新也是拿它跟 GitHub 上的最新版本比**。
+# 发新版时务必改这里（只改发布产物名不行），详见 README「发布新版本」一节。
+version = "1.4.1"
 edition = "2021"
 description = "BBVoxi - Windows 语音输入法：按住快捷键说话，松开即自动输入到光标处"
 rust-version = "1.80"
@@ -51,6 +52,23 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",                 # ShellExecuteW：用系统浏览器打开项目地址
     "Win32_UI_WindowsAndMessaging",
 ] }
+# 自动更新用：查 GitHub 最新发布 + 下载 exe。
+# 版本**故意钉在 ~3.2**：ureq 3.3 起要求 rustc ≥1.85，而本项目向主人承诺的是
+# 「Rust 1.80+ 就能编」（见 README）。放开成 3.x 会让那条承诺悄悄失效 ——
+# 编译机上工具链新、看不出来，等哪天用老工具链编就炸。
+#
+# `win-system-proxy` **必须有**：它让 ureq 读 Windows「Internet 选项 → 代理服务器」
+# 那个设置。主人这台机器上实测差别是**10 倍速度**（直连 68KB/s vs 走代理 663KB/s），
+# 不读代理时 8MB 的更新包 600 秒都下不完 —— 更新功能等于废的。
+ureq = { version = "~3.2", default-features = false, features = [
+    "rustls",
+    "win-system-proxy",
+] }
+# 校验下载下来的 exe 的 SHA-256（GitHub 每个发布资产都公布了这个指纹）
+sha2 = "0.10.9"
+# 安全替换**正在运行的自己**：Windows 不许覆盖运行中的 exe，这个库按标准姿势做
+# 「旧的改名让位 → 新的就位 → 下次启动清掉旧文件」，比自己手写可靠
+self-replace = "1.5.0"
 
 [profile.release]
 opt-level = "z"

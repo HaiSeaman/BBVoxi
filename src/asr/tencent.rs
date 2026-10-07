@@ -34,7 +34,7 @@ impl Tencent {
     pub fn parse(&mut self, msg: Message) -> Parsed {
         let text = match msg {
             Message::Text(t) => t.to_string(),
-            Message::Close(_) => return Parsed::Finished,
+            Message::Close(frame) => return super::parse_close("腾讯云", frame),
             _ => return Parsed::Ignored,
         };
         parse_json(&text)
@@ -43,6 +43,12 @@ impl Tencent {
 
 fn parse_json(text: &str) -> Parsed {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        // 坏帧不能整帧静默吞掉（同豆包/千问）：协议一变就是"等 8 秒超时 → 没有
+        // 识别到内容"，日志里却什么都没有。只打前 16 个字符，不倒整帧。
+        crate::log::log(format!(
+            "腾讯云响应不是合法 JSON（前 16 字符：{}）",
+            text.chars().take(16).collect::<String>()
+        ));
         return Parsed::Ignored;
     };
     let code = v["code"].as_i64().unwrap_or(0);
@@ -219,6 +225,37 @@ mod tests {
             secret_key: "SecretKeyExample".into(),
             engine_model_type: "Hy-ASR-3.0-preview".into(),
         }
+    }
+
+    /// 回归（断线被说成"没有识别到内容"）：腾讯收到**任何**关闭帧都当成
+    /// "识别正常结束"，关闭码和原因全丢 —— 包括 60 秒引擎上限踢人、鉴权掉线。
+    /// 主人得到的却是「没有识别到内容，请靠近麦克风再说一次」，完全被带偏。
+    #[test]
+    fn abnormal_close_reports_the_reason() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let mut t = Tencent::new();
+        let close = Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "engine limit".into(),
+        }));
+        match t.parse(close) {
+            Parsed::Error(e) => {
+                assert!(e.contains("策略拒绝"), "应给出关闭码含义：{e}");
+                assert!(e.contains("engine limit"), "应带上服务端原因：{e}");
+            }
+            other => panic!("异常关闭要报错，实际：{other:?}"),
+        }
+
+        // 正常收尾仍按正常结束
+        let mut normal = Tencent::new();
+        let frame = Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "done".into(),
+        }));
+        assert!(matches!(normal.parse(frame), Parsed::Finished));
+        assert!(matches!(Tencent::new().parse(Message::Close(None)), Parsed::Finished));
     }
 
     #[test]

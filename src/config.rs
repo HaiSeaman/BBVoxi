@@ -156,6 +156,12 @@ pub struct Options {
     /// 非自动时：豆包传官方 language 参数（自动切整句端点）、腾讯切对应引擎、
     /// 千问模型自身多语种自动检测（无需参数）。
     pub language: String,
+    /// 录音用哪台麦克风：存设备的唯一编号（形如
+    /// `wasapi:{0.0.1.00000000}.{...}`，见 `audio::MicDevice`）。
+    /// **空字符串 = 跟随系统默认设备** —— 老配置文件里没有这一项，读出来就是空，
+    /// 行为与升级前完全一样，所以不需要版本迁移。
+    /// 界面上显示的是 Windows 那个好认的名字，编号只在文件里存着。
+    pub mic_device: String,
 }
 
 impl Default for Options {
@@ -180,6 +186,8 @@ impl Default for Options {
             hotwords: String::new(),
             // 语言默认"自动"：不传 language 参数，行为与升级前完全一致
             language: "auto".into(),
+            // 麦克风默认空 = 跟随系统默认设备（与升级前一致）
+            mic_device: String::new(),
         }
     }
 }
@@ -267,26 +275,37 @@ fn migrate(cfg: &mut Config) -> bool {
     if cfg.version >= CURRENT_VERSION {
         return false;
     }
-    // 旧默认值 Ctrl+` → Ctrl+Win。**只看升版本这一次**：以前它每次启动都跑，
-    // 于是主人后来自己把快捷键改成 Ctrl+` 时，下次启动就被悄悄改回 Ctrl+Win，
-    // 界面上一个字都不提 —— `migration_leaves_user_hotkeys_alone` 的清单里
-    // 恰好漏了这一项，所以这个毛病一直没被抓住。
-    migrate_legacy_default_hotkey(cfg);
-    // 1 → 2：`keep_on_clipboard` 老默认是关的，而它兜的恰恰是"字没打进目标程序"
-    // 这一档 —— 那一档**无法核实**（`SendInput` 只报告事件入队成功，目标程序收下
-    // 再丢掉我们完全看不见；Chrome/Electron 这类目标连插入符都不给，实测过），
-    // 所以唯一可靠的兜底就是"永远留一份"。改为默认开。
+    // **每一步只在自己那一段版本区间里跑**。
     //
-    // 老配置里这个值是"从没动过"留下的默认 false，还是主人真的关过 ——
-    // 两者在文件里长得一模一样，分不出来。按"漏掉主人说的话"比"覆盖一次
-    // 剪贴板"更糟来取舍：统一打开。不想要的在设置里关掉即可，
-    // version 已经是 2，下次启动不会再被打开。
-    if !cfg.options.keep_on_clipboard {
-        cfg.options.keep_on_clipboard = true;
-        crate::log::log("配置升级：识别结果改为默认留一份到剪贴板（可在设置里关掉）");
+    // 为什么必须分区间：以前只有上面一道总闸（`version < CURRENT_VERSION` 就把
+    // 三步全跑一遍），于是 1.3.x 的用户（配置里 version = 2）升级到本版时，
+    // 「1 → 2」那两步会被**再跑一次** —— 主人自己关掉的「结果总留一份到剪贴板」
+    // 被强行打开（从此每说一句都顶掉剪贴板里刚复制的东西）、自己设成 Ctrl+`
+    // 的快捷键被改回 Ctrl+Win，而且界面上一个字都不说。
+    // 这正是这些注释自己警告过的"升级顺手改掉主人设置"。
+    if cfg.version < 2 {
+        // 旧默认值 Ctrl+` → Ctrl+Win。**只看升版本这一次**（在下面这个区间里）：
+        // 以前它每次启动都跑，于是主人后来自己把快捷键改成 Ctrl+` 时，下次启动
+        // 就被悄悄改回 Ctrl+Win —— `migration_leaves_user_hotkeys_alone` 的清单里
+        // 恰好漏了这一项，所以那个毛病当初一直没被抓住。
+        migrate_legacy_default_hotkey(cfg);
+        // 1 → 2：`keep_on_clipboard` 老默认是关的，而它兜的恰恰是"字没打进目标程序"
+        // 这一档 —— 那一档**无法核实**（`SendInput` 只报告事件入队成功，目标程序
+        // 收下再丢掉我们完全看不见；Chrome/Electron 这类目标连插入符都不给，
+        // 实测过），所以唯一可靠的兜底就是"永远留一份"。改为默认开。
+        //
+        // 老配置里这个值是"从没动过"留下的默认 false，还是主人真的关过 ——
+        // 两者在文件里长得一模一样，分不出来。按"漏掉主人说的话"比"覆盖一次
+        // 剪贴板"更糟来取舍：统一打开。不想要的在设置里关掉即可，
+        // 关掉之后 version 已经是 2，下次启动不会再被打开。
+        if !cfg.options.keep_on_clipboard {
+            cfg.options.keep_on_clipboard = true;
+            crate::log::log("配置升级：识别结果改为默认留一份到剪贴板（可在设置里关掉）");
+        }
     }
     // 2 → 3：千问旧默认模型 3.0 → 3.1。字符串精确匹配旧默认值：
     // 主人自己改过的模型（哪怕只差一个字符）都不动。
+    // 这一步对**所有**低于当前版本的配置都要跑（从 version 1 一步跨上来的也要）。
     if cfg.qwen.model == QWEN_MODEL_LEGACY {
         cfg.qwen.model = QWEN_MODEL.into();
         crate::log::log("配置升级：千问默认模型已从 3.0 升级到 3.1");
@@ -315,22 +334,27 @@ fn temp_path(path: &std::path::Path) -> PathBuf {
 
 /// 返回 (配置, 是否首次运行即配置文件不存在)
 pub fn load_or_default() -> Result<(Config, bool)> {
-    let file = dir()?.join("BBVoxi").join("config.json");
+    Ok(load_from(&dir()?.join("BBVoxi").join("config.json")))
+}
+
+/// 从指定文件读配置（`load_or_default` 的实现，**单独抽出来是为了能单测**：
+/// 默认路径来自系统目录，测试里没法往里放坏文件）。
+///
+/// 返回 (配置, 是否首次运行即配置文件不存在)。
+/// 语义注意：只有"文件不存在"才算首次运行，**读失败不算** —— 拿读失败当首次运行，
+/// 会让界面显示成"全新安装"，主人以为自己的配置被清了。
+fn load_from(file: &std::path::Path) -> (Config, bool) {
     if !file.exists() {
-        return Ok((Config::default(), true));
+        return (Config::default(), true);
     }
     // 读失败（文件被写坏成非法 UTF-8、权限被拒、被独占锁住等）也回退默认值，而不是把
     // 错误往上抛：main 里的 `?` 传播出去后，release 版是 windows_subsystem="windows"，
     // 既没有控制台也不会写日志，主人只看到"双击毫无反应"，连哪里坏了都不知道。
-    // 语义注意：只有"文件不存在"才算首次运行，读失败**不算**（不能拿它当首次运行处理）。
-    let text = match std::fs::read_to_string(&file) {
+    let text = match std::fs::read_to_string(file) {
         Ok(t) => t,
         Err(e) => {
-            crate::log::log(format!(
-                "读取配置文件失败（{}），已回退默认配置: {e}",
-                file.display()
-            ));
-            return Ok((Config::default(), false));
+            backup_unreadable(file, &format!("读取失败：{e}"));
+            return (Config::default(), false);
         }
     };
     // ponytail: 配置损坏时回退默认值，不让用户被一个坏文件卡死
@@ -343,14 +367,37 @@ pub fn load_or_default() -> Result<(Config, bool)> {
                     crate::log::log(format!("升级配置后写回失败（下次启动会再试一遍）: {e}"));
                 }
             }
-            Ok((cfg, false))
+            (cfg, false)
         }
         Err(e) => {
             // 不能用 eprintln!：release 下 windows_subsystem="windows"，没有控制台，
             // 这一行会直接消失。这里不是"恢复默认"就完了 —— 主人需要知道凭据为什么没了。
-            crate::log::log(format!("配置文件解析失败，已回退默认配置: {e}"));
-            Ok((Config::default(), false))
+            backup_unreadable(file, &format!("解析失败：{e}"));
+            (Config::default(), false)
         }
+    }
+}
+
+/// 读不出来 / 解析不了时，**先把原文件另存一份**，再退回默认值。
+///
+/// 为什么必须有这一步（审查时发现的真实数据丢失路径）：读失败可能是**临时**的
+/// （文件被别的程序独占、杀软正在扫）。退回默认值之后，主人只要做了什么会写盘的
+/// 操作（改个开关点保存，甚至只切一下主题就会立即落盘），就会把那个其实好好的
+/// 配置文件覆盖成空配置 —— API Key 全部永久丢失，而且毫无提示。
+/// 另存一份之后，最坏也能把它改回 `config.json` 救回来。
+fn backup_unreadable(file: &std::path::Path, why: &str) {
+    let backup = file.with_extension("json.bad");
+    let saved = std::fs::copy(file, &backup);
+    match saved {
+        Ok(_) => crate::log::log(format!(
+            "配置文件无法使用（{why}）：原文件已另存为 {}，本次先用默认配置启动。\
+             想恢复的话把它改回 config.json 即可。",
+            backup.display()
+        )),
+        Err(e) => crate::log::log(format!(
+            "配置文件无法使用（{why}），而且另存备份也失败了（{e}）：\
+             **在确认之前先别点保存**，否则原文件会被默认配置覆盖。"
+        )),
     }
 }
 
@@ -556,8 +603,49 @@ mod tests {
         );
     }
 
-    /// 新增的 hotwords / language 字段对老配置是纯增量：
-    /// 文件里没有就落回默认（空词表 / auto），行为与升级前完全一致。
+    /// 回归（升级顺手改掉主人自己的设置）：停在 version 2 的配置（1.3.x 用户）
+    /// 升到 1.4.0 时，**1→2 那两步绝不能再跑一遍**。
+    ///
+    /// 旧实现只有一道总闸（`version < CURRENT_VERSION` 就把三步全跑），于是
+    /// 「1→2」的快捷键迁移与"强制打开留一份到剪贴板"被重复执行：主人自己关掉的
+    /// 开关被重新打开（从此每说一句都顶掉剪贴板里刚复制的东西）、自己设成
+    /// Ctrl+` 的快捷键被改回 Ctrl+Win，而界面上一句话都不说。
+    /// 老的两条回归测试用的都是 `version: CURRENT_VERSION`，正好绕开真实的升级
+    /// 路径，所以这个毛病一直没被抓到。
+    #[test]
+    fn migration_v2_leaves_user_choices_alone() {
+        let mut cfg = Config {
+            version: 2,
+            hotkey: "ctrl+`".into(),
+            ..Config::default()
+        };
+        cfg.options.keep_on_clipboard = false; // 主人在 1.3.3 里明确关掉的
+        assert!(migrate(&mut cfg), "版本号本身要写回（2 → 3）");
+        assert!(
+            !cfg.options.keep_on_clipboard,
+            "主人明确关掉的「留一份到剪贴板」被升级重新打开了"
+        );
+        assert_eq!(cfg.hotkey, "ctrl+`", "主人自己设的快捷键被改回默认值了");
+        assert_eq!(cfg.version, CURRENT_VERSION);
+    }
+
+    /// 升级到当前版本之后，1→2 的两步再也不会动主人后来改的设置（幂等）
+    #[test]
+    fn migration_never_repeats_the_old_steps() {
+        let mut cfg = Config {
+            version: CURRENT_VERSION,
+            hotkey: "ctrl+`".into(),
+            ..Config::default()
+        };
+        cfg.options.keep_on_clipboard = false;
+        assert!(!migrate(&mut cfg), "已是当前版本就不该动它");
+        assert!(!cfg.options.keep_on_clipboard);
+        assert_eq!(cfg.hotkey, "ctrl+`");
+    }
+
+    /// 新增的 hotwords / language / mic_device 字段对老配置是纯增量：
+    /// 文件里没有就落回默认（空词表 / auto / 跟随系统默认麦克风），
+    /// 行为与升级前完全一致。
     #[test]
     fn new_option_fields_default_for_old_configs() {
         let old: Config = serde_json::from_str(
@@ -567,9 +655,33 @@ mod tests {
         .expect("老配置文件必须能读进来");
         assert_eq!(old.options.hotwords, "");
         assert_eq!(old.options.language, "auto");
+        assert_eq!(
+            old.options.mic_device, "",
+            "老配置没有「麦克风」这一项时必须落回跟随系统默认设备"
+        );
         // 默认值本身
         assert_eq!(Options::default().hotwords, "");
         assert_eq!(Options::default().language, "auto");
+        assert_eq!(Options::default().mic_device, "");
+    }
+
+    /// 选中的麦克风必须真的存下来、读回来还是同一台（否则主人每次开机都要重选）。
+    /// 存的是设备编号而不是名字：两台同型号麦克风名字一模一样，只有编号分得开。
+    #[test]
+    fn selected_microphone_survives_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("bbvoxi_mic_{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let cfg = Config {
+            options: Options {
+                mic_device: "wasapi:{0.0.1.00000000}.{92bdc9f1-bcf9-4c64-b02e-dc429cb283f9}".into(),
+                ..Options::default()
+            },
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let back: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.options.mic_device, cfg.options.mic_device);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -578,6 +690,59 @@ mod tests {
         assert_eq!(d.endpoint(), DOUBAO_URL_STREAM);
         d.high_accuracy = true;
         assert_eq!(d.endpoint(), DOUBAO_URL_NOSTREAM);
+    }
+
+    /// 回归（配置读坏 / 被临时锁住时，密钥会被默认值盖掉 —— 再也找不回来）：
+    /// 只要读不出来或解析不了，就必须**先把原文件另存一份**再退回默认值。
+    ///
+    /// 这条路径很阴：读失败可能是临时的（文件被独占、杀软在扫），退回默认值之后
+    /// 主人随便点一下会写盘的东西（甚至只切个主题就会立即落盘），那个其实好好的
+    /// 配置文件就被空配置覆盖了 —— API Key 永久丢失，界面上还什么都不说。
+    #[test]
+    fn unreadable_config_is_backed_up_before_falling_back() {
+        let dir = std::env::temp_dir().join(format!("bbvoxi_badcfg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // 1) 写坏成非法 JSON：原文件必须被另存为 config.json.bad
+        let broken = r#"{"provider":"qwen","qwen":{"api_key":"sk-主人的密钥"#; // 截断的 JSON
+        std::fs::write(&path, broken).unwrap();
+        let (cfg, first_run) = load_from(&path);
+        assert!(!first_run, "读失败不算首次运行（界面不该显示成全新安装）");
+        assert_eq!(cfg, Config::default(), "读不出来时先用默认值启动");
+        let backup = path.with_extension("json.bad");
+        assert!(
+            backup.exists(),
+            "必须留下备份，否则主人的密钥再也找不回来"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            broken,
+            "备份必须是原文件**一字不动**的内容"
+        );
+        assert!(path.exists(), "原文件也不能删（主人可能还要自己看）");
+
+        // 2) 好文件：照常读出来，而且不该产生备份
+        let _ = std::fs::remove_file(&backup);
+        let good = Config {
+            qwen: QwenConfig {
+                api_key: "sk-正常的".into(),
+                ..QwenConfig::default()
+            },
+            ..Config::default()
+        };
+        good.save_to(&path).unwrap();
+        let (back, first_run) = load_from(&path);
+        assert!(!first_run);
+        assert_eq!(back.qwen.api_key, "sk-正常的");
+        assert!(!backup.exists(), "正常读取不该产生备份文件");
+
+        // 3) 文件不存在 = 首次运行
+        let _ = std::fs::remove_file(&path);
+        let (_, first_run) = load_from(&path);
+        assert!(first_run, "文件不存在才算首次运行");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

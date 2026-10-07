@@ -111,6 +111,14 @@ pub fn read_text() -> Option<String> {
         // GlobalSize 给的是字节数；长度按"到第一个 NUL 为止"算，
         // 不信任 size（延迟渲染/别人写坏的情况下它未必等于真实长度）
         let cap = GlobalSize(hglobal) / 2;
+        if cap == 0 {
+            // GlobalSize 返回 0 = 这块内存现在读不出来（句柄已被换掉、延迟渲染还没
+            // 落地）。必须返回 None（"读不出来"），**不能**把它当成"剪贴板里是空
+            // 字符串"：调用方 `write_text_verified` 会因此报一句"剪贴板可能已被
+            // 其他程序改写"—— 一个编造出来的诊断，排障时会被引到错方向。
+            let _ = GlobalUnlock(hglobal);
+            return None;
+        }
         let mut len = 0;
         while len < cap && *ptr.add(len) != 0 {
             len += 1;

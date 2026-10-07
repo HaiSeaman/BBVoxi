@@ -66,7 +66,14 @@ impl Shared {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.inner.lock().map(|s| s.clone()).unwrap_or_default()
+        // 锁中毒（上一次拿锁的线程 panic 了）时也把里面的数据取回去，
+        // **不能**退回默认值：中毒标记一旦置上就永不清除，退回默认值等于界面从
+        // 此永远显示"没在录音、没文本、没错误"—— 打字照常、界面全空，最难查。
+        // （`update` 那边遇中毒是同一种处理，并会记一条日志。）
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Snapshot)) {
@@ -255,10 +262,14 @@ async fn run_session(
 
     shared.begin_session();
 
-    let mut capture = match audio::start() {
+    // 设置里选的那台麦克风（空 = 跟随系统默认设备）；选的那台不在时，
+    // `audio` 会回退系统默认并留下日志，不会让这次录音直接失败。
+    let mut capture = match audio::start(&cfg.options.mic_device) {
         Ok(c) => c,
         Err(e) => {
-            shared.fail(format!("{e}"));
+            // `{e:#}` 打出整条因果链：麦克风起不来时真正的原因（被独占、被拔掉、
+            // 格式不支持）都在链里，只打最外层那句"打开麦克风输入流失败"等于没说
+            shared.fail(format!("{e:#}"));
             return;
         }
     };
@@ -310,11 +321,6 @@ async fn run_session(
     // 否则测试窗口会显示"录音中 00:07"却只录了 5 秒，看着像坏了。
     shared.update(|s| s.started = Some(Instant::now()));
 
-    // 采集流是不是「自己结束」的（rx 关闭）。只有这种情况才需要去看错误原因，
-    // 见循环结束后的处理。不能在分支里直接调 capture.error()：rx 正被 select
-    // 借用着，借用冲突编译不过。
-    let mut mic_ended = false;
-
     // 会话是不是中途失败的。**失败不能直接 return** —— 那会跳过"给服务端发结束
     // 指令、松手后等最终结果的窗口、发关闭帧"三件事，而服务端很可能已经把主人
     // 说的那句定稿了：结果取不回来，「最近识别」就停在上一次的内容，
@@ -359,11 +365,9 @@ async fn run_session(
                     }
                 }
                 // 采集线程结束（rx 关闭）：拔出麦克风等错误会让回调置位 stopped，
-                // 采集线程随之退出，这里就会收到 None。
-                None => {
-                    mic_ended = true;
-                    break;
-                }
+                // 采集线程随之退出，这里就会收到 None。具体原因由收尾时的
+                // `capture.error()` 取出来（不再只看这个分支是怎么结束的）。
+                None => break,
             },
             msg = client.recv() => match msg {
                 Some(m) => {
@@ -422,27 +426,45 @@ async fn run_session(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // 采集是自己结束的（rx 关闭）且带着错误：把「麦克风异常」记成失败原因。
+    // 采集**出过错**就把「麦克风异常」记成失败原因。
     // 不能含糊地说「没有识别到内容」—— 那会让主人以为是自己没说话，
     // 其实是设备出了问题（被独占、被拔掉……）。这里**不 return**：主人刚说的
     // 那句话很可能还在服务端那头等着被取回来（见 `failure` 的说明）。
-    if mic_ended {
-        if let Some(msg) = capture.error() {
-            failure.get_or_insert_with(|| format!("麦克风异常：{msg}"));
-        }
+    //
+    // 不设"必须是因为 rx 关闭才结束"这道门（以前有，是个漏报）：出循环的原因
+    // 有四种（松开快捷键、测试时间到、服务端结束、rx 关闭），只要麦克风真出过错
+    // 就该如实报出来。加了门之后，只要别的分支在同一轮 select 里先赢一次，
+    // 错误原因就被永远丢掉，最后照样报一句"请靠近麦克风再说一次"。
+    if let Some(msg) = capture.error() {
+        failure.get_or_insert_with(|| format!("麦克风异常：{msg}"));
     }
 
-    // 收干残留音频：上限 20 帧（约 2 秒）。残留再多也只是缓冲里陈旧的音频，
-    // 没必要全发；给上限是为了杜绝「理论上一直有残留」时卡死。
-    // 每一步同样加超时，网络不通时不能把会话挂死在这里。
+    // 收干残留音频：上限 20 帧，并且**整段有总时间预算**。残留再多也只是缓冲里
+    // 陈旧的音频，没必要全发；给上限是为了杜绝「理论上一直有残留」时卡死。
     //
-    // 链路已经坏掉时整段跳过：再往服务端灌只会白等一个 5 秒超时，而主人已经在等了。
+    // 为什么还要总预算：每帧单独套一个 5 秒超时，20 帧最坏就是 100 秒，而这段
+    // 循环里没有 select!（主人按快捷键、点托盘都没人收），`recording` 也一直
+    // 挂着 —— 界面看上去就是"软件死了"。注释里一直写的是"约 2 秒"，那就按 2 秒
+    // 真的算，而不是只数帧数。
+    //
+    // 链路已经坏掉时整段跳过：再往服务端灌只会白等一个超时，而主人已经在等了。
     if !link_broken {
+        let drain_deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
         for _ in 0..20 {
+            let left = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                log::log(format!(
+                    "收尾发送残留音频已到 {:?} 时间预算，剩下的 {} 帧不再发送（末尾可能少几个字）",
+                    DRAIN_BUDGET,
+                    capture.rx.len()
+                ));
+                break;
+            }
             let Ok(frame) = capture.rx.try_recv() else {
                 break;
             };
-            match tokio::time::timeout(Duration::from_secs(5), client.send_audio(&frame)).await {
+            let wait = left;
+            match tokio::time::timeout(wait, client.send_audio(&frame)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     log::log(format!("收尾发送残留音频失败：{e:#}"));
@@ -467,6 +489,13 @@ async fn run_session(
     if !link_broken {
         if let Err(e) = client.finish().await {
             log::log(format!("发送结束指令失败：{e:#}"));
+            // 只有"服务端还没结束"时这算失败：它正等着我们的结束帧，
+            // 发不出去就很可能吐不出最终结果 —— 不记下来的话，最后 text 为空时
+            // 界面又会报"没有识别到内容"，把真因埋掉。
+            // 服务端已经结束（done）的情况下写失败无所谓：结果它已经给了。
+            if !client.state.done {
+                failure.get_or_insert_with(|| format!("发送结束指令失败：{e:#}"));
+            }
         }
     }
 
@@ -483,11 +512,16 @@ async fn run_session(
                 }
                 Some(Cmd::Test) => {
                     // 测试请求同样没法插进来执行，但必须说一声 —— 按钮按下去
-                    // 什么都不发生比报错更让人困惑
-                    shared.report("上一次识别还没结束，请稍后再点「测试识别」");
+                    // 什么都不发生比报错更让人困惑。
+                    // 用 notice 而不是 report：这是"请稍等"，不是故障；
+                    // report 会让托盘换成出错图标、悬浮文字写"上次识别出错"。
+                    shared.notice("上一次识别还没结束，请稍后再点「测试识别」");
                 }
                 Some(Cmd::StartupFailure(msg)) => shared.report(msg),
-                None => {}
+                // 命令通道关闭 = 界面和键盘钩子都没了（进程正在退出）：立刻收尾，
+                // 别占着 tokio 工作线程空转到超时 —— 那种空转会每轮都选中这个
+                // 立刻返回 None 的分支，纯烧 CPU。
+                None => break,
             },
             msg = tokio::time::timeout_at(deadline, client.recv()) => match msg {
                 Ok(Some(m)) => {
@@ -498,9 +532,28 @@ async fn run_session(
                         sync_live(&mut typer, shared, &text);
                     }
                 }
-                Ok(None) => break,
+                // 读线程关闭 = 连接没了。**必须和主循环里那条路同一定性**
+                // （`ending_after_reader_closed`）：以前这里直接 break、`failure`
+                // 一个字都不记，最后 text 为空时又会报"没有识别到内容，请靠近
+                // 麦克风再说一次"——真因明明是断线，主人却被指去找自己的麦克风。
+                Ok(None) => {
+                    if let Ending::LinkBroken(reason) = ending_after_reader_closed(
+                        client.state.done,
+                        client.state.last_error.is_some(),
+                    ) {
+                        // 只记失败原因：此刻收尾动作都已经走完了，`link_broken`
+                        // 后面再没人读，改它反而会让编译器提醒"赋值没被使用"。
+                        failure.get_or_insert_with(|| reason.to_string());
+                    }
+                    break;
+                }
                 Err(_) => {
-                    log::log("等待最终结果超时（8 秒），使用已收到的内容");
+                    // 把真正的等待时长写进去：链路已断时只有 2 秒，日志里写死
+                    // "8 秒"会让人对着时间轴怀疑程序在别的地方卡住了
+                    log::log(format!(
+                        "等待最终结果超时（{:?}），使用已收到的内容",
+                        final_wait(link_broken)
+                    ));
                     break;
                 }
             },
@@ -528,6 +581,13 @@ async fn run_session(
 
     if let Some(e) = &asr_error {
         log::log(format!("识别过程中收到服务端错误：{e}"));
+        // 光写日志不够（`asr::mod` 里就写着"错误要在界面上提示，不能只写日志"）：
+        // 结果虽然交到主人手里了，但服务端中途报过错，这一次的识别很可能不完整 ——
+        // 不说的话，他只会觉得"这软件识别得真差"。
+        // 用 notice（提醒色）而不是 fail（故障红）：字已经在他手里了，这不是失败。
+        if !text.is_empty() {
+            shared.notice(format!("识别过程中服务端报错（这次结果可能不完整）：{e}"));
+        }
     }
 
     if let Some(reason) = failure {
@@ -647,6 +707,14 @@ const FINAL_WAIT: Duration = Duration::from_secs(8);
 
 /// 推流那一步已经失败时等最终结果的窗口（链路不可信，不陪着一起干等）
 const BROKEN_LINK_FINAL_WAIT: Duration = Duration::from_secs(2);
+
+/// 收尾"收干残留音频"那一步的**总时间预算**（见 `run_session` 里那段循环）。
+///
+/// 为什么要总预算，而不是只给每帧套一个超时：那段注释一直写的是"上限 20 帧
+/// （约 2 秒）"，可 20 帧 × 每帧 5 秒超时 = 最坏 100 秒。这 100 秒里循环里没有
+/// `select!`（主人按快捷键、点托盘都没人收），`recording` 也一直挂着 ——
+/// 界面上就是"软件死了"。所以按它嘴上说的 2 秒，真的算一次总账。
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
 /// 收尾等最终结果要等多久。
 ///
@@ -836,8 +904,9 @@ async fn wait_for_foreign_foreground() -> Option<isize> {
 
 /// 此刻的前台窗口是不是我们自己（没有前台窗口时算"不是"）。
 ///
-/// 抽出来是因为"要不要把字交给它"这件事在两个地方要判断（等焦点离开本程序、
-/// 注入前再确认一次），以前各自写了一遍 `GetForegroundWindow` + 判归属 + 判无效句柄。
+/// 判归属那一层收在 `is_own_window` 里（"等焦点离开本程序"和"注入前再确认一次"
+/// 两处都用它，以前各自写了一遍 `GetForegroundWindow` + 判归属 + 判无效句柄）；
+/// 这里只是给"当前就是自己"这个问法一个名字。
 fn foreground_is_own() -> bool {
     foreground_window().is_some_and(is_own_window)
 }

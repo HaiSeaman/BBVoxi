@@ -12,7 +12,6 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::json;
 use std::io::{Read, Write};
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
 
 const MSG_FULL_CLIENT_REQUEST: u8 = 0b0001;
@@ -157,21 +156,9 @@ impl Doubao {
             Message::Close(frame) => {
                 self.finished = true;
                 // 正常收尾是 Close(Normal, "finish last sequence")；
-                // 异常关闭（过载、鉴权掉线）不能糊成"没有识别到内容"，要把原因说清楚
-                match frame {
-                    Some(f) if f.code != CloseCode::Normal => {
-                        let reason = if f.reason.is_empty() {
-                            "无附加信息"
-                        } else {
-                            f.reason.as_str()
-                        };
-                        return Parsed::Error(format!(
-                            "豆包提前关闭连接（{}）：{reason}",
-                            close_hint(f.code)
-                        ));
-                    }
-                    _ => return Parsed::Finished,
-                }
+                // 异常关闭（过载、鉴权掉线）不能糊成"没有识别到内容"，
+                // 要把码和原因说清楚 —— 判定逻辑三家共用，见 `super::parse_close`
+                return super::parse_close("豆包", frame);
             }
             _ => return Parsed::Ignored,
         };
@@ -228,7 +215,11 @@ impl Doubao {
         // 挡掉、改写帧整段替换（替换靠下面固定的 `DOUBAO_FINAL_ID`，见字段注释）。
         let mut definite = String::new();
         let mut partial = String::new();
-        if let Some(list) = result["utterances"].as_array() {
+        // `.filter(|l| !l.is_empty())` 是必须的：`as_array()` 对**空数组**也返回
+        // `Some`，于是 `utterances: []` 时整段逻辑什么都不做、又轮不到下面
+        // "退回整段文本"那条分支 —— 一帧里明明带着 `result.text`，却被当成空帧
+        // 默默丢掉（连日志都没有）。
+        if let Some(list) = result["utterances"].as_array().filter(|l| !l.is_empty()) {
             for u in list {
                 let text = u["text"].as_str().unwrap_or("").trim();
                 if text.is_empty() {
@@ -377,24 +368,6 @@ fn describe(code: i32, value: &serde_json::Value) -> String {
     match error_hint(code) {
         Some(hint) => format!("豆包返回错误（code={code}，{hint}）：{body}"),
         None => format!("豆包返回错误（code={code}）：{body}"),
-    }
-}
-
-/// WebSocket 关闭码的中文解释
-fn close_hint(code: CloseCode) -> &'static str {
-    match code {
-        CloseCode::Away => "服务端临时离开",
-        CloseCode::Policy => "策略拒绝（多为鉴权或额度问题）",
-        CloseCode::Size => "消息过大",
-        CloseCode::Protocol => "协议错误",
-        CloseCode::Unsupported => "不支持的数据类型",
-        CloseCode::Abnormal => "连接异常中断",
-        CloseCode::Invalid => "数据无效",
-        CloseCode::Extension => "扩展协商失败",
-        CloseCode::Error => "服务端内部错误",
-        CloseCode::Restart => "服务端重启",
-        CloseCode::Again => "服务端要求重试",
-        _ => "连接被关闭",
     }
 }
 
@@ -753,6 +726,7 @@ mod tests {
     /// 服务端异常关闭不能糊成"没有识别到内容"，要把原因说出来
     #[test]
     fn abnormal_close_reports_the_reason() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
         use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
         let mut d = Doubao::new(&cfg(), &Options::default());
@@ -869,14 +843,26 @@ mod tests {
             println!("[过短] {bytes:02x?}");
             return;
         }
+        // 取 4 字节大端整数；帧被截断时**不能直接切片**（越界就 panic，
+        // 而这段代码的全部意义就是"坏帧也要能打印出来"，自己先崩掉就白写了）
+        let be32 = |at: usize| -> Option<u32> {
+            bytes
+                .get(at..at + 4)
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .map(u32::from_be_bytes)
+        };
         let mt = bytes[1] >> 4;
         let flags = bytes[1] & 0x0f;
         let ser = bytes[2] >> 4;
         let comp = bytes[2] & 0x0f;
-        let mut off = 4usize;
+        // 头长**按真实协议取**（`bytes[0] & 0x0f` 个单位、每单位 4 字节），
+        // 不能写死 4：`decode` 就是这么读的，而这段探测代码存在的意义正是
+        // "协议一变要能看出来" —— 写死了它就会跟着一起错。
+        // 兜底 `.max(4)`：坏帧里那个半字节可能是 0，取 0 会把帧头当正文打出来。
+        let mut off = ((bytes[0] & 0x0f) as usize * 4).max(4);
         let mut seq = None;
         if flags & 0x01 != 0 {
-            seq = Some(i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()));
+            seq = be32(off).map(|v| v as i32);
             off += 4;
         }
         if flags & 0x04 != 0 {
@@ -884,12 +870,17 @@ mod tests {
         }
         let mut code = None;
         if mt == 0b1111 {
-            code = Some(u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()));
+            code = be32(off);
             off += 4;
         }
-        let size = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        let Some(size) = be32(off).map(|v| v as usize) else {
+            println!("[帧头不完整] {bytes:02x?}\n     解析结果：{parsed}");
+            return;
+        };
         off += 4;
-        let payload = &bytes[off..std::cmp::min(off + size, bytes.len())];
+        // 同样不能直接切片：`off` 是从帧头算出来的，坏帧上完全可能超出长度
+        let payload = bytes.get(off..).unwrap_or_default();
+        let payload = &payload[..std::cmp::min(size, payload.len())];
         let text = if comp == 1 {
             let mut out = Vec::new();
             std::io::Read::read_to_end(&mut GzDecoder::new(payload), &mut out)
@@ -905,6 +896,34 @@ mod tests {
             text.chars().take(800).collect::<String>()
         );
         println!("     解析结果：{parsed}");
+    }
+
+    /// 回归（"坏帧也要能打印出来"的那件工具自己被坏帧搞崩）：`dump` 是按帧头里的
+    /// 各个 flag 一位一位往后取的，帧被截断时旧实现直接对 `bytes[off..off+4]` 切片
+    /// —— 越界 panic。用真连接抓帧时正好碰上一条截断帧，探测就先崩了，什么都没看到。
+    /// （`parse` 那条路对同一帧是安全的：它走 `decode` 里的 `bytes.get`。）
+    #[test]
+    fn dump_survives_a_truncated_frame() {
+        // 只有 4 字节，但帧头声称"后面还有序号字段"：旧实现会在 bytes[4..8] 越界
+        let short = Message::binary(vec![0x11u8, 0x91, 0x00, 0x00]);
+        let mut parser = Doubao::new(&cfg(), &Options::default());
+        dump(&short, &mut parser);
+
+        // 空帧同样不能崩
+        dump(&Message::binary(Vec::new()), &mut parser);
+    }
+
+    /// 回归（空 utterances 吞掉整帧）：`as_array()` 对 `[]` 也返回 `Some`，
+    /// 于是"退回整段文本"那条分支**永远轮不到** —— 一帧里明明带着 `result.text`，
+    /// 却被当成空帧默默丢掉（连日志都没有，排障时完全看不出文本去哪了）。
+    #[test]
+    fn empty_utterances_falls_back_to_the_plain_text() {
+        let mut d = Doubao::new(&cfg(), &Options::default());
+        let frame = server_frame(r#"{"result":{"utterances":[],"text":"你好世界"}}"#);
+        match d.parse(frame) {
+            Parsed::Text { text, .. } => assert_eq!(text, "你好世界"),
+            other => panic!("空 utterances 时应当退回整段文本，实际：{other:?}"),
+        }
     }
 
     /// 按真实协议拼一条服务端 full server response（0b1001）

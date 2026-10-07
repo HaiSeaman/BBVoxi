@@ -84,7 +84,7 @@ impl Qwen {
         let text = match msg {
             Message::Text(t) => t.to_string(),
             Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Close(_) => return Parsed::Finished,
+            Message::Close(frame) => return super::parse_close("千问", frame),
             _ => return Parsed::Ignored,
         };
         parse_json(&text, &mut self.ready)
@@ -93,6 +93,13 @@ impl Qwen {
 
 fn parse_json(text: &str, ready: &mut bool) -> Parsed {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        // 坏帧不能整帧静默吞掉：协议一变，现场就是"等 8 秒超时 → 没有识别到内容"，
+        // 而日志里一条线索都没有（豆包那边早就这么记了，这里补齐）。
+        // 只打前 16 个字符，不把整帧倒进日志。
+        crate::log::log(format!(
+            "千问响应不是合法 JSON（前 16 字符：{}）",
+            text.chars().take(16).collect::<String>()
+        ));
         return Parsed::Ignored;
     };
     match v["header"]["event"].as_str().unwrap_or("") {
@@ -149,6 +156,39 @@ mod tests {
         let mut o = Options::default();
         f(&mut o);
         o
+    }
+
+    /// 回归（断线被说成"没有识别到内容"）：千问收到**任何**关闭帧都当成
+    /// "识别正常结束"，关闭码和原因全丢。过载、鉴权掉线时主人看到的是
+    /// 「没有识别到内容，请靠近麦克风再说一次」—— 服务端的问题说成了主人的问题。
+    /// 豆包那边早就按"只有 Close(Normal) 才算正常"处理，这里补齐。
+    #[test]
+    fn abnormal_close_reports_the_reason() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let mut q = Qwen::new(&QwenConfig::default(), &Options::default());
+        let close = Message::Close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "server busy".into(),
+        }));
+        match q.parse(close) {
+            Parsed::Error(e) => {
+                assert!(e.contains("服务端内部错误"), "应给出关闭码含义：{e}");
+                assert!(e.contains("server busy"), "应带上服务端原因：{e}");
+            }
+            other => panic!("异常关闭要报错，实际：{other:?}"),
+        }
+
+        // 正常收尾（关闭帧是 Normal 或压根没给码）仍算正常结束
+        let mut normal = Qwen::new(&QwenConfig::default(), &Options::default());
+        let frame = Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "done".into(),
+        }));
+        assert!(matches!(normal.parse(frame), Parsed::Finished));
+        let mut bare = Qwen::new(&QwenConfig::default(), &Options::default());
+        assert!(matches!(bare.parse(Message::Close(None)), Parsed::Finished));
     }
 
     /// 「自动添加标点」开关必须真的落到请求参数里（之前不传，开关是摆设）

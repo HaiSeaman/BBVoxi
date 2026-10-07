@@ -334,8 +334,7 @@ fn is_function_key(vk: u32) -> bool {
 }
 
 struct HookCtx {
-    tx: UnboundedSender<Cmd>,
-    paused: Arc<AtomicBool>,
+    tx: UnboundedSender<Cmd>,    paused: Arc<AtomicBool>,
     ctrl: AtomicBool,
     alt: AtomicBool,
     shift: AtomicBool,
@@ -374,11 +373,30 @@ pub fn set_current(hk: Hotkey) {
     // armed 会一直挂着 —— 会话收不到 Stop，录音停不下来。
     // 两个 Win 记账字段同理：留着它们会在下次按别的键时补发一个早已过期的
     // Win 事件（凭空弹一次开始菜单，或者把 Win+X 送到别的程序里）。
+    //
+    // 注意这里**要发 Stop**（见 `reset_hold`）：主人的录音还在进行中时改键/保存，
+    // 光清状态是停不下来的 —— 会话那边只认"松开"，而松手时 `decide()` 已经认不出
+    // 这次按住了，于是麦克风与推流一直开着（普通录音没有时长上限）。
     if let Some(ctx) = CTX.get() {
-        ctx.armed.store(false, Ordering::Relaxed);
-        ctx.held_vk.store(0, Ordering::Relaxed);
-        ctx.pending_win.store(0, Ordering::Relaxed);
-        ctx.session_win.store(0, Ordering::Relaxed);
+        reset_hold(ctx);
+    }
+}
+
+/// 把「按住说话」的四个记账字段一次清干净；刚才确实在录的话，顺手让会话停下来。
+///
+/// 为什么清状态**还必须**发 Stop：会话只认"松开快捷键"这一个结束信号，
+/// 而状态一清，主人真松手时 `decide()` 就认不出这次按住了 —— Stop 永远不来，
+/// 麦克风与推流一直开着（普通录音没有时长上限），只剩托盘菜单能停。
+/// 两处调用都要这一手：录音途中改键/保存（`set_current`）、
+/// 录音途中进改键捕捉（`hook_proc` 的 paused 分支）。
+fn reset_hold(ctx: &HookCtx) {
+    let was_armed = ctx.armed.swap(false, Ordering::Relaxed);
+    ctx.held_vk.store(0, Ordering::Relaxed);
+    ctx.pending_win.store(0, Ordering::Relaxed);
+    ctx.session_win.store(0, Ordering::Relaxed);
+    if was_armed {
+        // 无界通道、发送不阻塞，在钩子回调里发是安全的（和发 Trigger 同一套规矩）
+        let _ = ctx.tx.send(Cmd::Stop);
     }
 }
 
@@ -571,6 +589,30 @@ pub fn spawn(hk: Hotkey, tx: UnboundedSender<Cmd>, paused: Arc<AtomicBool>) -> R
     Ok(())
 }
 
+/// 把"还按着的那次 hold"收掉：交给 [`reset_hold`]（它同时负责清干净四个字段
+/// 和"真的发一个 Stop"）。
+fn end_orphaned_hold(ctx: &HookCtx) {
+    reset_hold(ctx);
+}
+
+/// 捕捉（改键）期间，这个 Win 事件该不该被我们吞掉？
+///
+/// 为什么不能无脑吞：Win 的**按下**只有在"当前快捷键组合里要用 Win"时才会被我们
+/// 接管（见 `decide` 里的 `owns_win`）。组合里不含 Win 时，主人按 Win 是原样放行给
+/// 外壳的 —— 这时候再把他松开的那一下吞掉，外壳就永远等不到"Win 松开了"，
+/// 之后随便敲个字母都会触发 Win+X（打开资源管理器），比弹一下开始菜单更糟。
+/// 所以只吞**确实由我们接管过**的那些（`pending_win` / `session_win` 记着的那两次按下）。
+///
+/// 抽成纯函数是为了能单测：判错的代价是"Win 键卡住"这种全系统级别的怪毛病。
+fn swallow_win_while_capturing(
+    hotkey_uses_win: bool,
+    pending_win: u32,
+    session_win: u32,
+    vk: u32,
+) -> bool {
+    hotkey_uses_win || pending_win == vk || session_win == vk
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(ctx) = CTX.get() else {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
@@ -608,10 +650,26 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     // 顺带把「临时接管」的记账清掉：那次按下的 keyup 正好在这里被吞，
     // 留着的记账会在捕捉结束后拿着一次早已过期的 Win 去补发。
     if ctx.paused.load(Ordering::Relaxed) {
+        // 先把"还按着的那次 hold"收掉。位置很讲究：必须在下面 Win 那一支**之前**
+        // ——松开的是 Win 时那一支会直接 return，收尾就被跳过了，而默认组合
+        // 就是 Ctrl+Win，先松 Win 再松 Ctrl 太常见了。
+        if ctx.armed.load(Ordering::Relaxed) {
+            end_orphaned_hold(ctx);
+        }
         if classify_modifier(vk) == Some(ModKind::Win) {
-            ctx.pending_win.store(0, Ordering::Relaxed);
-            ctx.session_win.store(0, Ordering::Relaxed);
-            return LRESULT(1);
+            // 只吞我们确实接管过的 Win（判定见 `swallow_win_while_capturing`）：
+            // 组合里不含 Win 时，主人按下 Win 本来就是放行给外壳的，
+            // 再把它的松开吞掉，外壳会以为 Win 一直按着（之后敲字母就触发 Win+X）。
+            if swallow_win_while_capturing(
+                current().win,
+                ctx.pending_win.load(Ordering::Relaxed),
+                ctx.session_win.load(Ordering::Relaxed),
+                vk,
+            ) {
+                ctx.pending_win.store(0, Ordering::Relaxed);
+                ctx.session_win.store(0, Ordering::Relaxed);
+                return LRESULT(1);
+            }
         }
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
@@ -989,6 +1047,109 @@ pub fn decide(hk: Hotkey, mods: Mods, vk: u32, down: bool, hold: Hold) -> Decisi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归（录音途中改键/保存 → 麦克风停不下来）：`set_current` 会清掉"按住中"
+    /// 的记账，而会话只认"松开" —— 不补一个 Stop，麦克风与推流会一直开着
+    /// （普通录音没有时长上限），只剩托盘菜单能停。
+    #[test]
+    fn resetting_the_hold_while_recording_stops_the_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = HookCtx {
+            tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            ctrl: AtomicBool::new(true),
+            alt: AtomicBool::new(false),
+            shift: AtomicBool::new(false),
+            win: AtomicBool::new(true),
+            armed: AtomicBool::new(true), // 正在录音
+            held_vk: AtomicU32::new(0x5B),
+            pending_win: AtomicU32::new(0),
+            session_win: AtomicU32::new(0x5B),
+        };
+
+        reset_hold(&ctx);
+
+        assert!(!ctx.armed.load(Ordering::Relaxed));
+        assert_eq!(ctx.held_vk.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.session_win.load(Ordering::Relaxed), 0);
+        assert!(
+            matches!(rx.try_recv(), Ok(Cmd::Stop)),
+            "刚才确实在录音，必须补一个 Stop，否则麦克风停不下来"
+        );
+    }
+
+    /// 没在录音时清记账**不许**发 Stop：`set_current` 每次保存设置都会被调用，
+    /// 每次都发一个 Stop 只会往日志里灌"当前没在录音，已忽略"这种噪音。
+    #[test]
+    fn resetting_an_idle_hold_sends_nothing() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = HookCtx {
+            tx,
+            paused: Arc::new(AtomicBool::new(false)),
+            ctrl: AtomicBool::new(false),
+            alt: AtomicBool::new(false),
+            shift: AtomicBool::new(false),
+            win: AtomicBool::new(false),
+            armed: AtomicBool::new(false), // 没在录音
+            held_vk: AtomicU32::new(0),
+            pending_win: AtomicU32::new(0),
+            session_win: AtomicU32::new(0),
+        };
+
+        reset_hold(&ctx);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "没在录音就不该发 Stop（每次保存设置都会走到这里）"
+        );
+    }
+
+    /// 回归（Win 键卡住 → 之后敲字母弹开始菜单/资源管理器）：捕捉（改键）期间
+    /// **只吞我们确实接管过的 Win**。组合里不含 Win 时主人按 Win 是放行给外壳的，
+    /// 再把它的松开吞掉，外壳就永远等不到"Win 松开了"。
+    #[test]
+    fn capturing_only_swallows_the_win_we_actually_took_over() {
+        const LWIN: u32 = 0x5B;
+        const RWIN: u32 = 0x5C;
+
+        // 组合里要用 Win（默认的 Ctrl+Win）：捕捉期间照吞（否则一按就弹开始菜单、
+        // 捕捉当场结束，Ctrl+Win 永远录不上）
+        assert!(swallow_win_while_capturing(true, 0, 0, LWIN));
+        // 组合里不含 Win，且我们没接管过这个键 → 放行（这是被修掉的那个 bug）
+        assert!(!swallow_win_while_capturing(false, 0, 0, LWIN));
+        // 组合里不含 Win，但我们确实接管过这次按下（左 Win）→ 它的松开必须吞
+        assert!(swallow_win_while_capturing(false, LWIN, 0, LWIN));
+        assert!(swallow_win_while_capturing(false, 0, LWIN, LWIN));
+        // 接管的是左 Win，按下的却是右 Win → 不归我们管，放行
+        assert!(!swallow_win_while_capturing(false, LWIN, 0, RWIN));
+    }
+
+    /// 三处"默认快捷键"必须说的是同一个组合：配置文件里的字符串
+    /// （`config::Config::default().hotkey`）、`Hotkey::default()`、
+    /// 以及进程级静态变量里的初值（钩子真正在等的那个）。
+    ///
+    /// 为什么值得钉住：改一处漏两处，就会出现"界面显示 Ctrl+Win、钩子却在等别的
+    /// 组合"，表现是"按了没反应"，而代码里怎么读都自洽 —— 最难查的那类。
+    #[test]
+    fn the_default_hotkey_is_the_same_in_all_three_places() {
+        let from_config =
+            parse(&crate::config::Config::default().hotkey).expect("默认快捷键必须能解析");
+        assert_eq!(
+            from_config,
+            Hotkey::default(),
+            "config 里的默认值和 Hotkey::default() 不一致"
+        );
+        assert_eq!(
+            mods_bits(&from_config),
+            CURRENT_MODS.load(Ordering::Relaxed),
+            "静态变量里的默认修饰键与 Hotkey::default() 不一致"
+        );
+        assert_eq!(
+            from_config.vk,
+            CURRENT_VK.load(Ordering::Relaxed),
+            "静态变量里的默认主键与 Hotkey::default() 不一致"
+        );
+    }
 
     #[test]
     fn parses_common_combos() {

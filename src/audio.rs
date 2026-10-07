@@ -14,6 +14,103 @@ pub const TARGET_RATE: u32 = 16_000;
 /// 100ms 一帧（三家服务商都建议 100~200ms）
 pub const FRAME_SAMPLES: usize = (TARGET_RATE as usize) / 10;
 
+/// 下拉栏里的一台麦克风：`id` 存进配置、`label` 给人看。
+///
+/// 为什么显示的和存的要分开：主人认的是 Windows 里那个名字
+/// （比如「麦克风 (BY-CM1)」），但**名字会重名** —— 两台同型号设备一模一样，
+/// 只存名字就会出现"选的是它、开的却是另一台"。`id` 是 Windows 的端点编号
+/// （`GetId()` 那条，形如 `wasapi:{0.0.1.00000000}.{...}`），唯一且重启、
+/// 拔了再插都不变，所以拿它当身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicDevice {
+    pub id: String,
+    pub label: String,
+}
+
+/// 列出本机所有能录音的设备（设置窗下拉栏用）。
+pub fn list_input_devices() -> Result<Vec<MicDevice>> {
+    let host = cpal::default_host();
+    let mut out = Vec::new();
+    for device in host.input_devices().context("枚举麦克风失败")? {
+        // 编号读不出来就没法存进配置、下次也找不回来：这台不列，
+        // 免得在下拉栏里摆一个"选了也不生效"的选项
+        let Some(id) = guarded(|| device.id().ok().map(|i| i.to_string())) else {
+            crate::log::log("有一台麦克风读不出设备编号，已从列表里跳过");
+            continue;
+        };
+        out.push(MicDevice {
+            id,
+            label: device_label(&device),
+        });
+    }
+    Ok(out)
+}
+
+/// 选定的那台麦克风现在还在不在（设置页用它决定要不要提醒主人）。
+/// 空串 = 跟随系统默认，永远算「在」。
+///
+/// 判定与真正开流时**共用同一个 `pick`**：两处各写一份的话，日后改了一处就会
+/// 出现"界面看着没问题、实际录的是另一台麦"这种最难查的毛病。
+pub fn selected_is_missing(wanted: &str, mics: &[MicDevice]) -> bool {
+    matches!(
+        pick(wanted, mics.iter().map(|m| m.id.as_str())),
+        Pick::Missing
+    )
+}
+
+/// 录音时该开哪台麦克风（纯逻辑，方便单测钉住）。
+#[derive(Debug, PartialEq, Eq)]
+enum Pick {
+    /// 跟随系统默认设备（配置里没选过）
+    Default,
+    /// `ids` 里的第 n 台
+    Index(usize),
+    /// 选过，但那台现在不在（被拔掉 / 被停用）
+    Missing,
+}
+
+/// `wanted` 空 = 跟随系统默认；否则按唯一编号在候选里找。
+fn pick<'a>(wanted: &str, mut ids: impl Iterator<Item = &'a str>) -> Pick {
+    if wanted.is_empty() {
+        return Pick::Default;
+    }
+    match ids.position(|id| id == wanted) {
+        Some(i) => Pick::Index(i),
+        None => Pick::Missing,
+    }
+}
+
+/// 下拉栏里显示给人看的名字。
+///
+/// 为什么不直接用 `description().name()`：WASAPI 那边它优先取的是**驱动描述**
+/// （DeviceDesc），实测主人这台机器上只给出干巴巴的「麦克风」，两台设备会长得
+/// 一模一样。真正好认的 FriendlyName（「麦克风 (BY-CM1)」）被 cpal 放在
+/// `extended()` 里，所以优先用它，取不到再退回朴素名字。
+fn mic_label(desc: &cpal::DeviceDescription) -> String {
+    match desc.extended().first() {
+        Some(friendly) if !friendly.trim().is_empty() && friendly != desc.name() => friendly.clone(),
+        _ => desc.name().to_string(),
+    }
+}
+
+/// 设备的显示名（只为写日志/界面，读不出来给个占位串，绝不因此让录音失败）
+fn device_label(device: &cpal::Device) -> String {
+    guarded(|| device.description().ok())
+        .map(|d| mic_label(&d))
+        .unwrap_or_else(|| "未知设备".to_string())
+}
+
+/// 读设备信息时**必须**兜住 panic。
+///
+/// 为什么：cpal 的 WASAPI 后端在 `description()` 里用了
+/// `expect("could not open property store")` —— 设备恰好在这一瞬间被拔掉就会
+/// panic。而这里的调用点在界面线程和采集线程上：一次 panic，轻则这次录音没了，
+/// 重则整个托盘程序消失（主人只会看到"打开设置就闪退"）。宁可少列一台设备，
+/// 也不能让程序死掉。读不出来返回 `None`，由调用方决定怎么呈现。
+fn guarded<T>(read: impl FnOnce() -> Option<T>) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or(None)
+}
+
 pub struct Capture {
     pub rx: Receiver<Vec<i16>>,
     /// 采集出错时的错误文本（采集线程写、会话读）
@@ -49,12 +146,28 @@ impl Capture {
     }
 }
 
+impl Drop for Capture {
+    /// 丢掉采集句柄时**一定**叫采集线程收工。
+    ///
+    /// 为什么要有它：`stop()` 只是"请你停下来"，而采集线程真正退出还差一步 ——
+    /// 它得等到回调再往通道里发一次满帧、撞上 Closed，或者回调自己报错。
+    /// 会话里有一条提前 `return` 的路径（连 ASR 失败时），那条路上只把 Capture
+    /// 丢掉、并没有调 `stop()`：常规设备 100~200ms 内就自愈了，但设备要是正好
+    /// 不再产生回调（蓝牙/USB 声卡睡死、驱动卡住又不报错），采集线程就会一直
+    /// 轮询、麦克风一直被占着（Windows 的"正在使用麦克风"一直亮）到进程结束。
+    /// 这一行把"忘了 stop"这条路整个收掉。
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
 /// 等麦克风就绪的上限。设备被独占、驱动卡死时 `build_input_stream` 可能一直不返回，
 /// 而这里是**同步调用**（会话线程）—— 不设上限的话整个会话线程会一直卡着，
 /// 之后所有热键（包括松开结束）都失效，只能重启程序。
 const DEVICE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn start() -> Result<Capture> {
+/// 开始采集。`wanted` 是设置里选中的麦克风编号（空串 = 跟随系统默认设备）。
+pub fn start(wanted: &str) -> Result<Capture> {
     // 100 帧 = 10 秒，够覆盖连接建立的耗时
     let (tx, rx) = channel::<Vec<i16>>(100);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -64,9 +177,15 @@ pub fn start() -> Result<Capture> {
     let stopped = Arc::new(AtomicBool::new(false));
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let tail_flushed = Arc::new(AtomicBool::new(false));
+    let frame_dropped = Arc::new(AtomicBool::new(false));
+    let tail_lost = Arc::new(AtomicBool::new(false));
     let thread_stopped = stopped.clone();
     let thread_error = error.clone();
     let thread_tail = tail_flushed.clone();
+    let thread_dropped = frame_dropped.clone();
+    let thread_tail_lost = tail_lost.clone();
+    // 采集线程要用这个值，先把借来的 &str 变成自己的一份
+    let wanted = wanted.to_string();
 
     std::thread::Builder::new()
         .name("bbvoxi-audio".into())
@@ -76,26 +195,36 @@ pub fn start() -> Result<Capture> {
                 stopped: thread_stopped.clone(),
                 error: thread_error,
                 tail_flushed: thread_tail.clone(),
+                frame_dropped: thread_dropped.clone(),
+                tail_lost: thread_tail_lost.clone(),
             };
-            let stream = match build_stream(handles) {
+            let stream = match build_stream(handles, &wanted) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(e.to_string()));
+                    // `{e:#}` 而不是 `{e}`：anyhow 的 Display 只给最外层那句话
+                    // （"打开麦克风输入流失败"），真正的原因（被独占、格式不支持、
+                    // 设备被拔掉）全在因果链里，主人和排障都等着它。
+                    let _ = ready_tx.send(Err(format!("{e:#}")));
                     return;
                 }
             };
             let _ = ready_tx.send(Ok(()));
             // 停止条件有两个来源：会话主动 stop，或流自身出错时由回调置位。
             // 接收端被丢弃后回调也会置位 stopped，此时结束采集。
+            // 循环里顺带把回调记下的两件"只能由这里来说"的事写进日志（见
+            // `log_callback_notes`：回调里不能写日志）。
             while !thread_stopped.load(Ordering::Relaxed) {
+                log_callback_notes(&thread_dropped, &thread_tail_lost);
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // 会话可能还在等"尾帧补发完"：这里再给回调一点时间（它每 50ms 轮询一次），
-            // 但**有上限**，绝不为了尾巴把收尾卡死。
+            // 会话可能还在等"尾帧补发完"：这里再给回调一点时间（**回调每来一批音频
+            // 就查一次停止标志**），但**有上限**，绝不为了尾巴把收尾卡死。
             let deadline = std::time::Instant::now() + TAIL_WAIT_BEFORE_DROP;
             while !thread_tail.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // 收工前把最后积压的话说完（否则"尾帧丢了"这条日志永远不会出现）
+            log_callback_notes(&thread_dropped, &thread_tail_lost);
             drop(stream);
         })
         .context("启动音频线程失败")?;
@@ -134,14 +263,40 @@ struct CaptureHandles {
     stopped: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     tail_flushed: Arc<AtomicBool>,
+    /// 缓冲满、丢过帧（**回调只置位**，日志由采集线程写，见 `log_callback_notes`）
+    frame_dropped: Arc<AtomicBool>,
+    /// 尾帧没能送出去（同上：回调只置位）
+    tail_lost: Arc<AtomicBool>,
 }
 
-fn build_stream(handles: CaptureHandles) -> Result<cpal::Stream> {
+/// 把音频回调里记下的两件事写进日志 —— **在采集线程里写，绝不在回调里写**。
+///
+/// 为什么回调里连一行日志都不能写：音频回调跑在驱动的高优先级线程上，必须在一个
+/// 缓冲区周期内返回；而 `log::log` 要抢一把全局锁、写文件、还要写 stderr，磁盘一忙
+/// （杀软在扫、机械盘）就可能卡几十毫秒 —— 直接后果就是丢音，甚至被驱动判为卡顿。
+/// 所以回调只置个标志（纳秒级），让每 50ms 醒一次的采集线程替它把话说完：
+/// 日志一条不少，回调一个字节的额外活都不干。
+///
+/// 用 `swap(false)` 取走标志：同一个事件只写一次日志（`Feed` 那边也保证只置位一次），
+/// 不会因为一直丢帧就把日志刷爆。
+fn log_callback_notes(frame_dropped: &AtomicBool, tail_lost: &AtomicBool) {
+    if frame_dropped.swap(false, Ordering::Relaxed) {
+        crate::log::log("音频缓冲已满，丢弃了部分帧（连接建立较慢）");
+    }
+    if tail_lost.swap(false, Ordering::Relaxed) {
+        // 两种原因都可能：缓冲满，或采集已被叫停（接收端退出了）。
+        // 不硬说是哪一种 —— 猜错会把排障带到沟里。
+        crate::log::log("尾帧没能送出去（缓冲已满或采集已停止）：最后一段音频可能丢了");
+    }
+}
+
+fn build_stream(handles: CaptureHandles, wanted: &str) -> Result<cpal::Stream> {
     let host = cpal::default_host();
-    let device = host.default_input_device().context("未检测到麦克风设备")?;
-    let supported = device
-        .default_input_config()
-        .context("无法读取麦克风默认格式（可能被其他程序占用或未授权）")?;
+    let device = pick_input_device(&host, wanted)?;
+    let label = device_label(&device);
+    let supported = device.default_input_config().with_context(|| {
+        format!("无法读取麦克风「{label}」的默认格式（可能被其他程序占用或未授权）")
+    })?;
 
     let in_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
@@ -182,9 +337,47 @@ fn build_stream(handles: CaptureHandles) -> Result<cpal::Stream> {
         std::cmp::Ordering::Greater => "盒式滤波降采样",
     };
     crate::log::log(format!(
-        "麦克风已启动：{in_rate}Hz / {channels}ch / {format:?} → {how}到 {TARGET_RATE}Hz"
+        "麦克风已启动：{label} {in_rate}Hz / {channels}ch / {format:?} → {how}到 {TARGET_RATE}Hz"
     ));
     Ok(stream)
+}
+
+/// 这次录音到底开哪台麦克风。
+///
+/// 两条兜底，都是为了"别让选麦克风这件小事把录音整个搞垮"：
+/// 1. 枚举失败（驱动异常）也照常走系统默认设备 —— 不能因为列表读不出来就录不了音；
+/// 2. 选中的那台现在不在（拔了 / 停用了）就回退系统默认，并留下日志 ——
+///    主人下次打开设置会在那一行看到提醒，而不是对着"录不到声音"瞎猜。
+fn pick_input_device(host: &cpal::Host, wanted: &str) -> Result<cpal::Device> {
+    let devices: Vec<cpal::Device> = match host.input_devices() {
+        Ok(it) => it.collect(),
+        Err(e) => {
+            crate::log::log(format!("枚举麦克风失败（{e}），改用系统默认设备"));
+            Vec::new()
+        }
+    };
+    let ids: Vec<String> = devices
+        .iter()
+        .map(|d| guarded(|| d.id().ok().map(|i| i.to_string())).unwrap_or_default())
+        .collect();
+    let chosen = match pick(wanted, ids.iter().map(String::as_str)) {
+        // 下标就是从这个列表里数出来的，理论上一定在；真取不到也只回退默认，不 panic
+        Pick::Index(i) => devices.get(i).cloned(),
+        Pick::Default => None,
+        Pick::Missing => {
+            // 三种情况都归到这里：设备被拔了、被停用了，或者列表根本没读出来。
+            // 日志如实写成"没能用上"，别硬说是哪一种（猜错会把排障带到沟里）。
+            crate::log::log(
+                "设置里选的那台麦克风没能用上（已拔掉、被停用，或设备列表读不出来），\
+                 本次改用系统默认设备；可在设置→通用里点「刷新」后重新选一台",
+            );
+            None
+        }
+    };
+    match chosen {
+        Some(d) => Ok(d),
+        None => host.default_input_device().context("未检测到麦克风设备"),
+    }
 }
 
 fn build<T>(
@@ -204,6 +397,8 @@ where
         tx: handles.tx,
         stopped: handles.stopped,
         tail_flushed: handles.tail_flushed,
+        frame_dropped: handles.frame_dropped,
+        tail_lost: handles.tail_lost,
         channels,
         sum: 0.0,
         counted: 0,
@@ -222,10 +417,13 @@ struct Feed {
     stopped: Arc<AtomicBool>,
     /// 残留尾帧补发完的标志（会话收尾时等它，见 `Capture::tail_flushed`）
     tail_flushed: Arc<AtomicBool>,
+    /// 丢过帧／尾帧没送出去（**回调只置位，日志由采集线程写**，见 `log_callback_notes`）
+    frame_dropped: Arc<AtomicBool>,
+    tail_lost: Arc<AtomicBool>,
     channels: usize,
     sum: f32,
     counted: usize,
-    /// 是否已经因为缓冲满丢过帧（只记一次日志，避免刷屏）
+    /// 是否已经因为缓冲满丢过帧（只置位一次，避免刷屏）
     dropped: bool,
     /// 停止后是否已经把残留尾帧补发过了（见 `push` 的开头，避免重复发）
     flushed: bool,
@@ -246,7 +444,14 @@ impl Feed {
                 }
                 if !self.frame.is_empty() {
                     let tail = std::mem::take(&mut self.frame);
-                    let _ = self.tx.try_send(tail);
+                    // 通道可能已经满了（网络慢时缓冲会攒到 100 帧）：这时这一帧
+                    // ——往往正是主人松手前那几个字——会被丢掉。丢掉本身没法避免
+                    // （回调里不能等），但**必须留下痕迹**：否则现象只是"最后一个
+                    // 字少了"，日志里一条线索都没有。痕迹同样只置标志，由采集线程
+                    // 落日志（见 `log_callback_notes`）。
+                    if self.tx.try_send(tail).is_err() {
+                        self.tail_lost.store(true, Ordering::Relaxed);
+                    }
                 }
                 // 告诉会话"尾巴已经补完了"：它在收尾时等这个标志，而不是睡一个
                 // 固定时长（固定时长在回调周期长的设备上会等不到，尾巴照样丢）。
@@ -273,11 +478,13 @@ impl Feed {
                     use tokio::sync::mpsc::error::TrySendError;
                     match self.tx.try_send(full) {
                         Ok(()) => {}
-                        // 还没连上 ASR 时缓冲会满：丢这一帧继续采，绝不能因此停掉麦克风
+                        // 还没连上 ASR 时缓冲会满：丢这一帧继续采，绝不能因此停掉麦克风。
+                        // 只置标志，日志由采集线程写（回调里连一行日志都不能写，
+                        // 见 `log_callback_notes`）
                         Err(TrySendError::Full(_)) => {
                             if !self.dropped {
                                 self.dropped = true;
-                                crate::log::log("音频缓冲已满，丢弃了部分帧（连接建立较慢）");
+                                self.frame_dropped.store(true, Ordering::Relaxed);
                             }
                         }
                         // 接收端已退出，采集收工
@@ -485,6 +692,98 @@ impl ToF32 for i32 {
 mod tests {
     use super::*;
 
+    /// 下拉栏里显示给人看的名字，必须是 Windows「声音设置」里那个好认的名字。
+    ///
+    /// 为什么不直接用 `description().name()`：WASAPI 那边它优先取的是**驱动描述**
+    /// （DeviceDesc），实测主人这台机器上只给出干巴巴的「麦克风」；两台不同型号
+    /// 的设备会显示成一模一样，下拉栏里根本分不出谁是谁。真正好认的
+    /// FriendlyName（「麦克风 (BY-CM1)」）被 cpal 放在 `extended()` 里。
+    #[test]
+    fn mic_label_prefers_the_windows_friendly_name() {
+        let desc = cpal::DeviceDescriptionBuilder::new("麦克风")
+            .add_extended_line("麦克风 (BY-CM1)")
+            .build();
+        assert_eq!(mic_label(&desc), "麦克风 (BY-CM1)");
+    }
+
+    /// 没有更详细的附加行时，退回朴素名字 —— 不能显示成空白，否则下拉栏
+    /// 里会出现一行点不中、也认不出的空选项。
+    #[test]
+    fn mic_label_falls_back_to_the_plain_name() {
+        let plain = cpal::DeviceDescriptionBuilder::new("麦克风").build();
+        assert_eq!(mic_label(&plain), "麦克风");
+
+        // 附加行与名字重复时别显示成「麦克风（麦克风）」
+        let same = cpal::DeviceDescriptionBuilder::new("麦克风")
+            .add_extended_line("麦克风")
+            .build();
+        assert_eq!(mic_label(&same), "麦克风");
+
+        // 空白附加行同样不能用
+        let blank = cpal::DeviceDescriptionBuilder::new("麦克风")
+            .add_extended_line("   ")
+            .build();
+        assert_eq!(mic_label(&blank), "麦克风");
+    }
+
+    /// 没选（配置里是空串）= 跟随系统默认设备。老配置文件里没有这一项，
+    /// 读出来就是空串 —— 行为必须和升级前一模一样。
+    #[test]
+    fn empty_mic_selection_uses_the_system_default() {
+        assert_eq!(pick("", std::iter::empty()), Pick::Default);
+        assert_eq!(pick("", ["wasapi:a"].into_iter()), Pick::Default);
+    }
+
+    /// 选过设备：按唯一编号在下拉栏的候选里找到它（名字会重名，编号不会）。
+    #[test]
+    fn saved_mic_is_found_by_its_device_id() {
+        let ids = ["wasapi:a", "wasapi:b", "wasapi:c"];
+        assert_eq!(pick("wasapi:b", ids.iter().copied()), Pick::Index(1));
+        assert_eq!(
+            pick("wasapi:b", ids.iter().copied()),
+            Pick::Index(1),
+            "顺序必须跟候选列表一致，否则会开到别的麦克风"
+        );
+    }
+
+    /// 回归（选定的麦克风被拔掉 / 被禁用）：必须如实报"不在"，
+    /// 由调用方回退系统默认并留下痕迹 —— 不能静默换成列表里的第一台，
+    /// 否则主人会被从完全不相干的设备录音，还找不到原因。
+    #[test]
+    fn unplugged_mic_is_reported_as_missing() {
+        let ids = ["wasapi:a", "wasapi:b"];
+        assert_eq!(
+            pick("wasapi:gone", ids.iter().copied()),
+            Pick::Missing,
+            "选中的设备不在了，必须报 Missing 而不是随便挑一台"
+        );
+    }
+
+    /// 设置页那行提醒用的是**同一套判定**（`selected_is_missing`）：
+    /// 两处各写一份的话，日后改了一处就会出现"界面说没问题、实际录的是别的麦"。
+    #[test]
+    fn missing_mic_check_agrees_with_the_capture_decision() {
+        let mics = vec![
+            MicDevice {
+                id: "wasapi:a".into(),
+                label: "麦克风 (BY-CM1)".into(),
+            },
+            MicDevice {
+                id: "wasapi:b".into(),
+                label: "耳机麦克风".into(),
+            },
+        ];
+        assert!(
+            !selected_is_missing("", &mics),
+            "跟随系统默认永远算「在」，不该提醒主人"
+        );
+        assert!(!selected_is_missing("wasapi:b", &mics));
+        assert!(
+            selected_is_missing("wasapi:gone", &mics),
+            "选中的设备不在了，设置页必须提醒"
+        );
+    }
+
     fn drain(dec: &mut Decimator, input: &[f32]) -> Vec<i16> {
         let mut out = Vec::new();
         for s in input {
@@ -594,6 +893,8 @@ mod tests {
             tx,
             stopped: stopped.clone(),
             tail_flushed: tail_flushed.clone(),
+            frame_dropped: Arc::new(AtomicBool::new(false)),
+            tail_lost: Arc::new(AtomicBool::new(false)),
             channels: 1,
             sum: 0.0,
             counted: 0,
@@ -646,6 +947,8 @@ mod tests {
             tx,
             stopped: stopped.clone(),
             tail_flushed: tail_flushed.clone(),
+            frame_dropped: Arc::new(AtomicBool::new(false)),
+            tail_lost: Arc::new(AtomicBool::new(false)),
             channels: 1,
             sum: 0.0,
             counted: 0,
@@ -659,6 +962,112 @@ mod tests {
             tail_flushed.load(Ordering::Relaxed),
             "没有残留也要置位，否则会话会白等到超时"
         );
+    }
+
+    /// 回归（音频回调里做文件 I/O）：通道满或接收端已退出时，尾帧发不出去 ——
+    /// 回调**只许置标志**，日志交给采集线程写（回调卡住就是丢音）。
+    /// 这条测试盯的是"标志确实被置起来了"，也就是那条日志还会出现。
+    #[test]
+    fn a_tail_that_cannot_be_sent_raises_the_flag_instead_of_logging() {
+        let (tx, rx) = channel::<Vec<i16>>(1);
+        let tail_lost = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut feed = Feed {
+            resampler: Resampler::new(TARGET_RATE, TARGET_RATE),
+            frame: Vec::new(),
+            tx,
+            stopped: stopped.clone(),
+            tail_flushed: Arc::new(AtomicBool::new(false)),
+            frame_dropped: Arc::new(AtomicBool::new(false)),
+            tail_lost: tail_lost.clone(),
+            channels: 1,
+            sum: 0.0,
+            counted: 0,
+            dropped: false,
+            flushed: false,
+        };
+
+        // 先正常采一小段（不足一帧，攒在 frame 里），再把接收端丢掉、置位停止：
+        // 下一次回调要补发尾帧，而这时必然发不出去
+        feed.push(&[0.1f32; 100]);
+        drop(rx);
+        stopped.store(true, Ordering::Relaxed);
+        feed.push(&[0.1f32; 10]);
+
+        assert!(
+            tail_lost.load(Ordering::Relaxed),
+            "尾帧发不出去必须置标志，否则这条线索永远不会进日志"
+        );
+        // 取走标志（采集线程就是这么做的），不能重复报同一条
+        log_callback_notes(&Arc::new(AtomicBool::new(false)), &tail_lost);
+        assert!(
+            !tail_lost.load(Ordering::Relaxed),
+            "说过一次之后要清掉，免得一直丢帧就把日志刷爆"
+        );
+    }
+
+    /// 真机验证（默认不跑，手动跑：`cargo test -- --ignored --nocapture`）：
+    /// 1. 列出本机的麦克风，确认名字和编号都读得出来；
+    /// 2. 按「设置里选中的那台」真的开一次麦克风，确认录得到音频帧；
+    /// 3. 选一台**不存在**的设备，确认会退回系统默认（而不是报错、也不是录不到）。
+    ///
+    /// 为什么要它：上面那些纯函数测试只能证明"该选谁"的判断对，证明不了 WASAPI
+    /// 那边**真的开到了那台设备**。这件事只有真开一次麦克风才算验证过。
+    /// 为什么默认不跑：它动真麦克风（本机没麦 / 麦克风被禁用就会失败），
+    /// 常规 `cargo test` 不该被硬件状态拖累。
+    #[test]
+    #[ignore = "需要真实麦克风；手动跑：cargo test -- --ignored --nocapture"]
+    fn real_microphone_is_listed_selected_and_captured() {
+        let mics = list_input_devices().expect("枚举本机麦克风");
+        println!("本机麦克风 {} 台：", mics.len());
+        for m in &mics {
+            println!("  - {}  [{}]", m.label, m.id);
+        }
+        assert!(!mics.is_empty(), "本机没有可用的麦克风，这条测试验证不了");
+
+        // 故意选列表里的最后一台（通常不是系统默认那台），验证"选的能被真的开起来"
+        let target = mics.last().unwrap();
+        let frames = capture_for_a_moment(&target.id);
+        println!("选中「{}」录到 {frames} 帧", target.label);
+        assert!(frames > 0, "选中了「{}」却一帧都没录到", target.label);
+
+        // 光看"能录到"是不够的：本机只有一台麦克风时，"按编号选中"和"回退默认"
+        // 结果一模一样，证明不了匹配逻辑对。这里直接核对**解析出来的设备编号**
+        // ——它必须就是选的那一台，而不是"随便开了一个能用的"。
+        let host = cpal::default_host();
+        let resolved = pick_input_device(&host, &target.id).expect("按编号解析麦克风");
+        assert_eq!(
+            guarded(|| resolved.id().ok().map(|i| i.to_string())).as_deref(),
+            Some(target.id.as_str()),
+            "按编号选出来的不是这一台设备"
+        );
+
+        // 选一台不存在的设备：必须退回系统默认并照常录到声音（不能直接失败）
+        let ghost = "wasapi:{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}";
+        assert!(selected_is_missing(ghost, &mics), "这台设备本来就不该存在");
+        let frames = capture_for_a_moment(ghost);
+        println!("选了一台不存在的设备，退回系统默认后录到 {frames} 帧");
+        assert!(
+            frames > 0,
+            "选中的设备不在时应该退回系统默认设备，而不是录不到声音"
+        );
+    }
+
+    /// 开一次麦克风、录约 0.6 秒，返回收到的帧数（真机验证用）
+    fn capture_for_a_moment(wanted: &str) -> usize {
+        let mut capture = start(wanted).expect("打开麦克风");
+        let deadline = std::time::Instant::now() + Duration::from_millis(600);
+        let mut frames = 0;
+        while std::time::Instant::now() < deadline {
+            if capture.rx.try_recv().is_ok() {
+                frames += 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        capture.stop();
+        // 给采集线程一点时间真的把设备放掉，免得连开两次时互相打架
+        std::thread::sleep(Duration::from_millis(150));
+        frames
     }
 
     /// `Decimator::finish` 要把当前正在积累的箱也收掉，
